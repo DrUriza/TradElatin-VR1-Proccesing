@@ -5,12 +5,12 @@ is reused from Prices and historical aggressive buy/sell flow is reused from
 CVD Processing when available.
 
 Acquisition policy:
-- bootstrap: native 1m for current-screen density + native 1h for a deep
+- bootstrap: native 1m for current-screen density + native 4h for a deep
   analytical seed (up to 1000 points), range-10 depth only;
-- incremental: native 1m orderbook/depth/footprint; large-limit-order snapshots
-  at most every 5 minutes; Whale Index at most every hour;
-- repeated runs inside an already persisted provider bucket issue no duplicate
-  request for that bucket.
+- incremental: native 1m orderbook + footprint + large-limit-order snapshots
+  are refreshed on every Liquidity worker cycle (~5 s);
+- Input consumes only the newest historical snapshot from each fixed-500
+  Emulator response, so fast refresh does not reprocess the full history.
 """
 from __future__ import annotations
 
@@ -23,29 +23,24 @@ from typing import Any
 
 LIQUIDITY_MICROSTRUCTURE_FAMILY = "liquidity_microstructure"
 PROVIDER = "coinglass"
-REST_BASE_URL = "https://open-api-v4.coinglass.com"
-TIMEFRAMES = ("1m", "5m", "15m", "1h")
-BOOTSTRAP_TIMEFRAMES = ("1m", "1h")
+TIMEFRAMES = ("1m", "5m", "15m", "4h")
+BOOTSTRAP_TIMEFRAMES = ("1m", "4h")
 INCREMENTAL_TIMEFRAMES = ("1m",)
-TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "4h": 14400}
 # The final HMI consumes the 10% reference depth.  1% / 5% were legacy
 # exploratory ranges and multiplied provider calls without feeding the final
 # contract.
 DEPTH_RANGES_PERCENT = (10,)
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
 WHALE_ORDERS_TTL_SECONDS = 300
-WHALE_INDEX_TTL_SECONDS = 3600
 
 ENDPOINT_MANIFEST = {
     "spot_orderbook_heatmap": {"transport": "rest", "path": "/api/spot/orderbook/history"},
     "perpetual_orderbook_heatmap": {"transport": "rest", "path": "/api/futures/orderbook/history"},
-    "spot_order_depth": {"transport": "rest", "path": "/api/spot/orderbook/ask-bids-history"},
-    "perpetual_order_depth": {"transport": "rest", "path": "/api/futures/orderbook/ask-bids-history"},
     "spot_footprint": {"transport": "rest", "path": "/api/spot/volume/footprint-history"},
-    "perpetual_footprint": {"transport": "rest", "path": "/api/futures/volume/footprint-history"},
+    "futures_footprint": {"transport": "rest", "path": "/api/futures/volume/footprint-history"},
     "spot_large_limit_orders": {"transport": "rest", "path": "/api/spot/orderbook/large-limit-order"},
     "perpetual_large_limit_orders": {"transport": "rest", "path": "/api/futures/orderbook/large-limit-order"},
-    "whale_index": {"transport": "rest", "path": "/api/futures/whale-index/history"},
 }
 
 RawFetcher = Callable[..., Any]
@@ -118,7 +113,6 @@ def build_liquidity_microstructure_fetch_plan(
     overlap_seconds: int = 300,
     existing_contract: Mapping[str, Any] | None = None,
     whale_orders_ttl_seconds: int = WHALE_ORDERS_TTL_SECONDS,
-    whale_index_ttl_seconds: int = WHALE_INDEX_TTL_SECONDS,
     recovery_requests: Sequence[str | Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
@@ -126,7 +120,7 @@ def build_liquidity_microstructure_fetch_plan(
     reference = int(reference_timestamp or time.time())
     if history_limit <= 0 or footprint_limit <= 0 or (hourly_history_limit is not None and hourly_history_limit <= 0):
         raise ValueError("invalid_history_limit")
-    if whale_orders_ttl_seconds <= 0 or whale_index_ttl_seconds <= 0:
+    if whale_orders_ttl_seconds <= 0:
         raise ValueError("invalid_refresh_ttl")
 
     if timeframes is None:
@@ -141,7 +135,7 @@ def build_liquidity_microstructure_fetch_plan(
         raise ValueError("unsupported_depth_range")
 
     def limit_for(timeframe: str) -> int:
-        return int(hourly_history_limit if timeframe == "1h" and hourly_history_limit is not None else history_limit)
+        return int(hourly_history_limit if timeframe == "4h" and hourly_history_limit is not None else history_limit)
 
     def start_for(timeframe: str, limit: int | None = None) -> int:
         if mode == "incremental":
@@ -161,12 +155,10 @@ def build_liquidity_microstructure_fetch_plan(
         ("perpetual", perpetual_symbol, "perpetual_orderbook_heatmap"),
     ):
         for timeframe in selected_timeframes:
-            if mode == "incremental" and not _needs_bucket(
-                existing_contract, ("providers", "coinglass", "orderbook", market_type), reference, TIMEFRAME_SECONDS[timeframe]
-            ):
-                orderbook_needed = False
-            else:
-                orderbook_needed = True
+            # Liquidity is a fast snapshot family. Even within the same 1m
+            # provider bucket, the current book can materially change every
+            # simulation/market update (~5 s), so incremental runs must poll.
+            orderbook_needed = True
             limit = limit_for(timeframe)
             start = start_for(timeframe)
             dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": timeframe, "range_percent": None}
@@ -184,16 +176,14 @@ def build_liquidity_microstructure_fetch_plan(
 
     # Recent executed price-bin detail is required for Screen A.  Historical
     # Screen-B absorption reuses CVD Processing; therefore Footprint no longer
-    # needs a 730-hour seed.
+    # needs a 730-bar seed.
     footprint_count = min(int(footprint_limit), 1000)
     for market_type, symbol, endpoint_id in (
         ("spot", spot_symbol, "spot_footprint"),
-        ("perpetual", perpetual_symbol, "perpetual_footprint"),
+        ("perpetual", perpetual_symbol, "futures_footprint"),
     ):
-        if mode == "incremental" and not _needs_bucket(
-            existing_contract, ("providers", "coinglass", "large_trades", market_type), reference, 60
-        ):
-            continue
+        # Footprint current-bucket execution changes inside the minute; always
+        # poll on the dedicated Liquidity cadence.
         dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": "1m", "range_percent": None}
         footprint_start = start_for("1m", footprint_count)
         plan.append(_request(endpoint_id, params={
@@ -205,16 +195,14 @@ def build_liquidity_microstructure_fetch_plan(
             "end_time": reference * 1000,
         }, dimensions=dimensions))
 
-    # Active whale-order snapshots are useful for Screen A but do not justify a
-    # per-minute call.  Persisted snapshots are refreshed at most every 5 min.
+    # Active whale-order snapshots feed Screen A and persistence/cancellation
+    # analysis, so they refresh on every dedicated Liquidity cycle.
     for market_type, symbol, endpoint_id in (
         ("spot", spot_symbol, "spot_large_limit_orders"),
         ("perpetual", perpetual_symbol, "perpetual_large_limit_orders"),
     ):
-        if mode == "incremental" and not _needs_bucket(
-            existing_contract, ("providers", "coinglass", "whale_orders", market_type), reference, whale_orders_ttl_seconds
-        ):
-            continue
+        # Large resting orders are snapshot state, not a slow historical
+        # indicator. Refresh them every Liquidity worker cycle.
         dimensions = {**common, "market_type": market_type, "symbol": symbol, "timeframe": "1m", "range_percent": None}
         plan.append(_request(endpoint_id, params={"exchange": exchange, "symbol": symbol}, dimensions=dimensions))
 

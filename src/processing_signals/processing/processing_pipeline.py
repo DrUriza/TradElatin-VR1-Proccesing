@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from .prices_ohlcv.prices_ohlcv_processor import run_prices_ohlcv_processing
-from .etf_exchange_flows import run_etf_exchange_flows_processing
+from .etf_exchange_flows.etf_exchange_flows_processor import run_etf_exchange_flows_processing
 from .liquidity_microstructure.liquidity_microstructure_processor import process_liquidity_microstructure
 from .long_short_liquidations.long_short_liquidations_processor import process_long_short_liquidations
 from .on_chain_miners.on_chain_miners_processor import process_on_chain_miners

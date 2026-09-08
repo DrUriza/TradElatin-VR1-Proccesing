@@ -9,25 +9,21 @@ from datetime import datetime, timezone
 from typing import Any
 
 FAMILY             = "open_interest_and_funding"
-SCREEN_TIMEFRAMES  = ("1m", "5m", "15m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS  = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
+SCREEN_TIMEFRAMES  = ("5m", "15m", "4h")
+TIMEFRAME_SECONDS  = {"5m": 300, "15m": 900, "4h": 14_400}
 VALID_MODES        = {"bootstrap", "incremental", "recovery"}
 BOOTSTRAP_LIMIT    = 1000
-BOOTSTRAP_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
-INCREMENTAL_LIMITS = {"1m": 15}
+BOOTSTRAP_TIMEFRAMES = SCREEN_TIMEFRAMES
+# Keep every HMI timeframe current. These are parameterized calls to the same
+# two canonical CoinGlass endpoints, not additional endpoint identities.
+INCREMENTAL_LIMITS = {timeframe: 15 for timeframe in SCREEN_TIMEFRAMES}
 
 ENDPOINTS = {
     "aggregated_open_interest_ohlc": {"provider": "coinglass", "endpoint_id": "aggregated_open_interest_ohlc", "path": "/api/futures/open-interest/aggregated-history", "request_kind": "timeframe_series", "raw_shape": "code_msg_data_list_ohlc", "required": True, "canonical_id": "open_interest_ohlc"},
     "oi_weighted_funding_rate_ohlc": {"provider": "coinglass", "endpoint_id": "oi_weighted_funding_rate_ohlc", "path": "/api/futures/funding-rate/oi-weight-history", "request_kind": "timeframe_series", "raw_shape": "code_msg_data_list_ohlc_rate", "required": True, "canonical_id": "funding_rate_ohlc"},
-    "open_interest_exchange_list": {"provider": "coinglass", "endpoint_id": "open_interest_exchange_list", "path": "/api/futures/open-interest/exchange-list", "request_kind": "snapshot", "raw_shape": "code_msg_data_exchange_oi_list", "required": True, "canonical_id": "open_interest_exchange_list"},
-    "funding_rate_exchange_list": {"provider": "coinglass", "endpoint_id": "funding_rate_exchange_list", "path": "/api/futures/funding-rate/exchange-list", "request_kind": "snapshot", "raw_shape": "code_msg_data_nested_funding_exchange_list", "required": True, "canonical_id": "funding_rate_exchange_list"},
-    "options_info": {"provider": "coinglass", "endpoint_id": "options_info", "path": "/api/option/info", "request_kind": "snapshot", "raw_shape": "code_msg_data_options_info", "required": False, "canonical_id": "options_info"},
-    "cryptoquant_open_interest": {"provider": "cryptoquant", "endpoint_id": "open_interest", "path": "/btc/market-data/open-interest", "request_kind": "confirmation_series", "raw_shape": "status_result_data_open_interest", "required": False, "canonical_id": "cryptoquant_open_interest"},
-    "cryptoquant_funding_rates": {"provider": "cryptoquant", "endpoint_id": "funding_rates", "path": "/btc/market-data/funding-rates", "request_kind": "confirmation_series", "raw_shape": "status_result_data_funding_rates", "required": False, "canonical_id": "cryptoquant_funding_rates"},
-    "glassnode_futures_open_interest_sum": {"provider": "glassnode", "endpoint_id": "futures_open_interest_sum", "path": "/v1/metrics/derivatives/futures_open_interest_sum", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_open_interest_sum"},
-    "glassnode_futures_funding_rate_perpetual": {"provider": "glassnode", "endpoint_id": "futures_funding_rate_perpetual", "path": "/v1/metrics/derivatives/futures_funding_rate_perpetual", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_funding_rate_perpetual"},
-    "glassnode_futures_estimated_leverage_ratio": {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "path": "/v1/metrics/derivatives/futures_estimated_leverage_ratio", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": False, "canonical_id": "glassnode_futures_estimated_leverage_ratio"},
+    "glassnode_futures_estimated_leverage_ratio": {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "path": "/v1/metrics/derivatives/futures_estimated_leverage_ratio", "request_kind": "confirmation_series", "raw_shape": "list_t_v_scalar", "required": True, "canonical_id": "glassnode_futures_estimated_leverage_ratio"},
 }
+
 
 OpenInterestAndFundingFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
 
@@ -63,13 +59,6 @@ def build_coinglass_history_params(*, timeframe: str, limit: int, start_timestam
     if start_timestamp is not None and end_timestamp is not None and start_timestamp > end_timestamp:
         raise ValueError("start_timestamp must not exceed end_timestamp")
     return params
-
-
-def build_cryptoquant_params(*, from_timestamp: int, to_timestamp: int, limit: int, window: str = "hour") -> dict[str, Any]:
-    start, end = _timestamp(from_timestamp, "from_timestamp"), _timestamp(to_timestamp, "to_timestamp")
-    if start > end or window != "hour":
-        raise ValueError("invalid CryptoQuant range or window")
-    return {"exchange": "all_exchange", "window": window, "from": _compact_utc(start), "to": _compact_utc(end), "limit": _positive_int(limit, "limit"), "format": "json"}
 
 
 def build_glassnode_params(*, from_timestamp: int, to_timestamp: int, currency: str | None = None) -> dict[str, Any]:
@@ -110,7 +99,7 @@ def _request(spec: Mapping[str, Any], *, metric_id: str, timeframe: str | None, 
 
 
 def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp: int, existing_state: Mapping[str, Any] | None = None,
-                                                recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = True,
+                                                recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = False,
                                                 include_confirmations: bool = True, refresh_secondary: bool = False) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError("unsupported mode")
@@ -150,7 +139,7 @@ def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp
         return plan
 
     plan: list[dict[str, Any]] = []
-    primary_timeframes = BOOTSTRAP_TIMEFRAMES if mode == "bootstrap" else ("1m",)
+    primary_timeframes = SCREEN_TIMEFRAMES
     for metric, key in (("open_interest_ohlc", "aggregated_open_interest_ohlc"), ("funding_rate_ohlc", "oi_weighted_funding_rate_ohlc")):
         spec = ENDPOINTS[key]
         for timeframe in primary_timeframes:
@@ -160,21 +149,18 @@ def build_open_interest_and_funding_fetch_plan(*, mode: str, reference_timestamp
             start = max(0, (existing_last if mode == "incremental" and existing_last is not None else end - (limit - 1) * TIMEFRAME_SECONDS[timeframe]) - TIMEFRAME_SECONDS[timeframe])
             plan.append(_request(spec, metric_id=metric, timeframe=timeframe, start=start, end=end,
                                  params=build_coinglass_history_params(timeframe=timeframe, limit=limit, start_timestamp=start, end_timestamp=end), suffix=timeframe))
-    # VR1 final endpoint policy: exchange-list snapshots and options-info are
-    # not contractual primitives.  Current OI/Funding state is derived from
-    # the canonical OHLC/rate series.  `include_snapshots` is preserved in the
-    # public signature for backward compatibility but intentionally causes no
-    # external request.
+    # Final-33 policy: no exchange-list/options snapshots and no CQ/GN OI/Funding
+    # confirmations.  Estimated Leverage Ratio is the only secondary OI primitive.
+    del include_snapshots
     if include_confirmations and (mode != "incremental" or refresh_secondary):
-        # OI and Funding already have canonical CoinGlass primitives.  The
-        # CryptoQuant and duplicate Glassnode OI/Funding confirmations were
-        # removed from the paid path.  ELR is retained because it is a unique
-        # market-context primitive used by the current contract.
         start = max(0, reference - (BOOTSTRAP_LIMIT - 1) * 3_600)
-        key = "glassnode_futures_estimated_leverage_ratio"
-        spec = ENDPOINTS[key]
-        plan.append(_request(spec, metric_id=key, timeframe="1h", start=start, end=reference,
-                             params=build_glassnode_params(from_timestamp=start, to_timestamp=reference), suffix="1h"))
+        spec = ENDPOINTS["glassnode_futures_estimated_leverage_ratio"]
+        plan.append(_request(
+            spec, metric_id="glassnode_futures_estimated_leverage_ratio", timeframe=None,
+            start=start, end=reference,
+            params=build_glassnode_params(from_timestamp=start, to_timestamp=reference),
+            suffix="native:1h",
+        ))
     return plan
 
 
@@ -204,7 +190,7 @@ class OpenInterestAndFundingRawExtractor:
         self.fetcher = fetcher
 
     def extract(self, *, mode: str, reference_timestamp: int, existing_state: Mapping[str, Any] | None = None,
-                recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = True, include_confirmations: bool = True,
+                recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_snapshots: bool = False, include_confirmations: bool = True,
                 data_mode: str = "live", is_demo: bool = False, execution_timestamp: int | None = None,
                 refresh_secondary: bool = False) -> dict[str, Any]:
         if data_mode not in {"live", "synthetic"} or type(is_demo) is not bool or (data_mode == "synthetic" and not is_demo):
@@ -226,7 +212,7 @@ class OpenInterestAndFundingRawExtractor:
             else:
                 raw["confirmations"][request["metric_id"]] = payload
         return {"family": FAMILY, "stage": "raw_input", "mode": mode, "context": {"asset": "BTC", "exchange_scope": "all_exchanges",
-                "primary_provider": "coinglass", "confirmation_providers": ["cryptoquant", "glassnode"], "data_mode": data_mode, "is_demo": is_demo,
+                "primary_provider": "coinglass", "confirmation_providers": ["glassnode"], "data_mode": data_mode, "is_demo": is_demo,
                 "reference_timestamp": reference, "execution_timestamp": execution, "requested_at": _iso_utc(execution),
                 "include_snapshots": include_snapshots, "include_confirmations": include_confirmations,
                 "refresh_secondary": bool(refresh_secondary)}, "raw": raw}
@@ -234,7 +220,7 @@ class OpenInterestAndFundingRawExtractor:
 
 def extract_open_interest_and_funding_raw(*, fetcher: OpenInterestAndFundingFetcher, mode: str, reference_timestamp: int,
                                           existing_state: Mapping[str, Any] | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
-                                          include_snapshots: bool = True, include_confirmations: bool = True, data_mode: str = "live",
+                                          include_snapshots: bool = False, include_confirmations: bool = True, data_mode: str = "live",
                                           is_demo: bool = False, execution_timestamp: int | None = None,
                                           refresh_secondary: bool = False) -> dict[str, Any]:
     return OpenInterestAndFundingRawExtractor(fetcher).extract(mode=mode, reference_timestamp=reference_timestamp, existing_state=existing_state,

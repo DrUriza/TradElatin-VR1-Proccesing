@@ -7,7 +7,14 @@ import json
 import math
 from typing import Any
 
-from processing_signals.processing.math.native_analysis import rolling_zscore, rolling_percentile, difference, rolling_wasserstein, pct_change as native_pct_change, latest
+from .long_short_liquidations_math import (
+    rolling_zscore,
+    rolling_percentile,
+    difference,
+    rolling_wasserstein,
+    pct_change as native_pct_change,
+    latest,
+)
 
 from .long_short_liquidations_feature_builder import (
     EVENT_INTENSITY_MIN_COMPLETE_BINS, EVENT_WINDOWS_SECONDS, MAP_BUCKET_WIDTH_BPS,
@@ -18,10 +25,10 @@ from .long_short_liquidations_feature_builder import (
 )
 
 REFERENCE_PRICE_MAX_AGE_SECONDS = 120
-POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h")
+POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "4h")
 VALID_DATASET_STATES = {"available", "partial", "unavailable", "invalid"}
 VALID_INPUT_QUALITY_STATES = VALID_DATASET_STATES | {"ok"}
-PROCESSING_REQUIRED_FEATURES = ["realized.series", "realized.windows.1h", "realized.windows.4h", "realized.windows.12h",
+PROCESSING_REQUIRED_FEATURES = ["realized.series", "realized.windows.4h", "realized.windows.12h",
                                 "realized.windows.24h", "exchange_distribution", "events.aggregate.24h", "maps.aggregated.base"]
 PROCESSING_OPTIONAL_FEATURES = ["realized.confirmations", "exchange_histories", "events.short_windows", "maps.by_exchange",
                                 "maps.aligned_exchanges", "maps.max_pain", "maps.spatial", "pressure"]
@@ -264,10 +271,7 @@ def validate_reference_price_context(context: Mapping[str, Any] | None, snapshot
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
     live_required = {"source_family": "prices_ohlcv", "source_market": "spot", "source_timeframe": "1m",
                      "price_field": "close", "is_closed_bar": True}
-    synthetic_required = {"source_family": "long_short_liquidations", "source_market": "futures",
-                          "source_timeframe": "snapshot", "price_field": "provider_price", "is_closed_bar": True}
-    required = synthetic_required if context.get("synthetic_fixture_alignment") is True else live_required
-    if not isinstance(context, Mapping) or any(context.get(key) != value for key, value in required.items()):
+    if not isinstance(context, Mapping) or any(context.get(key) != value for key, value in live_required.items()):
         return None, {"status": "unavailable", "reason": "invalid_reference_price_context"}
     value, timestamp = context.get("value"), context.get("timestamp")
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -303,14 +307,12 @@ def _dataset_group_status(payload: Any) -> str:
 
 def _source_selection(providers: Mapping[str, Any]) -> dict[str, Any]:
     definitions = {
-        "realized_aggregate": ("coinglass", "aggregated_history", "canonical"), "realized_by_exchange": ("coinglass", "pair_history", "canonical"),
-        "exchange_distribution": ("coinglass", "exchange_snapshot", "snapshot"), "events": ("coinglass", "events", "canonical"),
-        "aggregated_map": ("coinglass", "aggregated_map", "snapshot"), "exchange_maps": ("coinglass", "pair_maps", "optional"),
-        "max_pain": ("coinglass", "max_pain", "optional"), "cryptoquant_confirmation": ("cryptoquant", "aggregate_history", "confirmation"),
-        "glassnode_long_confirmation": ("glassnode", "long_liquidations", "confirmation"),
-        "glassnode_short_confirmation": ("glassnode", "short_liquidations", "confirmation"),
-        "glassnode_total_confirmation": ("glassnode", "total_liquidations", "confirmation"),
-        "glassnode_dominance_reference": ("glassnode", "long_liquidation_dominance", "optional")}
+        "realized_aggregate": ("coinglass", "aggregated_history", "canonical"),
+        "events": ("coinglass", "events", "canonical"),
+        "aggregated_map": ("coinglass", "aggregated_map", "snapshot"),
+        "exchange_maps": ("coinglass", "pair_maps", "screen_a_pair_maps"),
+        "positioning": ("coinglass", "positioning_by_exchange_timeframe", "canonical"),
+    }
     output = {}
     for name, (provider, dataset, role) in definitions.items():
         parent = providers.get(provider, {}) if isinstance(providers.get(provider, {}), Mapping) else {}
@@ -319,7 +321,6 @@ def _source_selection(providers: Mapping[str, Any]) -> dict[str, Any]:
         output[name] = {"provider": provider, "dataset_path": f"{provider}.{dataset}", "status": status,
                         "selected": status in {"available", "partial"}, "role": role, "fallback_applied": False}
     return output
-
 
 def _events_coverage_complete(dataset: Mapping[str, Any], start: int, end: int) -> bool:
     if dataset.get("status") != "available" or "event_endpoint_record_limit_reached" in dataset.get("warnings", []):
@@ -386,23 +387,25 @@ def _invalid_output(reference_timestamp: int, config: Mapping[str, Any] | None, 
 def _build_positioning_history(
     positioning: Mapping[str, Sequence[Mapping[str, Any]]] | None,
     *,
-    limit: int = 730,
+    limit: int = 500,
+    bucket_seconds: int = 3600,
 ) -> dict[str, Any]:
     """Build Screen-A positioning history on the provider ratio timeline.
 
     Positioning is an independent market series.  It must not inherit the
     timestamp domain of realized liquidations; doing so can turn valid ratio
     history into an all-None chart whenever the two datasets have different
-    coverage.  We select a canonical hourly timeline from the best available
-    CoinGlass ratio series and align the other two ratios by the same UTC hour.
-    No neutral/fallback values are injected.
+    coverage.  We preserve the selected timeframe by aligning the three
+    CoinGlass ratio series on that timeframe's UTC bucket.  No hourly
+    downsampling and no neutral/fallback values are injected.
     """
 
     positioning = positioning or {}
-    names = ("top_position_ratio", "top_account_ratio", "global_account_ratio")
+    names = ("long_short_ratio",)
+    bucket_seconds = max(1, int(bucket_seconds))
     buckets: dict[str, dict[int, tuple[int, float]]] = {}
     for name in names:
-        by_hour: dict[int, tuple[int, float]] = {}
+        by_bucket: dict[int, tuple[int, float]] = {}
         for row in positioning.get(name, ()):
             if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
                 continue
@@ -410,25 +413,21 @@ def _build_positioning_history(
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 continue
             ts = int(row["timestamp"])
-            hour = ts // 3600
-            # If a provider revises the same bucket, keep the newest observation.
-            previous = by_hour.get(hour)
+            bucket = ts // bucket_seconds
+            # If a provider revises the same timeframe bucket, keep the newest observation.
+            previous = by_bucket.get(bucket)
             if previous is None or ts >= previous[0]:
-                by_hour[hour] = (ts, float(value))
-        buckets[name] = by_hour
+                by_bucket[bucket] = (ts, float(value))
+        buckets[name] = by_bucket
 
-    # Prefer Top Position because it is the primary Screen-A series; otherwise
-    # use whichever valid ratio has the broadest coverage.
-    primary = "top_position_ratio"
-    if not buckets[primary]:
-        primary = max(names, key=lambda name: len(buckets[name]))
+    primary = "long_short_ratio"
     primary_rows = buckets[primary]
-    hours = sorted(primary_rows)[-max(1, int(limit)):] if primary_rows else []
+    selected_buckets = sorted(primary_rows)[-max(1, int(limit)):] if primary_rows else []
 
     points: list[dict[str, Any]] = []
-    for hour in hours:
-        timestamp = primary_rows[hour][0]
-        values = {name: (buckets[name].get(hour) or (None, None))[1] for name in names}
+    for bucket in selected_buckets:
+        timestamp = primary_rows[bucket][0]
+        values = {name: (buckets[name].get(bucket) or (None, None))[1] for name in names}
         shares: dict[str, float | None] = {}
         for ratio_name, ratio_value in values.items():
             stem = ratio_name.removesuffix("_ratio")
@@ -487,34 +486,32 @@ def _native_liquidation_analysis(
 
     def ratio_series(name: str) -> list[float | None]:
         # CoinGlass ratio candles are UTC-hour aligned while liquidation history
-        # may carry the run's minute offset.  Join by the same closed 1h bucket.
-        lookup = {int(row["timestamp"]) // 3600: row.get("long_short_ratio") for row in positioning.get(name, ())
+        # may carry the run's minute offset.  Join by the same closed 4h bucket.
+        lookup = {int(row["timestamp"]) // 14400: row.get("long_short_ratio") for row in positioning.get(name, ())
                   if isinstance(row, Mapping) and type(row.get("timestamp")) is int}
-        return [lookup.get(int(ts) // 3600) for ts in timestamps]
-    top_position = ratio_series("top_position_ratio")
-    top_account = ratio_series("top_account_ratio")
-    global_account = ratio_series("global_account_ratio")
-    crowding_raw = [None if value is None or float(value) <= 0 else math.log(float(value)) for value in top_position]
+        return [lookup.get(int(ts) // 14400) for ts in timestamps]
+    long_short_ratio = ratio_series("long_short_ratio")
+    crowding_raw = [None if value is None or float(value) <= 0 else math.log(float(value)) for value in long_short_ratio]
     crowding_score = rolling_zscore(crowding_raw, 48, 24)
     pressure_score = [None if z is None or imb is None else float(z) * float(imb) for z,imb in zip(intensity_z,imbalance,strict=True)]
     combined = [None if c is None and p is None else float((c or 0.0) + (p or 0.0)) / 2.0 for c,p in zip(crowding_score,pressure_score,strict=True)]
     regime_score = [None if z is None or imb is None or cas is None else float(z) * 0.45 + float(imb) * 0.35 + float(cas) * 0.20 for z,imb,cas in zip(intensity_z,imbalance,cascade_z,strict=True)]
-    wasserstein = rolling_wasserstein(totals, 24, 168)
+    log_totals = [None if value is None or float(value) < 0 else math.log1p(float(value)) for value in totals]
+    wasserstein = rolling_wasserstein(log_totals, 24, 168)
 
     return {
         "status":"available" if rows else "unavailable", "timestamps":timestamps,
-        "positioning": {"top_position_ratio":top_position, "top_account_ratio":top_account, "global_account_ratio":global_account},
+        "positioning": {"long_short_ratio":long_short_ratio},
         "positioning_history": positioning_history,
         "indicators": {
             "liquidation_intensity_zscore": {"intensity_zscore":intensity_z,"intensity_percentile":intensity_pct,"total_liquidations_musd":total_musd},
             "long_short_liquidation_imbalance": {"liquidation_imbalance":imbalance,"long_liquidations_musd":[None if v is None else float(v)/1e6 for v in long_values],"short_liquidations_musd":[None if v is None else float(v)/1e6 for v in short_values]},
             "cascade_acceleration": {"cascade_acceleration":cascade,"cascade_zscore":cascade_z,"total_liquidations_musd":total_musd},
             "price_liquidation_regime": {"price_return_pct":price_return_pct,"price_liquidation_regime_score":price_regime},
-            "crowding_liquidation_pressure": {"top_position_ratio":top_position,"crowding_score":crowding_score,"liquidation_pressure_score":pressure_score,"crowding_liquidation_score":combined},
+            "crowding_liquidation_pressure": {"long_short_ratio":long_short_ratio,"crowding_score":crowding_score,"liquidation_pressure_score":pressure_score,"crowding_liquidation_score":combined},
             "liquidation_regime_hmi": {"liquidation_regime_score":regime_score,"wasserstein_distance":wasserstein},
         },
-        "current": {"top_position_ratio":latest(top_position), "top_account_ratio":latest(top_account),
-                    "global_account_ratio":latest(global_account), "liquidation_regime_score":latest(regime_score),
+        "current": {"long_short_ratio":latest(long_short_ratio), "liquidation_regime_score":latest(regime_score),
                     "wasserstein_distance":latest(wasserstein)},
         "recalculate_in_hmi":False,
     }
@@ -534,31 +531,25 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     providers, cg = source["providers"], source["providers"]["coinglass"]
     history = cg["aggregated_history"]
     records = _usable(history, "records")
-    realized_end = window_end_for_hourly(reference_timestamp, records)
+    realized_end = window_end_for_hourly(reference_timestamp, records, source_interval_seconds=900)
     windows, variations = {}, {}
     for label, seconds in REALIZED_WINDOWS_SECONDS.items():
-        current = aggregate_regular_window(records, window_end=realized_end, window_seconds=seconds)
-        previous = aggregate_regular_window(records, window_end=realized_end-seconds, window_seconds=seconds)
+        current = aggregate_regular_window(records, window_end=realized_end, window_seconds=seconds, source_interval_seconds=900)
+        previous = aggregate_regular_window(records, window_end=realized_end-seconds, window_seconds=seconds, source_interval_seconds=900)
         if history["status"] == "partial" and current["status"] == "available":
             current["status"], current["reason"] = "partial", "source_dataset_partial"
         windows[label], variations[label] = current, variation(current, previous)
     realized_series = [{**record, "total_liquidation_usd": record["long_liquidation_usd"] + record["short_liquidation_usd"]} for record in records]
     realized_provenance = {"provider": "coinglass", "endpoint_id": history.get("provenance", {}).get("endpoint_id"),
-                           "source_dataset": "coinglass.aggregated_history", "source_interval": history.get("interval", "1h"),
+                           "source_dataset": "coinglass.aggregated_history", "source_interval": history.get("interval", "15m"),
                            "source_unit": "USD", "source_status": history["status"], "source_reference_timestamp": reference_timestamp,
                            "calculation_method": "semi_open_regular_windows_and_long_plus_short",
                            "windows": {key: {"window_start": value["window_start"], "window_end": value["window_end"],
                                              "coverage_ratio": value["coverage_ratio"]} for key, value in windows.items()}}
-    snapshot = cg["exchange_snapshot"]
-    exchange_distribution = build_exchange_distribution(_usable(snapshot, "records"))
-    if snapshot["status"] == "invalid":
-        exchange_distribution = {"status": "invalid", "reason": snapshot["reason"], "exchanges": []}
-    exchange_distribution["provenance"] = {"provider": "coinglass", "endpoint_id": snapshot.get("provenance", {}).get("endpoint_id"),
-        "snapshot_observed_at": snapshot.get("snapshot_observed_at"), "source_data_as_of": snapshot.get("source_data_as_of"),
-        "valid_exchange_count": len(exchange_distribution.get("exchanges", [])),
-        "excluded_exchange_count": len(snapshot.get("records", [])) - len(exchange_distribution.get("exchanges", [])),
-        "calculation_method": "computed_long_plus_short_then_valid_total_shares"}
-    exchange_histories = {exchange: {label: aggregate_regular_window(_usable(dataset, "records"), window_end=realized_end, window_seconds=seconds)
+    # Exchange distribution is derived from the contracted event stream;
+    # the removed exchange-list endpoint is not needed.
+    exchange_distribution: dict[str, Any] = {"status": "unavailable", "reason": "events_not_processed", "exchanges": []}
+    exchange_histories = {exchange: {label: aggregate_regular_window(_usable(dataset, "records"), window_end=realized_end, window_seconds=seconds, source_interval_seconds=900)
                                      for label, seconds in REALIZED_WINDOWS_SECONDS.items()}
                           for exchange, dataset in cg.get("pair_history", {}).items() if dataset["status"] in {"available", "partial"}}
     all_events, by_exchange_events = {}, {}
@@ -574,89 +565,129 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     aggregate_events = {label: build_event_window(list(all_events.values()), window_end=reference_timestamp, window_seconds=seconds,
                         coverage_complete=aggregate_coverage(reference_timestamp-seconds, reference_timestamp))
                         for label, seconds in EVENT_WINDOWS_SECONDS.items()}
+    event_distribution_records = []
+    for exchange, dataset in event_datasets.items():
+        event_records = _usable(dataset, "records")
+        long_usd = sum(float(row.get("usd_value", 0.0)) for row in event_records if row.get("order_side") == "sell")
+        short_usd = sum(float(row.get("usd_value", 0.0)) for row in event_records if row.get("order_side") == "buy")
+        event_distribution_records.append({
+            "exchange": exchange, "exchange_key": str(exchange).lower(),
+            "long_liquidation_usd": long_usd, "short_liquidation_usd": short_usd,
+            "liquidation_usd": long_usd + short_usd,
+        })
+    exchange_distribution = build_exchange_distribution(event_distribution_records)
+    event_data_as_of = max((int(row["timestamp"]) for row in all_events.values()
+                            if isinstance(row, Mapping) and type(row.get("timestamp")) is int), default=None)
+    exchange_distribution["provenance"] = {
+        "provider": "coinglass", "endpoint_id": "liquidation_order_events",
+        "source_dataset": "coinglass.events", "snapshot_observed_at": reference_timestamp,
+        "source_data_as_of": event_data_as_of, "valid_exchange_count": len(event_distribution_records),
+        "calculation_method": "event_stream_long_short_aggregation",
+    }
     event_provenance = {"providers": ["coinglass"], "included_exchanges": sorted(event_datasets), "interval": "event",
                         "truncation_detected": any("event_endpoint_record_limit_reached" in d.get("warnings", []) for d in event_datasets.values()),
                         "failed_segments": sum(d.get("status") != "available" for d in event_datasets.values()),
                         "calculation_method": "event_id_deduplication_and_semi_open_windows",
                         "zero_policy": "zero_only_when_request_coverage_complete"}
-    map_source = cg["aggregated_map"]
-    snapshot_at = map_source.get("snapshot_observed_at")
+    map_ranges = tuple(cg.get("map_ranges", ("1d", "7d", "30d")))
+    if not map_ranges:
+        map_ranges = ("1d", "7d", "30d")
+    aggregated_sources = cg.get("aggregated_maps_by_range", {}) if isinstance(cg.get("aggregated_maps_by_range"), Mapping) else {}
+    pair_sources = cg.get("pair_maps_by_range", {}) if isinstance(cg.get("pair_maps_by_range"), Mapping) else {}
+    if "1d" not in aggregated_sources:
+        aggregated_sources = {**aggregated_sources, "1d": cg["aggregated_map"]}
+    if "1d" not in pair_sources:
+        pair_sources = {**pair_sources, "1d": cg.get("pair_maps", {})}
+
+    default_map_source = aggregated_sources.get("1d", cg["aggregated_map"])
+    snapshot_at = default_map_source.get("snapshot_observed_at")
     price, reference_payload = validate_reference_price_context(price_context, snapshot_at)
     reference_reason = reference_payload.get("reason", "missing_reference_price")
-    aggregated_map = build_map_features(_usable(map_source, "levels"), price, reference_reason=reference_reason)
-    base_status = ("invalid" if map_source["status"] == "invalid" else "unavailable" if map_source["status"] == "unavailable"
-                   else aggregated_map["concentration"]["complete_map"]["status"])
-    aggregated_map["base"] = {"status": base_status,
-                              "reason": map_source.get("reason") if map_source["status"] in {"invalid", "unavailable"}
-                              else aggregated_map["concentration"]["complete_map"].get("reason"),
-                              "level_count": len(aggregated_map.get("provider_levels", [])), "concentration": aggregated_map["concentration"]["complete_map"]}
-    map_provenance = {"provider": "coinglass", "endpoint_id": map_source.get("provenance", {}).get("endpoint_id"),
-        "source_dataset": "coinglass.aggregated_map", "source_snapshot_timestamp": snapshot_at,
-        "reference_price_source_family": price_context.get("source_family") if isinstance(price_context, Mapping) else None,
-        "reference_price_source_market": price_context.get("source_market") if isinstance(price_context, Mapping) else None,
-        "reference_price_timeframe": price_context.get("source_timeframe") if isinstance(price_context, Mapping) else None,
-        "reference_price_timestamp": price_context.get("timestamp") if isinstance(price_context, Mapping) else None,
-        "side_assignment_method": "spatial_convention_v1", "provider_side_label_supplied": False,
-        "bucket_width_bps": MAP_BUCKET_WIDTH_BPS, "central_tolerance_bps": MAP_CENTRAL_TOLERANCE_BPS,
-        "interpolation_enabled": MAP_INTERPOLATION_ENABLED, "calculation_method": "decimal_relative_bps_bucketing"}
-    aggregated_map["provenance"] = map_provenance
-    by_exchange_maps, included, excluded, exclusion_reasons = {}, [], [], {}
-    for exchange, dataset in cg.get("pair_maps", {}).items():
-        feature = build_map_features(_usable(dataset, "levels"), price, reference_reason=reference_reason)
-        feature["provenance"] = {
-            **(feature.get("provenance", {}) if isinstance(feature.get("provenance"), Mapping) else {}),
-            "provider": "coinglass",
-            "endpoint_id": dataset.get("provenance", {}).get("endpoint_id"),
-            "source_dataset": f"coinglass.pair_maps.{exchange}",
-            "source_snapshot_timestamp": dataset.get("snapshot_observed_at"),
-            "reference_price_timestamp": reference_payload.get("timestamp"),
-            "reference_price_value": price,
-        }
-        by_exchange_maps[exchange] = feature
-        if feature["status"] == "available" and feature["buckets"]["status"] in {"available", "partial"} and feature["buckets"]["items"]:
-            included.append(exchange)
-        else:
-            excluded.append(exchange)
-            exclusion_reasons[exchange] = feature.get("reason", reference_reason)
-    aligned_status = "available" if included and not excluded else "partial" if included else "unavailable"
-    aligned = {"status": aligned_status, "reason": None if aligned_status == "available" else "some_exchange_maps_excluded" if included else "no_exchange_maps_aligned",
-               "included_exchanges": sorted(included), "excluded_exchanges": sorted(excluded), "exclusion_reasons": exclusion_reasons,
-               "buckets": {"status": aligned_status, "reason": None if aligned_status == "available" else
-                           "some_exchange_maps_excluded" if included else "no_exchange_maps_aligned",
-                           "items": {exchange: deepcopy(by_exchange_maps[exchange]["buckets"]["items"]) for exchange in included}},
-               "provenance": {"calculation_method": "independent_exchange_map_alignment", "reference_price_status": reference_payload["status"]}}
-    confirmations = {}
-    cq = providers.get("cryptoquant", {}).get("aggregate_history", {}) if isinstance(providers.get("cryptoquant"), Mapping) else {}
-    if isinstance(cq, Mapping):
-        confirmations["cryptoquant"] = confirmation(records, _usable(cq, "records") if cq.get("status") in VALID_DATASET_STATES else [],
-                                                       intervals_match=cq.get("interval", "1h") == "1h")
-    glassnode = providers.get("glassnode", {}) if isinstance(providers.get("glassnode"), Mapping) else {}
-    long_gn, short_gn = glassnode.get("long_liquidations", {}), glassnode.get("short_liquidations", {})
-    if isinstance(long_gn, Mapping) and isinstance(short_gn, Mapping):
-        joined = {}
-        for record in _usable(long_gn, "records"):
-            joined.setdefault(record["timestamp"], {})["long"] = record.get("value")
-        for record in _usable(short_gn, "records"):
-            joined.setdefault(record["timestamp"], {})["short"] = record.get("value")
-        gn_records = [{"timestamp": timestamp, "long_liquidations_usd": values["long"], "short_liquidations_usd": values["short"]}
-                      for timestamp, values in joined.items() if values.get("long") is not None and values.get("short") is not None]
-        confirmations["glassnode"] = confirmation(records, gn_records, units_match=long_gn.get("unit") == short_gn.get("unit") == "USD")
+
+    def build_range_maps(range_value: str):
+        map_source_local = aggregated_sources.get(range_value, {})
+        if not isinstance(map_source_local, Mapping):
+            map_source_local = {}
+        aggregated_local = build_map_features(_usable(map_source_local, "levels"), price, reference_reason=reference_reason)
+        source_status = map_source_local.get("status", "unavailable")
+        base_status = ("invalid" if source_status == "invalid" else "unavailable" if source_status == "unavailable"
+                       else aggregated_local["concentration"]["complete_map"]["status"])
+        aggregated_local["base"] = {"status": base_status,
+            "reason": map_source_local.get("reason") if source_status in {"invalid", "unavailable"}
+            else aggregated_local["concentration"]["complete_map"].get("reason"),
+            "level_count": len(aggregated_local.get("provider_levels", [])),
+            "concentration": aggregated_local["concentration"]["complete_map"]}
+        aggregated_local["range"] = range_value
+        aggregated_local["provenance"] = {
+            "provider": "coinglass", "endpoint_id": map_source_local.get("provenance", {}).get("endpoint_id"),
+            "source_dataset": f"coinglass.aggregated_maps_by_range.{range_value}",
+            "source_snapshot_timestamp": map_source_local.get("snapshot_observed_at"),
+            "reference_price_source_family": price_context.get("source_family") if isinstance(price_context, Mapping) else None,
+            "reference_price_source_market": price_context.get("source_market") if isinstance(price_context, Mapping) else None,
+            "reference_price_timeframe": price_context.get("source_timeframe") if isinstance(price_context, Mapping) else None,
+            "reference_price_timestamp": price_context.get("timestamp") if isinstance(price_context, Mapping) else None,
+            "side_assignment_method": "spatial_convention_v1", "provider_side_label_supplied": False,
+            "bucket_width_bps": MAP_BUCKET_WIDTH_BPS, "central_tolerance_bps": MAP_CENTRAL_TOLERANCE_BPS,
+            "interpolation_enabled": MAP_INTERPOLATION_ENABLED, "calculation_method": "decimal_relative_bps_bucketing",
+            "provider_range": range_value}
+
+        by_exchange_local, included, excluded, exclusion_reasons = {}, [], [], {}
+        pair_range = pair_sources.get(range_value, {}) if isinstance(pair_sources.get(range_value), Mapping) else {}
+        for exchange in ("Binance", "OKX", "Bybit", "Hyperliquid"):
+            dataset = pair_range.get(exchange, {}) if isinstance(pair_range.get(exchange), Mapping) else {}
+            feature = build_map_features(_usable(dataset, "levels"), price, reference_reason=reference_reason)
+            feature["range"] = range_value
+            feature["provenance"] = {
+                **(feature.get("provenance", {}) if isinstance(feature.get("provenance"), Mapping) else {}),
+                "provider": "coinglass", "endpoint_id": dataset.get("provenance", {}).get("endpoint_id"),
+                "source_dataset": f"coinglass.pair_maps_by_range.{range_value}.{exchange}",
+                "source_snapshot_timestamp": dataset.get("snapshot_observed_at"),
+                "reference_price_timestamp": reference_payload.get("timestamp"), "reference_price_value": price,
+                "provider_range": range_value}
+            by_exchange_local[exchange] = feature
+            if feature["status"] == "available" and feature["buckets"]["status"] in {"available", "partial"} and feature["buckets"]["items"]:
+                included.append(exchange)
+            else:
+                excluded.append(exchange); exclusion_reasons[exchange] = feature.get("reason", reference_reason)
+        aligned_status = "available" if included and not excluded else "partial" if included else "unavailable"
+        aligned_local = {"status": aligned_status,
+            "reason": None if aligned_status == "available" else "some_exchange_maps_excluded" if included else "no_exchange_maps_aligned",
+            "included_exchanges": sorted(included), "excluded_exchanges": sorted(excluded), "exclusion_reasons": exclusion_reasons,
+            "buckets": {"status": aligned_status,
+                "reason": None if aligned_status == "available" else "some_exchange_maps_excluded" if included else "no_exchange_maps_aligned",
+                "items": {exchange: deepcopy(by_exchange_local[exchange]["buckets"]["items"]) for exchange in included}},
+            "provenance": {"calculation_method": "independent_exchange_map_alignment",
+                "reference_price_status": reference_payload["status"], "provider_range": range_value}}
+        return aggregated_local, by_exchange_local, aligned_local
+
+    aggregated_by_range, by_exchange_by_range, aligned_by_range = {}, {}, {}
+    for range_value in ("1d", "7d", "30d"):
+        agg_one, exch_one, aligned_one = build_range_maps(range_value)
+        aggregated_by_range[range_value] = agg_one
+        by_exchange_by_range[range_value] = exch_one
+        aligned_by_range[range_value] = aligned_one
+
+    aggregated_map = aggregated_by_range["1d"]
+    by_exchange_maps = by_exchange_by_range["1d"]
+    aligned = aligned_by_range["1d"]
+    map_source = default_map_source
+    confirmations: dict[str, Any] = {}
     historical_totals = []
     for offset in range(1, 73):
-        item = aggregate_regular_window(records, window_end=realized_end-offset*3600, window_seconds=3600)
+        item = aggregate_regular_window(records, window_end=realized_end-offset*3600, window_seconds=3600, source_interval_seconds=900)
         if item["status"] == "available":
             historical_totals.append(item["total_usd"])
-    realized_intensity = empirical_percentile(windows["1h"].get("total_usd") or 0, historical_totals, 24) if windows["1h"]["status"] != "unavailable" else None
+    realized_intensity = empirical_percentile(windows["4h"].get("total_usd") or 0, historical_totals, 24) if windows["4h"]["status"] != "unavailable" else None
     deltas = [max(historical_totals[index] - historical_totals[index+1], 0) for index in range(len(historical_totals)-1)]
-    previous_1h = aggregate_regular_window(records, window_end=realized_end-3600, window_seconds=3600)
-    current_delta = max((windows["1h"].get("total_usd") or 0) - (previous_1h.get("total_usd") or 0), 0)
+    previous_4h = aggregate_regular_window(records, window_end=realized_end-14400, window_seconds=14400, source_interval_seconds=900)
+    current_delta = max((windows["4h"].get("total_usd") or 0) - (previous_4h.get("total_usd") or 0), 0)
     realized_acceleration = empirical_percentile(current_delta, deltas, 24)
     event_intensity = build_event_intensity(list(all_events.values()), current_end=reference_timestamp, coverage_checker=aggregate_coverage)
     proximity_value = aggregated_map.get("map_proximity") if isinstance(aggregated_map.get("map_proximity"), (int, float)) else None
     component_values = {"realized_intensity": realized_intensity, "realized_acceleration": realized_acceleration,
         "event_intensity": event_intensity["value"], "map_proximity": proximity_value,
         "map_concentration": aggregated_map.get("concentration", {}).get("complete_map", {}).get("top3_share"),
-        "imbalance_magnitude": abs(windows["1h"]["imbalance"]["value"]) if windows["1h"]["imbalance"].get("value") is not None else None}
+        "imbalance_magnitude": abs(windows["4h"]["imbalance"]["value"]) if windows["4h"]["imbalance"].get("value") is not None else None}
     pressure = build_pressure_score(component_values)
     pressure["components"] = {name: {"value": value, "status": "available" if value is not None else "unavailable",
                                      "reason": None if value is not None else (event_intensity["reason"] if name == "event_intensity" else "component_unavailable")}
@@ -665,9 +696,9 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     pressure["parameters"] = {"realized_baseline_hours": 72, "realized_minimum_baseline_points": 24, "event_baseline_hours": 24,
         "event_bin_seconds": 900, "event_minimum_complete_bins": EVENT_INTENSITY_MIN_COMPLETE_BINS,
         "map_proximity_decay_bps": MAP_PROXIMITY_DECAY_BPS, "minimum_available_weight": PRESSURE_MIN_AVAILABLE_WEIGHT}
-    pressure["provenance"] = {"component_source_paths": {"realized_intensity": "realized.windows.1h", "event_intensity": "events.aggregate",
+    pressure["provenance"] = {"component_source_paths": {"realized_intensity": "realized.windows.4h", "event_intensity": "events.aggregate",
         "map_proximity": "maps.aggregated.map_proximity", "map_concentration": "maps.aggregated.concentration.complete_map.top3_share",
-        "imbalance_magnitude": "realized.windows.1h.imbalance"}, "calculation_method": "weighted_normalized_component_score"}
+        "imbalance_magnitude": "realized.windows.4h.imbalance"}, "calculation_method": "weighted_normalized_component_score"}
     statuses = {"realized.series": "invalid" if history["status"] == "invalid" else "available" if realized_series else "unavailable",
                 **{f"realized.windows.{key}": "invalid" if history["status"] == "invalid" else value["status"] for key, value in windows.items()},
                 "exchange_distribution": exchange_distribution["status"], "events.aggregate.24h": aggregate_events["24h"]["status"],
@@ -683,13 +714,25 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
     else:
         quality_status = "available"
     warnings = list(dict.fromkeys(source["quality"].get("warnings", []) + history.get("warnings", []) + map_source.get("warnings", [])))
+    positioning_bucket_seconds = {"1m": 60, "5m": 300, "15m": 900, "4h": 14400}
     positioning_by_timeframe = {}
     raw_positioning_tf = cg.get("positioning_by_timeframe", {}) if isinstance(cg.get("positioning_by_timeframe"), Mapping) else {}
     for timeframe in POSITIONING_TIMEFRAMES:
         positioning_by_timeframe[timeframe] = _build_positioning_history({
             name: raw_positioning_tf.get(name, {}).get(timeframe, {}).get("records", [])
-            for name in ("top_position_ratio", "top_account_ratio", "global_account_ratio")
-        })
+            for name in ("long_short_ratio",)
+        }, bucket_seconds=positioning_bucket_seconds[timeframe])
+
+    positioning_by_exchange_timeframe: dict[str, dict[str, Any]] = {}
+    raw_exchange_tf = cg.get("positioning_by_exchange_timeframe", {}) \
+        if isinstance(cg.get("positioning_by_exchange_timeframe"), Mapping) else {}
+    for exchange in ("Binance", "OKX", "Bybit"):
+        positioning_by_exchange_timeframe[exchange] = {}
+        for timeframe in POSITIONING_TIMEFRAMES:
+            positioning_by_exchange_timeframe[exchange][timeframe] = _build_positioning_history({
+                name: raw_exchange_tf.get(name, {}).get(exchange, {}).get(timeframe, {}).get("records", [])
+                for name in ("long_short_ratio",)
+            }, bucket_seconds=positioning_bucket_seconds[timeframe])
 
     result = {"family": "long_short_liquidations", "stage": "processing", "reference_timestamp": reference_timestamp,
         "configuration": {"version": "0.1", **configuration}, "source_selection": _source_selection(providers),
@@ -697,17 +740,20 @@ def process_long_short_liquidations(input_contract: Mapping[str, Any], *, refere
                      "provenance": realized_provenance},
         "exchange_distribution": exchange_distribution, "exchange_histories": exchange_histories,
         "events": {"aggregate": aggregate_events, "by_exchange": by_exchange_events, "provenance": event_provenance},
-        "maps": {"reference_price": reference_payload, "aggregated": aggregated_map, "by_exchange": by_exchange_maps,
-                 "aligned_exchanges": aligned, "max_pain": _max_pain(cg["max_pain"], price)}, "pressure": pressure,
+        "maps": {"reference_price": reference_payload, "selected_range": "1d", "ranges": ["1d", "7d", "30d"],
+                 "aggregated": aggregated_map, "by_exchange": by_exchange_maps, "aligned_exchanges": aligned,
+                 "aggregated_by_range": aggregated_by_range, "by_exchange_by_range": by_exchange_by_range,
+                 "aligned_exchanges_by_range": aligned_by_range,
+                 "max_pain": _max_pain(cg["max_pain"], price)}, "pressure": pressure,
         "liquidation_analysis": _native_liquidation_analysis(realized_series, price_history=price_history, positioning={
-            "top_position_ratio": cg.get("top_position_ratio", {}).get("records", []),
-            "top_account_ratio": cg.get("top_account_ratio", {}).get("records", []),
-            "global_account_ratio": cg.get("global_account_ratio", {}).get("records", []),
+            "long_short_ratio": cg.get("long_short_ratio", {}).get("records", []),
         }),
         "quality": {"status": quality_status, "required_features": PROCESSING_REQUIRED_FEATURES,
                     "optional_features": PROCESSING_OPTIONAL_FEATURES, "missing_features": missing, "invalid_features": invalid,
                     "partial_features": partial, "unavailable_features": unavailable, "warnings": warnings, "errors": []}}
     result["liquidation_analysis"]["positioning_history_by_timeframe"] = positioning_by_timeframe
+    result["liquidation_analysis"]["positioning_history_by_exchange_timeframe"] = positioning_by_exchange_timeframe
+    result["liquidation_analysis"]["positioning_exchanges"] = ["Binance", "OKX", "Bybit"]
     result["liquidation_analysis"]["positioning_timeframes"] = list(POSITIONING_TIMEFRAMES)
     _json_safe(result, "output")
     json.dumps(result, ensure_ascii=False, allow_nan=False)

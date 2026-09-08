@@ -25,7 +25,7 @@ _BASIS_FIELDS = (
     "realized_rolling_mean_30d",
     "realized_rolling_std_30d",
     "realized_z_score_30d",
-    "realized_percentile_rank_90d",
+    "realized_percentile_rank_30d",
     "dvol",
     "spread_7d",
 )
@@ -107,7 +107,7 @@ def classify_percentile_regime(rank: Any) -> str | None:
 
 def calculate_regime_confidence(realized_rank: Any, realized_state: str) -> dict[str, Any]:
     """Confidence derives only from the realized-volatility percentile geometry."""
-    rank = _finite(realized_rank, "realized_percentile_rank_90d", nullable=False)
+    rank = _finite(realized_rank, "realized_percentile_rank_30d", nullable=False)
     if rank < 0 or rank > 1:
         raise ValueError("invalid_percentile_rank")
     if realized_state == "low_vol":
@@ -150,14 +150,14 @@ def classify_daily_regime_record(record: Mapping[str, Any]) -> dict[str, Any]:
         output.update(status="invalid", reason="invalid_processing_basis")
         return output
     try:
-        realized_state = classify_percentile_regime(record.get("realized_percentile_rank_90d"))
+        realized_state = classify_percentile_regime(record.get("realized_percentile_rank_30d"))
     except ValueError:
         output.update(status="invalid", reason="invalid_percentile_rank")
         return output
     if realized_state is None:
         output["reason"] = "classification_warmup_incomplete"
         return output
-    confidence = calculate_regime_confidence(record.get("realized_percentile_rank_90d"), realized_state)
+    confidence = calculate_regime_confidence(record.get("realized_percentile_rank_30d"), realized_state)
     output.update(regime=realized_state, status="available", reason=None, **confidence)
     return output
 
@@ -189,7 +189,7 @@ def classify_daily_regime_history(feature: Mapping[str, Any]) -> dict[str, Any]:
     elif not current:
         status, reason = "unavailable", "current_regime_unavailable"
     elif feature.get("status") in {"available", "partial"}:
-        # Expected warm-up rows before a 90-day percentile are not a current-data degradation.
+        # Expected warm-up rows before a 30-day percentile are not a current-data degradation.
         status, reason = "available", None
     else:
         status, reason = feature.get("status", "unavailable"), feature.get("reason") or "daily_regime_basis_unavailable"
@@ -403,7 +403,7 @@ def _context(processing: Mapping[str, Any]) -> dict[str, Any]:
             "confidence_medium_threshold": CONFIDENCE_MEDIUM_THRESHOLD,
         },
         "classification_policy": {
-            "primary_regime_basis": "realized_percentile_rank_90d",
+            "primary_regime_basis": "realized_percentile_rank_30d",
             "confidence_basis": "realized_percentile_boundary_distance",
             "dvol_role": "implied_volatility_context",
             "spread_basis": "realized_minus_implied",

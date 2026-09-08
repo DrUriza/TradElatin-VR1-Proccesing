@@ -8,13 +8,11 @@ from typing import Any
 
 FAMILY = "etf_exchange_flows"
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
-PROVIDERS = ("coinglass", "cryptoquant", "glassnode")
+PROVIDERS = ("coinglass", "cryptoquant")
 SUPPORTED_WINDOWS = {"hour", "day"}
-SUPPORTED_INTERVALS = {"1h", "24h"}
 RECOVERY_ALLOWED_FIELDS = {
     "coinglass": {"provider", "endpoint_id", "start_time", "end_time", "limit", "ticker", "symbol"},
     "cryptoquant": {"provider", "endpoint_id", "window", "start_time", "end_time", "limit", "exchange_scope"},
-    "glassnode": {"provider", "endpoint_id", "interval", "start_time", "end_time", "asset"},
 }
 BOOTSTRAP_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 730}
 INCREMENTAL_LIMITS = {"cryptoquant_hour": 48, "cryptoquant_day": 8}
@@ -22,43 +20,29 @@ ETF_HISTORICAL_BOOTSTRAP_LIMITS = {
     ("exchange_inflow", "day"): 730,
     ("exchange_outflow", "day"): 730,
     ("exchange_reserve", "day"): 730,
-    ("exchange_netflow", "day"): 730,
 }
-# Runtime request groups.  CoinGlass ETF flow is documented as hourly-cached;
-# slow ETF state is daily.  CryptoQuant netflow is a confirmation because
-# Processing can derive it exactly as inflow - outflow.
+# Runtime request groups. CoinGlass ETF flow is hourly-cached; the catalog is
+# fetched at bootstrap. Exchange net flow is derived in Processing as inflow - outflow
+# from the three contracted CryptoQuant primitives; there is no netflow endpoint.
 HOURLY_COINGLASS_ENDPOINTS = ("bitcoin_etf_flows",)
 SLOW_COINGLASS_ENDPOINTS: tuple[str, ...] = ()
 BOOTSTRAP_STATIC_COINGLASS_ENDPOINTS = ("bitcoin_etf_list",)
 PRIMARY_CRYPTOQUANT_ENDPOINTS = ("exchange_inflow", "exchange_outflow", "exchange_reserve")
-SECONDARY_CRYPTOQUANT_ENDPOINTS = ("exchange_netflow",)
 ProviderFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
 
 ENDPOINT_SPECS = {
     "coinglass": {
-        "bitcoin_etf_flows": {"path": "/api/etf/bitcoin/flow-history", "widgets": ["ETF Net Flow KPI", "ETF Flow Daily", "ETF Flow by Provider", "Cumulative ETF Net Flow"]},
-        "bitcoin_etf_list": {"path": "/api/etf/bitcoin/list", "widgets": ["fund catalog", "AUM and holdings source"]},
-        "bitcoin_etf_net_assets_history": {"path": "/api/etf/bitcoin/net-assets/history", "widgets": ["Total ETF AUM", "net assets history"]},
-        "bitcoin_etf_premium_discount_history": {"path": "/api/etf/bitcoin/premium-discount/history", "widgets": ["GBTC Premium/Discount"]},
-        "exchange_balance_list": {"path": "/api/exchange/balance/list", "widgets": ["Exchange Balance KPI", "exchange snapshot"]},
-        "exchange_balance_chart": {"path": "/api/exchange/balance/chart", "widgets": ["Exchange Balance History"]},
+        "bitcoin_etf_flows": {"path": "/api/etf/bitcoin/flow-history", "widgets": ["ETF flows"]},
+        "bitcoin_etf_list": {"path": "/api/etf/bitcoin/list", "widgets": ["ETF fund catalog and AUM"]},
     },
     "cryptoquant": {
-        "exchange_inflow": {"path": "/btc/exchange-flows/inflow", "widgets": ["Exchange Inflow 24H"]},
-        "exchange_outflow": {"path": "/btc/exchange-flows/outflow", "widgets": ["Exchange Outflow 24H"]},
-        "exchange_netflow": {"path": "/btc/exchange-flows/netflow", "widgets": ["Exchange Net Flow Daily"]},
-        "exchange_reserve": {"path": "/btc/exchange-flows/reserve", "widgets": ["Exchange Balance secondary source"]},
-    },
-    "glassnode": {
-        "exchange_inflow": {"path": "/v1/metrics/transactions/transfers_volume_to_exchanges_sum", "widgets": ["secondary exchange inflow"]},
-        "exchange_outflow": {"path": "/v1/metrics/transactions/transfers_volume_from_exchanges_sum", "widgets": ["secondary exchange outflow"]},
-        "exchange_netflow": {"path": "/v1/metrics/transactions/transfers_volume_exchanges_net", "widgets": ["secondary exchange netflow"]},
-        "exchange_balance": {"path": "/v1/metrics/distribution/balance_exchanges", "widgets": ["secondary exchange balance"]},
-        "us_spot_etf_flows_net": {"path": "/v1/metrics/institutions/us_spot_etf_flows_net", "widgets": ["secondary ETF net flow"]},
+        "exchange_inflow": {"path": "/btc/exchange-flows/inflow", "widgets": ["Exchange inflow"]},
+        "exchange_outflow": {"path": "/btc/exchange-flows/outflow", "widgets": ["Exchange outflow"]},
+        "exchange_reserve": {"path": "/btc/exchange-flows/reserve", "widgets": ["Exchange reserve"]},
     },
 }
 PRIMARY_ENDPOINT_IDS = tuple((*ENDPOINT_SPECS["coinglass"], *ENDPOINT_SPECS["cryptoquant"]))
-SECONDARY_ENDPOINT_IDS = tuple(ENDPOINT_SPECS["glassnode"])
+SECONDARY_ENDPOINT_IDS: tuple[str, ...] = ()
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -98,8 +82,7 @@ def _validate_recovery_requests(recovery_requests: Sequence[Mapping[str, Any]] |
             build_cryptoquant_params(exchange_scope=item.get("exchange_scope", exchange_scope), window=item.get("window"),
                 limit=item.get("limit", 100), start_time=item.get("start_time"), end_time=item.get("end_time"))
         else:
-            build_glassnode_params(interval=item.get("interval"), asset=item.get("asset", symbol),
-                start_time=item.get("start_time"), end_time=item.get("end_time"))
+            raise ValueError("provider_not_in_final33")
         validated.append(item)
     return validated
 
@@ -109,12 +92,9 @@ def _utc_iso(timestamp: int) -> str:
 
 
 def build_coinglass_params(endpoint_id: str, *, symbol: str = "BTC", ticker: str = "GBTC") -> dict[str, Any]:
+    del symbol, ticker
     if endpoint_id not in ENDPOINT_SPECS["coinglass"]:
         raise ValueError("unknown_coinglass_endpoint")
-    if endpoint_id in {"exchange_balance_list", "exchange_balance_chart"}:
-        return {"symbol": symbol}
-    if endpoint_id == "bitcoin_etf_premium_discount_history":
-        return {"ticker": ticker}
     return {}
 
 
@@ -133,19 +113,6 @@ def build_cryptoquant_params(*, exchange_scope: str, window: str, limit: int,
         raise ValueError("invalid_time_range")
     return params
 
-
-def build_glassnode_params(*, interval: str, asset: str = "BTC", start_time: int | None = None,
-                           end_time: int | None = None) -> dict[str, Any]:
-    if interval not in SUPPORTED_INTERVALS:
-        raise ValueError("invalid_glassnode_interval")
-    params = {"a": asset, "i": interval, "f": "json"}
-    if start_time is not None:
-        params["s"] = _positive_int(start_time, "start_time")
-    if end_time is not None:
-        params["u"] = _positive_int(end_time, "end_time")
-    if start_time is not None and end_time is not None and start_time > end_time:
-        raise ValueError("invalid_time_range")
-    return params
 
 
 def _request(provider: str, endpoint_id: str, params: Mapping[str, Any], variant: str | None = None) -> dict[str, Any]:
@@ -171,13 +138,9 @@ def build_etf_exchange_flows_fetch_plan(*, mode: str, exchange_scope: str | None
                 params = build_cryptoquant_params(exchange_scope=item.get("exchange_scope", exchange_scope),
                     window=item.get("window"), limit=limit, start_time=start, end_time=end)
                 variant = item.get("window")
-            elif provider == "glassnode":
-                params = build_glassnode_params(interval=item.get("interval"), asset=item.get("asset", symbol),
-                                                start_time=start, end_time=end)
-                variant = item.get("interval")
             else:
                 params = build_coinglass_params(endpoint, symbol=item.get("symbol", symbol), ticker=item.get("ticker", "GBTC"))
-                variant = item.get("ticker") if endpoint == "bitcoin_etf_net_assets_history" else None
+                variant = None
             plan.append(_request(provider, endpoint, params, variant))
         return plan
     if not exchange_scope:
@@ -214,18 +177,7 @@ def build_etf_exchange_flows_fetch_plan(*, mode: str, exchange_scope: str | None
                 exchange_scope=exchange_scope, window="hour", limit=_positive_int(limit, "limit")), "hour"))
 
     if include_secondary:
-        # Reported CQ netflow and Glassnode are confirmation channels, never
-        # requirements for the normal incremental cycle.
-        for window in (("day", "hour") if mode == "bootstrap" else ("hour",)):
-            endpoint = "exchange_netflow"
-            limit = limits[f"cryptoquant_{window}"]
-            limit = max(limit, ETF_HISTORICAL_BOOTSTRAP_LIMITS.get((endpoint, window), limit))
-            plan.append(_request("cryptoquant", endpoint, build_cryptoquant_params(
-                exchange_scope=exchange_scope, window=window, limit=_positive_int(limit, "limit")), window))
-        for endpoint in ENDPOINT_SPECS["glassnode"]:
-            # Screen B is daily.  A single 24h confirmation per Glassnode metric
-            # is sufficient; the old duplicate 1h+24h polling is unnecessary.
-            plan.append(_request("glassnode", endpoint, build_glassnode_params(interval="24h", asset=symbol), "24h"))
+        raise ValueError("secondary_endpoints_removed_final33")
     return plan
 
 

@@ -12,8 +12,8 @@ CLASSIFICATION_STAGE        = "classification"
 CLASSIFICATION_VERSION      = "0.1.0"
 PROCESSING_VERSION          = "0.1.0"
 MARKETS                     = ("spot", "futures")
-TIMEFRAMES                  = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
-SUMMARY_WINDOWS             = ("1h", "24h")
+TIMEFRAMES                  = ("5m", "15m", "4h")
+SUMMARY_WINDOWS             = ("4h", "24h")
 VALID_AVAILABILITY          = {"available", "partial", "unavailable", "invalid"}
 THRESHOLDS = {
     "order_flow_imbalance": {"strong_selling_max": -0.25, "neutral_min": -0.05, "neutral_max": 0.05, "strong_buying_min": 0.25},
@@ -112,7 +112,7 @@ class CvdVolumeOrderflowClassifier:
         if not isinstance(cross_market.get("window_summaries"), Mapping) or set(cross_market["window_summaries"]) != set(SUMMARY_WINDOWS):
             raise ValueError("invalid_cross_market_summaries")
         ratios = cross_market.get("volume_ratios")
-        if not isinstance(ratios, Mapping) or not isinstance(ratios.get("futures_vs_spot"), Mapping) or not isinstance(ratios["futures_vs_spot"].get("1h"), Mapping):
+        if not isinstance(ratios, Mapping) or not isinstance(ratios.get("futures_vs_spot"), Mapping) or not isinstance(ratios["futures_vs_spot"].get("4h"), Mapping):
             raise ValueError("invalid_cross_market_ratio")
         if context.get("data_mode") == "synthetic" and context.get("is_demo") is not True:
             raise ValueError("synthetic_requires_demo")
@@ -302,7 +302,7 @@ class CvdVolumeOrderflowClassifier:
         }
 
     def build_market_agreement(self, classified: Mapping[str, Any]) -> dict[str, Any]:
-        atoms = {market: classified[market]["window_summaries"]["1h"]["atoms"]["order_flow_state"] for market in MARKETS}
+        atoms = {market: classified[market]["window_summaries"]["4h"]["atoms"]["order_flow_state"] for market in MARKETS}
         states = {market: atoms[market]["state"] for market in MARKETS}
         spot_group, futures_group = _group(states["spot"]), _group(states["futures"])
         if None in {spot_group, futures_group}:
@@ -318,15 +318,20 @@ class CvdVolumeOrderflowClassifier:
         else:
             state = "mixed"
         source_status = _aggregate_status([atoms["spot"]["availability"]["status"], atoms["futures"]["availability"]["status"]])
-        availability_status = "unavailable" if state == "unavailable" else ("partial" if source_status == "partial" or state == "mixed" else "available")
+        if state == "unavailable":
+            availability_status, availability_reason = "unavailable", "source_state_unavailable"
+        elif source_status != "available":
+            availability_status, availability_reason = source_status, "source_partial"
+        else:
+            # mixed/divergent is a legitimate market relationship, not a data-quality defect.
+            availability_status, availability_reason = "available", None
         return {"state": state, "spot_state": states["spot"], "futures_state": states["futures"],
-            "availability": _availability(availability_status, "source_state_unavailable" if state == "unavailable" else (
-                "market_agreement_mixed" if state == "mixed" else ("source_partial" if availability_status == "partial" else None)))}
+            "availability": _availability(availability_status, availability_reason)}
 
     def build_temporal_alignment(self, classified: Mapping[str, Any]) -> dict[str, Any]:
         output = {}
         for market in MARKETS:
-            one_atom = classified[market]["window_summaries"]["1h"]["atoms"]["order_flow_state"]
+            one_atom = classified[market]["window_summaries"]["4h"]["atoms"]["order_flow_state"]
             day_atom = classified[market]["window_summaries"]["24h"]["atoms"]["order_flow_state"]
             one, day = one_atom["state"], day_atom["state"]
             one_group, day_group = _group(one), _group(day)
@@ -472,7 +477,7 @@ class CvdVolumeOrderflowClassifier:
         no_safe_base = all(classified[market]["timeframes"][timeframe]["availability"]["status"] in {"unavailable", "invalid"}
             for market in ("spot", "futures") for timeframe in TIMEFRAMES)
         return {"status": status, "core_status": core, "enrichment_status": enrichment, "markets": markets,
-            "confirmations": {"market_agreement_1h": agreement["availability"]}, "no_safe_base": no_safe_base,
+            "confirmations": {"market_agreement_4h": agreement["availability"]}, "no_safe_base": no_safe_base,
             "reason": None if status == "available" else "classification_incomplete"}
 
     def evaluate_quality(self, availability: Mapping[str, Any], processing_quality: Mapping[str, Any]) -> dict[str, Any]:
@@ -508,11 +513,11 @@ class CvdVolumeOrderflowClassifier:
             )
             for window in SUMMARY_WINDOWS
         }
-        ratio_source = cross_source["volume_ratios"]["futures_vs_spot"]["1h"]
+        ratio_source = cross_source["volume_ratios"]["futures_vs_spot"]["4h"]
         cross_market = {
             "window_summaries": cross_summaries,
-            "volume_ratios": {"futures_vs_spot": {"1h": self.classify_futures_vs_spot_ratio(
-                ratio_source, "cross_market.volume_ratios.futures_vs_spot.1h.value")}},
+            "volume_ratios": {"futures_vs_spot": {"4h": self.classify_futures_vs_spot_ratio(
+                ratio_source, "cross_market.volume_ratios.futures_vs_spot.4h.value")}},
         }
         for market in MARKETS:
             statuses = [classified[market]["timeframes"][timeframe]["availability"]["status"] for timeframe in TIMEFRAMES]
@@ -533,7 +538,7 @@ class CvdVolumeOrderflowClassifier:
             "parameters": {"thresholds": copy.deepcopy(THRESHOLDS), "source_processing_version": PROCESSING_VERSION,
                 "classification_policy": "interpret_processing_values_without_recalculation"},
             "classifications": {"markets": classified, "cross_market": cross_market}, "snapshots": snapshots,
-            "confirmations": {"market_agreement_1h": agreement, "temporal_alignment": temporal},
+            "confirmations": {"market_agreement_4h": agreement, "temporal_alignment": temporal},
             "interpreted_events": events, "technical_events": technical_events,
             "availability": availability, "quality": quality}
 

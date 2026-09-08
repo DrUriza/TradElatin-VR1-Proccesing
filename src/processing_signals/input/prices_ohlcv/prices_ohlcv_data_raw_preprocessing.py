@@ -105,29 +105,6 @@ def unwrap_glassnode_series(response: Any) -> list[Mapping[str, Any]]:
     return rows
 
 
-def normalize_glassnode_price_ohlc_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    timestamp = record.get("t", record.get("timestamp"))
-    payload = record.get("o", record.get("v", record))
-    if not isinstance(payload, Mapping):
-        raise ValueError("Glassnode Price OHLC row does not contain an OHLC object")
-    def pick(*keys: str) -> Any:
-        for key in keys:
-            if payload.get(key) is not None:
-                return payload[key]
-        return None
-    normalized = normalize_ohlcv_record({
-        "timestamp": timestamp,
-        "open": pick("o", "open"),
-        "high": pick("h", "high"),
-        "low": pick("l", "low"),
-        "close": pick("c", "close"),
-        "volume": 0.0,
-    })
-    normalized["provider"] = "glassnode"
-    normalized["endpoint_id"] = "price_usd_ohlc"
-    return normalized
-
-
 def normalize_glassnode_market_cap_record(record: Mapping[str, Any]) -> dict[str, Any]:
     timestamp = record.get("t", record.get("timestamp"))
     value = record.get("v", record.get("value"))
@@ -142,46 +119,37 @@ def normalize_glassnode_market_cap_record(record: Mapping[str, Any]) -> dict[str
     return {"timestamp": ts, "value": number, "unit": "USD", "provider": "glassnode", "endpoint_id": "marketcap_usd"}
 
 
-def preprocess_glassnode_prices(raw_glassnode: Mapping[str, Any] | None, existing: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def preprocess_glassnode_prices(raw_glassnode: Mapping[str, Any] | None, existing: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize the sole contracted Glassnode Prices primitive: Market Cap."""
     raw_glassnode = raw_glassnode or {}
     metrics = raw_glassnode.get("metrics", {}) if isinstance(raw_glassnode, Mapping) else {}
     prior = existing or {}
     warnings: list[str] = []
-
-    def metric_records(metric_id: str, normalizer) -> list[dict[str, Any]]:
-        payload = metrics.get(metric_id, {}) if isinstance(metrics, Mapping) else {}
-        incoming: list[dict[str, Any]] = []
-        if payload.get("status") == "ok":
-            try:
-                for index, row in enumerate(unwrap_glassnode_series(payload.get("response"))):
-                    try:
-                        incoming.append(normalizer(row))
-                    except (TypeError, ValueError) as exc:
-                        warnings.append(f"glassnode/{metric_id}/record[{index}]: {exc}")
-            except ValueError as exc:
-                warnings.append(f"glassnode/{metric_id}: {exc}")
-        else:
-            warnings.append(f"glassnode/{metric_id}: {payload.get('error') or 'request_failed'}")
-        previous = prior.get(metric_id, {}).get("records", []) if isinstance(prior, Mapping) else []
-        by_ts = {int(row["timestamp"]): dict(row) for row in previous if isinstance(row, Mapping) and row.get("timestamp") is not None}
-        by_ts.update({int(row["timestamp"]): dict(row) for row in incoming})
-        return [by_ts[key] for key in sorted(by_ts)]
-
-    price_records = metric_records("price_usd_ohlc", normalize_glassnode_price_ohlc_record)
-    market_cap_records = metric_records("marketcap_usd", normalize_glassnode_market_cap_record)
-    confirmations = {
-        "price_ohlc": {"provider": "glassnode", "endpoint_id": "price_usd_ohlc", "interval": raw_glassnode.get("interval", "1h"),
-                       "status": "available" if price_records else "unavailable", "records": price_records},
-    }
-    provider_features = {
+    payload = metrics.get("marketcap_usd", {}) if isinstance(metrics, Mapping) else {}
+    incoming: list[dict[str, Any]] = []
+    if payload.get("status") == "ok":
+        try:
+            for index, row in enumerate(unwrap_glassnode_series(payload.get("response"))):
+                try:
+                    incoming.append(normalize_glassnode_market_cap_record(row))
+                except (TypeError, ValueError) as exc:
+                    warnings.append(f"glassnode/marketcap_usd/record[{index}]: {exc}")
+        except ValueError as exc:
+            warnings.append(f"glassnode/marketcap_usd: {exc}")
+    elif payload:
+        warnings.append(f"glassnode/marketcap_usd: {payload.get('error') or 'request_failed'}")
+    previous = prior.get("records", []) if isinstance(prior, Mapping) else []
+    by_ts = {int(row["timestamp"]): dict(row) for row in previous if isinstance(row, Mapping) and row.get("timestamp") is not None}
+    by_ts.update({int(row["timestamp"]): dict(row) for row in incoming})
+    records = [by_ts[key] for key in sorted(by_ts)]
+    result = {
         "market_cap": {"provider": "glassnode", "endpoint_id": "marketcap_usd", "interval": raw_glassnode.get("interval", "1h"),
-                       "status": "available" if market_cap_records else "unavailable", "records": market_cap_records,
-                       "current": deepcopy(market_cap_records[-1]) if market_cap_records else None},
+                       "status": "available" if records else "unavailable", "records": records,
+                       "current": deepcopy(records[-1]) if records else None},
     }
     if warnings:
-        confirmations["price_ohlc"]["warnings"] = list(warnings)
-        provider_features["market_cap"]["warnings"] = list(warnings)
-    return confirmations, provider_features
+        result["market_cap"]["warnings"] = warnings
+    return result
 
 def upsert_ohlcv_records(
     existing_records: Sequence[Mapping[str, Any]],
@@ -222,7 +190,10 @@ def preprocess_market_response(
         }
 
     for timeframe, previous_payload in existing_timeframes.items():
-        output_timeframes.setdefault(str(timeframe), dict(previous_payload))
+        if str(timeframe) not in output_timeframes:
+            cached = deepcopy(dict(previous_payload))
+            cached["incoming_records"] = []
+            output_timeframes[str(timeframe)] = cached
 
     return {
         "provider": raw_market.get("provider", "coinglass"),
@@ -337,7 +308,7 @@ class PricesOhlcvInputPreprocessor:
         # but never carry stale Futures OHLC forward or fabricate it from Spot.
         futures = {
             "provider": "coinglass",
-            "endpoint_id": "futures_ohlcv",
+            "endpoint_id": None,
             "status": "unavailable",
             "reason": "retired_by_33_endpoint_policy",
             "timeframes": {
@@ -355,14 +326,9 @@ class PricesOhlcvInputPreprocessor:
         futures.update({"exchange": self.raw_extractor.exchange, "symbol": self.raw_extractor.symbol})
 
         markets = {"spot": spot, "futures": futures}
-        previous_confirmations = self.existing_contract.get("confirmations", {}).get("glassnode", {})
         previous_features = self.existing_contract.get("provider_features", {})
-        previous_glassnode = {
-            "price_usd_ohlc": previous_confirmations.get("price_ohlc", {}),
-            "marketcap_usd": previous_features.get("market_cap", {}),
-        }
-        glassnode_confirmations, provider_features = preprocess_glassnode_prices(
-            raw.get("raw", {}).get("glassnode"), existing=previous_glassnode
+        provider_features = preprocess_glassnode_prices(
+            raw.get("raw", {}).get("glassnode"), existing=previous_features.get("market_cap", {})
         )
         return {
             "family": "prices_ohlcv",
@@ -377,7 +343,6 @@ class PricesOhlcvInputPreprocessor:
                 "exchange": self.raw_extractor.exchange,
             },
             "markets": markets,
-            "confirmations": {"glassnode": glassnode_confirmations},
             "provider_features": provider_features,
             "quality": self.evaluate_quality(markets),
         }
@@ -395,6 +360,10 @@ def run_prices_ohlcv_input(
     incremental_limits: Mapping[str, int] | None = None,
     include_glassnode: bool = True,
     refresh_secondary: bool = False,
+    data_mode: str = "live",
+    is_demo: bool = False,
+    reference_timestamp: int | None = None,
+    execution_timestamp: int | None = None,
 ) -> dict[str, Any]:
     """Single public family facade backed by the OO implementation."""
     raw_extractor = PricesOhlcvRawExtractor(
@@ -410,7 +379,14 @@ def run_prices_ohlcv_input(
         raw_extractor=raw_extractor,
         existing_contract=existing_contract,
     )
-    return preprocessor.run(
+    output = preprocessor.run(
         requested_mode=requested_mode,
         recovery_requests=recovery_requests,
     )
+    output.setdefault("context", {}).update({
+        "data_mode": data_mode,
+        "is_demo": bool(is_demo),
+        "reference_timestamp": reference_timestamp,
+        "execution_timestamp": execution_timestamp,
+    })
+    return output

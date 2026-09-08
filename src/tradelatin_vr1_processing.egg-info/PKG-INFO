@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: tradelatin-vr1-processing
+Version: 4.2.2
+Summary: TradELATIN VR1 processing runtime.
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0

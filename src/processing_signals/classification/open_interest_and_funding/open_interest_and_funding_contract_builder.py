@@ -8,19 +8,15 @@ import json
 import math
 from typing import Any
 
-from .open_interest_and_funding_sp_v1_12_adapter import (
-    SP_SCHEMA_VERSION,
-    align_open_interest_and_funding_to_sp_v1_12,
-)
 
 
 FAMILY = "open_interest_and_funding"
 VERSION = "0.1"
 SCREEN_SCHEMA = "trad_elatin.open_interest_and_funding.screen.v1"
-SCREEN_VERSION = SP_SCHEMA_VERSION
-TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
-HMI_TIMEFRAMES = ("5m", "15m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
+SCREEN_VERSION = "1.12.0-oi-native-screen-b-demo"
+TIMEFRAMES = ("5m", "15m", "4h")
+HMI_TIMEFRAMES = ("5m", "15m", "4h")
+TIMEFRAME_SECONDS = {"5m": 300, "15m": 900, "4h": 14_400}
 STATUSES = ("available", "partial", "unavailable", "invalid")
 CONTEXT_FIELDS = (
     "asset", "exchange_scope", "primary_provider", "confirmation_providers", "data_mode", "is_demo",
@@ -432,25 +428,38 @@ def _widgets(classification: Mapping[str, Any], timeframe: str) -> dict[str, Any
         "funding_state": atoms["funding_state"].get("state") if usable else None,
         "quadrant_state": atoms["oi_funding_quadrant"].get("state") if usable else None,
         "source_paths": [f"classifications.by_timeframe.{timeframe}.current.{name}" for name in names]}
+    quality = _mapping(classification.get("quality"), "classification.quality")
+    processing_quality = _mapping(quality.get("processing_quality"), "classification.quality.processing_quality")
+    source_statuses = _mapping(processing_quality.get("source_statuses"), "classification.quality.processing_quality.source_statuses")
     confirmations = _mapping(classification.get("confirmations"), "classification.confirmations")
-    rows = []
-    for metric in ("open_interest", "funding_rate"):
-        providers = _mapping(confirmations.get(metric), f"confirmations.{metric}")
-        for provider in ("cryptoquant", "glassnode"):
-            payload = _mapping(providers.get(provider), f"confirmations.{metric}.{provider}")
-            row_status = _status(payload.get("status"), f"confirmations.{metric}.{provider}.status")
-            rows.append({"metric": metric, "provider": provider, "status": row_status,
-                "reason": payload.get("reason"), "provider_state": payload.get("provider_state"),
-                "endpoint_id": payload.get("endpoint_id"), "unit": payload.get("unit"),
-                "window_or_interval": payload.get("provider_window", payload.get("provider_interval")),
-                "source_path": f"confirmations.{metric}.{provider}"})
+    leverage = _mapping(_mapping(confirmations.get("estimated_leverage_ratio"), "confirmations.estimated_leverage_ratio").get("glassnode"),
+                        "confirmations.estimated_leverage_ratio.glassnode")
+
+    def primary_row(metric: str, endpoint_id: str, unit: str) -> dict[str, Any]:
+        statuses = [_status(source_statuses.get(f"{metric}.{tf}"), f"quality.source_statuses.{metric}.{tf}") for tf in HMI_TIMEFRAMES]
+        row_status = _combined(statuses)
+        return {"metric": metric, "provider": "coinglass", "status": row_status,
+            "reason": None if row_status == "available" else "primary_series_not_fully_available",
+            "provider_state": "primary", "endpoint_id": endpoint_id, "unit": unit,
+            "window_or_interval": list(HMI_TIMEFRAMES), "source_path": f"quality.processing_quality.source_statuses.{metric}.*"}
+
+    leverage_status = _status(leverage.get("status"), "confirmations.estimated_leverage_ratio.glassnode.status")
+    rows = [
+        primary_row("open_interest_ohlc", "aggregated_open_interest_ohlc", "USD"),
+        primary_row("funding_rate_ohlc", "oi_weighted_funding_rate_ohlc", "percentage_points"),
+        {"metric": "estimated_leverage_ratio", "provider": "glassnode", "status": leverage_status,
+         "reason": leverage.get("reason"), "provider_state": leverage.get("provider_state", "confirmation"),
+         "endpoint_id": leverage.get("endpoint_id", "futures_estimated_leverage_ratio"), "unit": leverage.get("unit", "ratio"),
+         "window_or_interval": leverage.get("provider_interval", "1h"),
+         "source_path": "confirmations.estimated_leverage_ratio.glassnode"},
+    ]
     provider_status = "invalid" if any(row["status"] == "invalid" for row in rows) else \
         "partial" if any(row["status"] in {"partial", "unavailable"} for row in rows) else "available"
     provider_reason = next((row["reason"] for row in rows if row["status"] != "available"), None)
     provider_widget = {"id": "provider_availability", "status": provider_status, "reason": provider_reason,
         "label_key": f"screens.{FAMILY}.widgets.provider_availability", "rows": [] if provider_status == "invalid" else rows,
-        "comparisons": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable", "provider_state": "provider_unavailable"},
-        "source_paths": ["confirmations.open_interest", "confirmations.funding_rate", "availability.unavailable.provider_comparisons"]}
+        "comparisons": {"status": "unavailable", "reason": "provider_comparisons_not_contracted_final33", "provider_state": "not_contracted"},
+        "source_paths": ["quality.processing_quality.source_statuses", "confirmations.estimated_leverage_ratio.glassnode"]}
     return {"oi_funding_state": oi_widget, "provider_availability": provider_widget}
 
 
@@ -686,7 +695,7 @@ def _visual_charts(processing: Mapping[str, Any], classification: Mapping[str, A
     return result
 
 
-def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selected_timeframe: str = "1h") -> dict[str, Any]:
+def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selected_timeframe: str = "15m") -> dict[str, Any]:
     """Build the complete visual screen contract from the canonical vertical bundle."""
     before = deepcopy(bundle)
     processing, classification = _validate_bundle(bundle, selected_timeframe)
@@ -725,7 +734,7 @@ def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selec
     output = {
         "family": FAMILY, "screen": FAMILY, "schema_version": SCREEN_VERSION, "context": {
             **output_context, "default_market": "all_exchanges", "available_markets": ["all_exchanges"],
-            "default_timeframe": "1h", "available_timeframes": list(HMI_TIMEFRAMES),
+            "default_timeframe": "15m", "available_timeframes": list(HMI_TIMEFRAMES),
             "units": {"open_interest": "USD", "funding_rate": "percent_points"},
             "history_policy": {"calculation": "upstream_full_history", "presentation": "selected_timeframe", "default_display_window": calculation_records},
         },
@@ -771,5 +780,344 @@ def build_open_interest_and_funding_contract(bundle: Mapping[str, Any], *, selec
 class OpenInterestAndFundingContractBuilder:
     """Object facade for the pure screen-contract builder."""
 
-    def build(self, bundle: Mapping[str, Any], *, selected_timeframe: str = "1h") -> dict[str, Any]:
+    def build(self, bundle: Mapping[str, Any], *, selected_timeframe: str = "15m") -> dict[str, Any]:
         return build_open_interest_and_funding_contract(bundle, selected_timeframe=selected_timeframe)
+
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+from datetime import datetime, timezone
+
+import json
+
+import math
+
+from pathlib import Path
+
+from typing import Any, Mapping
+
+SP_SCHEMA_VERSION = '1.12.0-oi-native-screen-b-demo'
+
+_screen_HMI_TIMEFRAMES = ('5m', '15m', '4h')
+
+_screen_DISPLAY_WINDOW = 120
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_MISSING = object()
+
+_screen_NATIVE_CHARTS = ('oi_dynamics', 'oi_zscore_percentile', 'price_oi_regime', 'price_oi_divergence', 'funding_oi_crowding', 'wasserstein_distance')
+
+_screen_PRIMARY_SERIES = {'oi_dynamics': 'oi_roc', 'oi_zscore_percentile': 'oi_zscore', 'price_oi_regime': 'regime_score', 'price_oi_divergence': 'divergence_score', 'funding_oi_crowding': 'crowding_score', 'wasserstein_distance': 'wasserstein_distance'}
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_finite(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+        return None
+    return 0.0 if value == 0 else value
+
+def _screen_is_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+def _screen_project(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project runtime values onto the exact current Screens contract shape."""
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_project(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(reference)
+        if not reference or all((_screen_is_scalar(item) for item in reference)):
+            return deepcopy(candidate)
+        if not candidate:
+            return []
+        identity_keys = ('metric_id', 'kpi_id', 'widget_id', 'chart_id', 'table_id', 'badge_id', 'id', 'role', 'event_group', 'indicator_id', 'market', 'timeframe')
+
+        def ref_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                for key in identity_keys:
+                    value = item.get(key, _screen_MISSING)
+                    if value is _screen_MISSING:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key, _screen_MISSING) == value:
+                            return ref_item
+            return reference[index] if index < len(reference) else reference[0]
+        return [_screen_project(ref_for(item, index), item) for index, item in enumerate(candidate)]
+    return deepcopy(reference if candidate is _screen_MISSING else candidate)
+
+def _screen_iso(timestamp: int | None) -> str | None:
+    if type(timestamp) is not int:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def _screen_compact(value: int | float | None) -> str:
+    if value is None:
+        return '—'
+    absolute = abs(float(value))
+    for divisor, suffix in ((1000000000000.0, 'T'), (1000000000.0, 'B'), (1000000.0, 'M'), (1000.0, 'K')):
+        if absolute >= divisor:
+            return f'{value / divisor:.2f}{suffix}'
+    return f'{value:.2f}'
+
+def _screen_context(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    pctx = processing['context']
+    out.update({'default_market': 'all_exchanges', 'available_markets': ['all_exchanges'], 'default_timeframe': '15m', 'available_timeframes': list(_screen_HMI_TIMEFRAMES), 'asset': pctx.get('asset', 'BTC'), 'exchange_scope': pctx.get('exchange_scope', 'all_exchanges'), 'primary_provider': pctx.get('primary_provider', 'coinglass'), 'confirmation_providers': deepcopy(pctx.get('confirmation_providers', ['glassnode'])), 'data_mode': pctx.get('data_mode'), 'is_demo': pctx.get('is_demo'), 'reference_timestamp': pctx.get('reference_timestamp'), 'generated_at': pctx.get('generated_at'), 'data_as_of': pctx.get('reference_timestamp'), 'analysis_profile': 'ohlc_without_volume', 'volume_enabled': False, 'screen_revision': 'oi_native_screen_b_v1'})
+    is_demo = bool(pctx.get('is_demo'))
+    out['fixture_as_of_timestamp'] = None
+    out['fixture_as_of_iso'] = None
+    out['synthetic_fixture'] = False
+    out['realism_refactor_version'] = 'runtime_emulator_v1' if is_demo else 'runtime_provider_v1'
+    out['realism_note'] = 'deterministic provider-shaped emulator data; CoinGlass OI/Funding plus Glassnode ELR' if is_demo else 'runtime provider data; CoinGlass OI/Funding plus Glassnode ELR'
+    return out
+
+def _screen_elr_payload(processing: Mapping[str, Any]) -> Mapping[str, Any]:
+    return processing.get('confirmations', {}).get('estimated_leverage_ratio', {}).get('glassnode', {})
+
+def _screen_latest_confirmation(payload: Mapping[str, Any]) -> tuple[int | None, float | None]:
+    records = payload.get('records') if isinstance(payload, Mapping) else None
+    if not isinstance(records, list) or not records:
+        records = payload.get('incoming_records') if isinstance(payload, Mapping) else None
+    if not isinstance(records, list) or not records:
+        return (None, None)
+    record = records[-1] if isinstance(records[-1], Mapping) else {}
+    return (record.get('timestamp') if type(record.get('timestamp')) is int else None, _screen_finite(record.get('value')))
+
+def _screen_kpis(reference: Mapping[str, Any], candidate: Mapping[str, Any], processing: Mapping[str, Any], selected_timeframe: str) -> dict[str, Any]:
+    candidate_items = {str(item.get('metric_id')): item for item in candidate.get('kpis', {}).get('items', []) if isinstance(item, Mapping)}
+    dynamic_items: list[dict[str, Any]] = []
+    for ref_item in reference.get('items', []):
+        if not isinstance(ref_item, Mapping):
+            continue
+        metric_id = str(ref_item.get('metric_id'))
+        if metric_id == 'estimated_leverage_ratio':
+            payload = _screen_elr_payload(processing)
+            ts, value = _screen_latest_confirmation(payload)
+            status = str(payload.get('status', 'unavailable')) if isinstance(payload, Mapping) else 'unavailable'
+            item = deepcopy(dict(ref_item))
+            item.update({'value': value, 'display_value': f'{value:.3f}' if value is not None else '—', 'status': status, 'reason': payload.get('reason') if status not in {'available', 'ok'} else None})
+            provenance = item.get('provenance')
+            if isinstance(provenance, dict):
+                provenance['integration_state'] = 'processing_confirmation_available' if value is not None else 'processing_confirmation_unavailable'
+            if isinstance(item.get('quality'), dict):
+                item['quality']['data_mode'] = processing['context'].get('data_mode')
+                item['quality']['contract_ready'] = value is not None
+            dynamic_items.append(item)
+            continue
+        item = _screen_project(ref_item, candidate_items.get(metric_id, {}))
+        if metric_id == 'open_interest_usd':
+            item['display_value'] = _screen_compact(_screen_finite(item.get('value')))
+        elif metric_id == 'funding_rate':
+            value = _screen_finite(item.get('value'))
+            item['display_value'] = f'{value:.4f}%' if value is not None else '—'
+        dynamic_items.append(item)
+    result = deepcopy(dict(reference))
+    result['selected_market'] = 'all_exchanges'
+    result['selected_timeframe'] = selected_timeframe
+    result['items'] = dynamic_items
+    return result
+
+def _screen_records(frame: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [{'timestamp': row.get('timestamp'), 'open': row.get('open'), 'high': row.get('high'), 'low': row.get('low'), 'close': row.get('close'), 'market_type': 'all_exchanges'} for row in frame.get('records', []) if isinstance(row, Mapping)]
+
+def _screen_slice_series(series: Mapping[str, Any], count: int) -> dict[str, list[Any]]:
+    return {str(key): deepcopy(value[-count:] if isinstance(value, list) else []) for key, value in series.items()}
+
+def _screen_candle_tf(processing: Mapping[str, Any], timeframe: str, reference: Mapping[str, Any]) -> dict[str, Any]:
+    frame = processing['series']['open_interest_ohlc']['timeframes'][timeframe]
+    full_records = _screen_records(frame)
+    visible = full_records[-_screen_DISPLAY_WINDOW:]
+    indicators = processing['indicators']['open_interest']['timeframes'][timeframe]
+    count = len(visible)
+    overlays = {'moving_averages': {'status': indicators['moving_averages'].get('status'), 'series': _screen_slice_series(indicators['moving_averages'].get('series', {}), count)}, 'bollinger_bands': {'status': indicators['bollinger_bands'].get('status'), 'series': _screen_slice_series(indicators['bollinger_bands'].get('series', {}), count)}, 'regression_channel': {'status': indicators['regression_channel'].get('status'), 'series': _screen_slice_series(indicators['regression_channel'].get('series', {}), count)}}
+    dynamic = {'status': frame.get('status'), 'records': visible, 'overlays': overlays, 'display_window': count, 'calculation_history': {'record_count': len(full_records), 'records': full_records, 'history_contract': {'calculation': 'full_available_history', 'presentation': 'tail_window', 'display_window': count, 'recalculate_in_hmi': False}}}
+    return _screen_project(reference, dynamic)
+
+def _screen_native_status(panel: Mapping[str, Any], chart_id: str) -> str:
+    values = panel.get('series', {}).get(_screen_PRIMARY_SERIES[chart_id], []) if isinstance(panel.get('series'), Mapping) else []
+    return 'available' if any((_screen_finite(value) is not None for value in values)) else 'partial'
+
+def _screen_native_tf(processing: Mapping[str, Any], chart_id: str, timeframe: str, reference: Mapping[str, Any]) -> dict[str, Any]:
+    panel = processing.get('native_analysis', {}).get(timeframe, {}).get(chart_id, {})
+    timestamps = panel.get('timestamps', []) if isinstance(panel, Mapping) else []
+    count = min(_screen_DISPLAY_WINDOW, len(timestamps))
+    series = _screen_slice_series(panel.get('series', {}) if isinstance(panel, Mapping) else {}, count)
+    current = deepcopy(panel.get('current', {}) if isinstance(panel, Mapping) else {})
+    dynamic = {'status': _screen_native_status(panel, chart_id) if isinstance(panel, Mapping) else 'unavailable', 'timestamps': deepcopy(timestamps[-count:]), 'series': series, 'current': current, 'reference_lines': deepcopy(reference.get('reference_lines', [])), 'history': {'closed_candles_available': len(timestamps), 'display_records': count, 'uses_closed_candles_only': True, 'all_indicator_periods_warm': len(timestamps) >= 90}, 'provenance': {'data_mode': processing['context'].get('data_mode'), 'processing_contract_target': True, 'real_market_calculation': not bool(processing['context'].get('is_demo')), 'hmi_recalculate': False}}
+    return _screen_project(reference, dynamic)
+
+def _screen_charts(reference: Mapping[str, Any], processing: Mapping[str, Any], selected_timeframe: str) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for chart_id, ref_chart in reference.items():
+        chart = deepcopy(ref_chart)
+        if 'selected_market' in chart:
+            chart['selected_market'] = 'all_exchanges'
+        if 'selected_timeframe' in chart:
+            chart['selected_timeframe'] = selected_timeframe
+        if chart_id in {'open_interest_candlestick', 'open_interest_ohlc'}:
+            ref_frames = ref_chart['markets']['all_exchanges']['timeframes']
+            prototype = next(iter(ref_frames.values()))
+            tf_map = {tf: _screen_candle_tf(processing, tf, ref_frames.get(tf, prototype)) for tf in _screen_HMI_TIMEFRAMES}
+            chart['markets'] = {'all_exchanges': {'timeframes': tf_map}}
+            chart['status'] = tf_map[selected_timeframe]['status']
+        elif chart_id in _screen_NATIVE_CHARTS:
+            ref_frames = ref_chart['markets']['all_exchanges']
+            prototype = next(iter(ref_frames.values()))
+            tf_map = {tf: _screen_native_tf(processing, chart_id, tf, ref_frames.get(tf, prototype)) for tf in _screen_HMI_TIMEFRAMES}
+            chart['markets'] = {'all_exchanges': tf_map}
+            chart['status'] = tf_map[selected_timeframe]['status']
+        output[chart_id] = chart
+    return output
+
+def _screen_event_candidates_from_visible_charts(charts: Mapping[str, Any]) -> dict[str, Any]:
+    """Build Screen-A MA crosses only from the exact OHLC/MA window published to HMI.
+
+    This prevents stale crosses from a deeper calculation history from leaking into
+    the visible chart and makes the exact marker reproducible from contractual MAs.
+    """
+    by_id: dict[str, Any] = {}
+    chart = charts.get('open_interest_candlestick', {}) if isinstance(charts, Mapping) else {}
+    frames = chart.get('markets', {}).get('all_exchanges', {}).get('timeframes', {}) if isinstance(chart, Mapping) else {}
+    for timeframe in _screen_HMI_TIMEFRAMES:
+        frame = frames.get(timeframe, {}) if isinstance(frames, Mapping) else {}
+        records = frame.get('records', []) if isinstance(frame, Mapping) else []
+        overlays = frame.get('overlays', {}) if isinstance(frame, Mapping) else {}
+        ma = overlays.get('moving_averages', {}).get('series', {}) if isinstance(overlays, Mapping) else {}
+        if not isinstance(records, list) or len(records) < 2 or (not isinstance(ma, Mapping)):
+            continue
+        timestamps = [row.get('timestamp') for row in records if isinstance(row, Mapping)]
+        if len(timestamps) != len(records) or any((type(ts) is not int for ts in timestamps)):
+            continue
+        first_visible, last_visible = (timestamps[0], timestamps[-1])
+        for first, second in (('ema_9', 'ema_21'), ('sma_20', 'sma_50'), ('wma_20', 'wma_50')):
+            a, b = (ma.get(first, []), ma.get(second, []))
+            if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(records) or (len(b) != len(records)):
+                continue
+            for index in range(1, len(records)):
+                p1, p2, c1, c2 = map(_screen_finite, (a[index - 1], b[index - 1], a[index], b[index]))
+                if None in (p1, p2, c1, c2):
+                    continue
+                d0, d1 = (float(p1 - p2), float(c1 - c2))
+                crossed = d0 < 0 <= d1 or d0 > 0 >= d1
+                if not crossed or d1 == d0:
+                    continue
+                alpha = -d0 / (d1 - d0)
+                if not 0.0 <= alpha <= 1.0:
+                    continue
+                exact_timestamp = float(timestamps[index - 1]) + alpha * (timestamps[index] - timestamps[index - 1])
+                if not first_visible <= exact_timestamp <= last_visible:
+                    continue
+                exact_value = float(p1) + alpha * (float(c1) - float(p1))
+                direction = 1 if d1 >= 0 else -1
+                relation = 'above' if direction == 1 else 'below'
+                event_id = f'{first}_{relation}_{second}'
+                uid = f'all_exchanges:{timeframe}:{timestamps[index]}:technical_cross:{event_id}'
+                by_id[uid] = {'event_uid': uid, 'timestamp': timestamps[index], 'event_id': event_id, 'event_type': 'technical_cross', 'event_group': 'moving_average_cross', 'signal': 'bullish' if direction == 1 else 'bearish', 'label': event_id.replace('_', ' ').upper(), 'marker': 'arrow_up' if direction == 1 else 'arrow_down', 'source': {'market': 'all_exchanges', 'timeframe': timeframe}, 'display': {'screen_a': True, 'screen_b': False, 'anchor_price': exact_value, 'marker_anchor': 'exact_interpolated_cross'}, 'event_timestamp_exact': exact_timestamp, 'event_value_exact': exact_value, 'event_price': exact_value}
+    return dict(sorted(by_id.items(), key=lambda item: (item[1].get('event_timestamp_exact') or 0, item[0])))
+
+def _screen_events(reference: Mapping[str, Any], charts: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish exact Screen-A MA crosses generated by Processing.
+
+    The template intentionally carries an empty events.by_id map. Requiring a
+    template prototype therefore discarded every runtime cross and left the
+    HMI without arrows. HMI only renders these precomputed events.
+    """
+    out = deepcopy(dict(reference))
+    by_id = _screen_event_candidates_from_visible_charts(charts)
+    out['by_id'] = by_id
+    out['technical_cross_ids'] = list(by_id)
+    return out
+
+def _screen_signal(chart_id: str, current: Mapping[str, Any]) -> tuple[str, str, float]:
+    primary = _screen_finite(current.get(chart_id))
+    if chart_id == 'price_oi_regime':
+        state = str(current.get('regime_state') or 'normal')
+        if state in {'bullish_expansion', 'short_covering'}:
+            return ('bullish', state, 0.75)
+        if state in {'bearish_expansion', 'deleveraging', 'long_liquidation'}:
+            return ('bearish', state, 0.75)
+        return ('neutral', state, 0.55)
+    if chart_id == 'funding_oi_crowding':
+        if primary is not None and primary >= 2:
+            return ('bearish', 'crowded_long', 0.8)
+        if primary is not None and primary <= -2:
+            return ('bullish', 'crowded_short', 0.8)
+        return ('neutral', 'balanced', 0.55)
+    if chart_id == 'wasserstein_distance':
+        return ('neutral', 'regime_shift_elevated' if primary is not None and primary >= 0.1 else 'stable', 0.6)
+    if primary is None:
+        return ('neutral', 'unavailable', 0.0)
+    return ('bullish', 'positive', 0.65) if primary > 0 else ('bearish', 'negative', 0.65) if primary < 0 else ('neutral', 'neutral', 0.5)
+
+def _screen_table(reference: Mapping[str, Any], processing: Mapping[str, Any], selected_timeframe: str) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    ref_markets = reference.get('indicator_package', {}).get('markets', {}).get('all_exchanges', {})
+    markets: dict[str, list[dict[str, Any]]] = {}
+    for tf in _screen_HMI_TIMEFRAMES:
+        ref_rows = {str(row.get('metric_id')): row for row in ref_markets.get(tf, []) if isinstance(row, Mapping)}
+        rows: list[dict[str, Any]] = []
+        for chart_id in _screen_NATIVE_CHARTS:
+            panel = processing.get('native_analysis', {}).get(tf, {}).get(chart_id, {})
+            current = panel.get('current', {}) if isinstance(panel, Mapping) else {}
+            primary = _screen_finite(current.get(chart_id))
+            signal, state, confidence = _screen_signal(chart_id, current)
+            dynamic = {'metric_id': chart_id, 'value': primary, 'timestamp': panel.get('timestamps', [])[-1] if panel.get('timestamps') else None, 'status': _screen_native_status(panel, chart_id) if isinstance(panel, Mapping) else 'unavailable', 'signal': signal, 'state': state, 'display_signal': signal.upper(), 'confidence': confidence, 'secondary_values': {key: value for key, value in current.items() if key != chart_id}, 'provenance': {'data_mode': processing['context'].get('data_mode'), 'processing_contract_target': True, 'real_market_calculation': not bool(processing['context'].get('is_demo')), 'hmi_recalculate': False}}
+            rows.append(_screen_project(ref_rows.get(chart_id, {}), dynamic))
+        markets[tf] = rows
+    out['indicator_package'] = {'selected_market': 'all_exchanges', 'selected_timeframe': selected_timeframe, 'markets': {'all_exchanges': markets}}
+    return out
+
+def _screen_quality(reference: Mapping[str, Any], classification: Mapping[str, Any], processing: Mapping[str, Any], events: Mapping[str, Any]) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    q = classification.get('quality', {})
+    status = q.get('status', 'partial')
+    out.update({'status': 'ok' if status == 'available' else status, 'contract_complete': True, 'data_complete': bool(q.get('data_complete', status == 'available')), 'volume_enabled': False, 'warnings': deepcopy(q.get('warnings', [])), 'errors': deepcopy(q.get('errors', []))})
+    ext = out.get('extensions', {})
+    if isinstance(ext.get('screen_b_arrow_audit_v2'), dict):
+        ext['screen_b_arrow_audit_v2']['event_counts'] = {'macd': 0, 'adx': 0, 'stochastic': 0}
+    if isinstance(ext.get('realistic_oi_500_v2'), dict):
+        full = len(processing['series']['open_interest_ohlc']['timeframes']['15m'].get('records', []))
+        ext['realistic_oi_500_v2']['history_records_per_timeframe'] = full
+        ext['realistic_oi_500_v2']['visible_records'] = min(_screen_DISPLAY_WINDOW, full)
+        ext['realistic_oi_500_v2']['screen_a_cross_events'] = len(events.get('by_id', {}))
+        ext['realistic_oi_500_v2']['screen_b_indicator_cross_events'] = 0
+    if isinstance(ext.get('realism_v1'), dict):
+        ref = processing['context'].get('reference_timestamp')
+        ext['realism_v1']['fixture_as_of_timestamp'] = None
+        ext['realism_v1']['fixture_as_of_iso'] = None
+        ext['realism_v1']['synthetic_not_live'] = bool(processing['context'].get('is_demo'))
+    out['extensions'] = ext
+    return out
+
+def align_open_interest_and_funding_to_sp_v1_12(candidate: Mapping[str, Any], processing: Mapping[str, Any], classification: Mapping[str, Any], *, selected_timeframe: str) -> dict[str, Any]:
+    reference = _screen_template()
+    charts = _screen_charts(reference['charts'], processing, selected_timeframe)
+    events = _screen_events(reference['events'], charts)
+    dynamic: dict[str, Any] = {'family': 'open_interest_and_funding', 'screen': 'open_interest_and_funding', 'schema_version': SP_SCHEMA_VERSION, 'context': _screen_context(reference['context'], processing), 'badges': deepcopy(reference['badges'] if processing['context'].get('is_demo') else []), 'kpis': _screen_kpis(reference['kpis'], candidate, processing, selected_timeframe), 'widgets': deepcopy(candidate.get('widgets', {})), 'selectors': deepcopy(reference['selectors']), 'charts': charts, 'tables': {'indicators_metrics': _screen_table(reference['tables']['indicators_metrics'], processing, selected_timeframe)}, 'events': events, 'screen_layout': deepcopy(reference['screen_layout']), 'history_contract': deepcopy(reference['history_contract']), 'technical_analysis': deepcopy(reference['technical_analysis'])}
+    dynamic['selectors']['timeframe']['selected'] = selected_timeframe
+    dynamic['selectors']['timeframe']['options'] = list(_screen_HMI_TIMEFRAMES)
+    history_count = min((len(processing['series']['open_interest_ohlc']['timeframes'][tf].get('records', [])) for tf in _screen_HMI_TIMEFRAMES))
+    dynamic['history_contract'].update({'calculation_records': history_count, 'all_visible_moving_averages_warm': history_count >= 50, 'technical_indicators_precomputed': True, 'hmi_recalculation': False, 'synthetic_fixture': False, 'fixture_seed': None, 'note': 'runtime full-history calculation; Screen B uses six native OI analyses and HMI renders precomputed values only'})
+    dynamic['quality'] = _screen_quality(reference['quality'], classification, processing, events)
+    aligned = _screen_project(reference, dynamic)
+    aligned['events']['by_id'] = events['by_id']
+    aligned['events']['technical_cross_ids'] = events['technical_cross_ids']
+    aligned['schema_version'] = SP_SCHEMA_VERSION
+    aligned['kpis']['selected_timeframe'] = selected_timeframe
+    for item in aligned.get('kpis', {}).get('items', []):
+        if isinstance(item, dict) and item.get('metric_id') == 'estimated_leverage_ratio':
+            provenance = item.get('provenance')
+            if isinstance(provenance, dict):
+                provenance['integration_state'] = 'processing_confirmation_available' if item.get('value') is not None else 'processing_confirmation_unavailable'
+    for chart_id in ('open_interest_candlestick', 'open_interest_ohlc'):
+        contract = aligned.get('charts', {}).get(chart_id, {}).get('ohlc_contract')
+        if isinstance(contract, dict):
+            contract['native_provider_ohlc'] = True
+            contract['construction_stage'] = 'input_provider_native_or_local_resample'
+    json.dumps(aligned, ensure_ascii=False, allow_nan=False)
+    return aligned

@@ -10,7 +10,7 @@ from typing import Any
 
 FAMILY = "etf_exchange_flows"
 VERSION = "0.1"
-RANGES = ("1d", "7d", "30d", "90d")
+RANGES = ("1d", "7d", "30d")
 STATUSES = {"available", "partial", "unavailable", "invalid"}
 
 ETF_DEADBAND_USD = 0.0
@@ -229,7 +229,7 @@ def classify_etf_flow_persistence(directions: Mapping[str, Mapping[str, Any]]) -
     return _wrapper(state=state, status="partial" if partial else "available",
                     reason="partial_source_feature" if partial else None, data_as_of=min(timestamps),
                     evidence={name: directions[name]["state"] for name in RANGES}, source_features=source_features,
-                    parameters={"decision_windows": ["1d", "7d", "30d"], "context_window": "90d"}, warnings=[])
+                    parameters={"decision_windows": ["1d", "7d", "30d"], "context_window": "30d"}, warnings=[])
 
 
 def classify_gbtc_premium_regime(feature: Any, *, generated_timestamp: int,
@@ -423,10 +423,15 @@ def classify_etf_exchange_flows(*, processing_contract: Mapping[str, Any], gener
     if generated_timestamp is None:
         raise ValueError("invalid_classification_input:generated_at")
     quality = contract["quality"]
+    # A provider can legitimately yield no usable ETF anchor during startup.
+    # Processing already represents that condition through quality.status;
+    # Classification must emit a blocked contract instead of aborting startup.
+    if quality.get("status") == "invalid":
+        result = _blocked(contract, effective_generated_at, configured)
+        json.dumps(result, allow_nan=False)
+        return result
     processing_data_as_of = _strict_data_as_of(contract.get("data_as_of"))
     if processing_data_as_of is None:
-        raise ValueError("invalid_classification_input:data_as_of")
-    if quality.get("status") == "invalid":
         result = _blocked(contract, effective_generated_at, configured)
         json.dumps(result, allow_nan=False)
         return result
@@ -439,7 +444,7 @@ def classify_etf_exchange_flows(*, processing_contract: Mapping[str, Any], gener
     pressure = classify_exchange_pressure_regime(_at(contract, "features.pressure.flow_24h"),
         generated_timestamp=generated_timestamp, parameters=configured, processing_data_as_of=processing_data_as_of)
     reconciliation = _at(contract, "features.provider_reconciliation.netflow")
-    netflow = classify_exchange_netflow_regime(_at(contract, "features.exchange_flows.netflow_24h_reported"), reconciliation,
+    netflow = classify_exchange_netflow_regime(_at(contract, "features.exchange_flows.netflow_24h_calculated"), reconciliation,
         generated_timestamp=generated_timestamp, parameters=configured, processing_data_as_of=processing_data_as_of)
     aum = classify_aum_reconciliation_state(_at(contract, "features.provider_reconciliation.aum.difference_percent"),
         generated_timestamp=generated_timestamp, parameters=configured, processing_data_as_of=processing_data_as_of)
@@ -485,7 +490,7 @@ def classify_etf_exchange_flows(*, processing_contract: Mapping[str, Any], gener
         "composite_capital_flow_regime": composite, "data_confidence": confidence}
     required = {"etf_flow_direction.1d": directions["1d"], "exchange_pressure_regime": pressure,
                 "composite_capital_flow_regime": composite, "data_confidence": confidence}
-    optional = {**{f"etf_flow_direction.{name}": directions[name] for name in ("7d", "30d", "90d")},
+    optional = {**{f"etf_flow_direction.{name}": directions[name] for name in ("7d", "30d")},
                 "etf_flow_persistence": persistence, "gbtc_premium_regime": premium,
                 "exchange_netflow_regime": netflow, "aum_reconciliation_state": aum}
     usable = [name for name, item in required.items() if item["status"] in {"available", "partial"}]

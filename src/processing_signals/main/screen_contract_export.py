@@ -1,204 +1,145 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 import json
+import math
 import os
-from pathlib import Path
 import tempfile
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
+from .atomic_replace import replace_with_retry
 
-CVD_VOLUME_ORDERFLOW_OUTPUT_PATH = Path("runtime/contracts/hmi/cvd_volume_orderflow_screen.json")
-CVD_VOLUME_ORDERFLOW_SCREEN_ROOT = (
-    "schema", "screen", "stage", "mode", "context", "badges", "selectors", "operational_status",
-    "kpis", "charts", "tables", "drilldowns", "events", "availability", "quality", "technical_analysis",
-    "history_contract",
-)
-
-def _validate_strict_json_value(value: Any) -> None:
-    if value is None or isinstance(value, (str, bool)) or type(value) is int:
-        return
-    if type(value) is float:
-        if not __import__("math").isfinite(value):
-            raise ValueError("vertical_export_invalid:serialization")
-        return
-    if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
-            raise ValueError("vertical_export_invalid:serialization")
-        for item in value.values():
-            _validate_strict_json_value(item)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _validate_strict_json_value(item)
-        return
-    raise ValueError("vertical_export_invalid:serialization")
+FAMILY_FILENAMES: dict[str, str] = {
+    "prices_ohlcv": "prices_VR1_FINAL.json",
+    "cvd_volume_orderflow": "cvd_volume_orderflow_VR1_FINAL.json",
+    "open_interest_and_funding": "open_interest_and_funding_VR1_FINAL.json",
+    "etf_exchange_flows": "etf_exchange_flows_VR1_FINAL.json",
+    "on_chain_miners": "on_chain_miners_VR1_FINAL.json",
+    "volatility_market_regimes": "volatility_market_regimes_VR1_FINAL.json",
+    "long_short_liquidations": "long_short_liquidations_VR1_FINAL.json",
+    "liquidity_microstructure": "liquidity_microstructure_VR1_FINAL.json",
+}
 
 
-def write_cvd_volume_orderflow_screen_json(*, screen_contract: Mapping[str, Any],
-                                           output_path: str | Path = CVD_VOLUME_ORDERFLOW_OUTPUT_PATH,
-                                           allow_invalid: bool = False) -> Path:
-    """Atomically write one validated CVD volume/order-flow screen contract."""
-    if not isinstance(screen_contract, Mapping) or type(allow_invalid) is not bool:
-        raise ValueError("cvd_export_invalid:screen")
-    schema, screen, quality = screen_contract.get("schema"), screen_contract.get("screen"), screen_contract.get("quality")
-    if (tuple(screen_contract) != CVD_VOLUME_ORDERFLOW_SCREEN_ROOT or not isinstance(schema, Mapping)
-            or schema.get("id") != "trad_elatin.cvd_volume_orderflow.screen.v1" or schema.get("version") != "1.5.0"
-            or not isinstance(screen, Mapping) or screen.get("id") != "cvd_volume_orderflow"
-            or screen.get("family") != "cvd_volume_orderflow" or screen_contract.get("stage") != "screen_contract"
-            or not isinstance(quality, Mapping) or quality.get("status") not in {"available", "ok", "partial", "invalid"}):
-        raise ValueError("cvd_export_invalid:screen")
-    if quality["status"] == "invalid" and not allow_invalid:
-        raise ValueError("cvd_export_invalid:screen_invalid")
-    try:
-        _validate_strict_json_value(screen_contract)
-        serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
-    except (TypeError, ValueError) as exc:
-        raise ValueError("cvd_export_invalid:serialization") from exc
-    destination = Path(output_path)
-    allowed_root = (Path.cwd() / "runtime" / "contracts").resolve()
-    resolved = destination.resolve()
-    try:
-        resolved.relative_to(allowed_root)
-    except ValueError as exc:
-        raise ValueError("cvd_export_invalid:path") from exc
-    if destination.suffix != ".json" or resolved.is_dir():
-        raise ValueError("cvd_export_invalid:path")
-    temporary: Path | None = None
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f".{resolved.name}.", suffix=".tmp",
-                                         dir=resolved.parent, delete=False, newline="\n") as handle:
-            temporary = Path(handle.name)
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, resolved)
-        return destination
-    except Exception as exc:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise ValueError("cvd_export_invalid:write") from exc
+def _validate_json_tree(value: Any) -> None:
+    stack = [value]
+    seen_containers: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if type(current) is dict:
+            identity = id(current)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            if any(type(key) is not str for key in current):
+                raise ValueError("screen_contract_keys_must_be_strings")
+            stack.extend(current.values())
+        elif type(current) is list:
+            identity = id(current)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            stack.extend(current)
+        elif type(current) is float:
+            if not math.isfinite(current):
+                raise ValueError("screen_contract_not_strict_json")
+        elif current is not None and type(current) not in (str, int, bool):
+            raise ValueError(f"screen_contract_unsupported_type:{type(current).__name__}")
 
 
-def write_long_short_liquidations_screen_json(*, screen_contract: Mapping[str, Any],
-                                              output_path: str | Path) -> Path:
-    if not isinstance(screen_contract, Mapping):
-        raise ValueError("screen_contract must be a mapping")
-    if screen_contract.get("family") != "long_short_liquidations":
-        raise ValueError("Expected long_short_liquidations family")
-    if screen_contract.get("screen_id") != "long_short_liquidations":
-        raise ValueError("Expected long_short_liquidations screen_id")
-    if screen_contract.get("contract_version") != "1.3.0-native-liquidations-b" or not isinstance(screen_contract.get("quality"), Mapping):
-        raise ValueError("Invalid long_short_liquidations screen contract")
-    serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
-    destination = Path(output_path)
+def validate_screen_contract(family: str, contract: Mapping[str, Any]) -> None:
+    """Minimal boundary validation before publishing to Screens.
+
+    Classification owns contract semantics.  Export only verifies the four
+    integration invariants required at the repository boundary.
+    """
+    if family not in FAMILY_FILENAMES:
+        raise ValueError(f"unsupported_family:{family}")
+    if not isinstance(contract, Mapping):
+        raise ValueError(f"{family}:screen_contract_must_be_object")
+
+    screen = contract.get("screen")
+    if isinstance(screen, Mapping):
+        contract_family = screen.get("family") or screen.get("id")
+    else:
+        contract_family = contract.get("family") or contract.get("screen_id") or screen
+    if contract_family != family:
+        raise ValueError(f"{family}:screen_contract_family_mismatch:{contract_family}")
+
+    _validate_json_tree(contract)
+
+
+_LEGACY_DEMO_BLOCK_KEYS = {"demo_fixture", "visual_fixture", "visual_fixture_population", "dense_demo_liquidity_fixture", "technical_fixture_validation"}
+
+def _strip_legacy_demo_payloads(value: Any) -> Any:
+    """Remove obsolete Screen demo payloads without hiding Emulator provenance."""
+    if type(value) is dict:
+        changed = False
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _LEGACY_DEMO_BLOCK_KEYS:
+                changed = True
+                continue
+            cleaned = _strip_legacy_demo_payloads(item)
+            output[key] = cleaned
+            changed = changed or cleaned is not item
+        return output if changed else value
+    if type(value) is list:
+        output = [_strip_legacy_demo_payloads(item) for item in value]
+        return output if any(cleaned is not item for cleaned, item in zip(output, value)) else value
+    if isinstance(value, str):
+        return ("emulator" if value == "demo_fixture" else value.replace("available_demo_fixture", "available").replace("weekday_trading_session_fixture", "weekday_trading_session_emulator"))
+    return value
+
+
+def _atomic_write_json(destination: Path, payload: Mapping[str, Any]) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
+    serialized = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ) + "\n"
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f".{destination.name}.", suffix=".tmp",
-                                         dir=destination.parent, delete=False, newline="\n") as handle:
-            temporary = Path(handle.name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        return destination
+        replace_with_retry(temporary_name, destination)
     except Exception:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
         raise
+    return destination
 
 
-def export_long_short_liquidations_screen_json(*, vertical_output: Mapping[str, Any],
-                                               output_path: str | Path =
-                                               "runtime/contracts/hmi/long_short_liquidations_screen.json") -> Path:
-    screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
-    if not isinstance(screen, Mapping):
-        raise ValueError("vertical_output must contain a mapping at 'screen'")
-    return write_long_short_liquidations_screen_json(screen_contract=screen, output_path=output_path)
+def export_screen_contract(
+    family: str,
+    contract: Mapping[str, Any],
+    *,
+    screens_contracts_root: str | Path,
+) -> Path:
+    validate_screen_contract(family, contract)
+    clean_contract = _strip_legacy_demo_payloads(contract)
+    if clean_contract is not contract:
+        validate_screen_contract(family, clean_contract)
+    destination = Path(screens_contracts_root) / FAMILY_FILENAMES[family]
+    return _atomic_write_json(destination, clean_contract)
 
 
-def write_on_chain_miners_screen_json(*, screen_contract: Mapping[str, Any],
-                                      output_path: str | Path) -> Path:
-    if not isinstance(screen_contract, Mapping):
-        raise ValueError("screen_contract must be a mapping")
-    schema = screen_contract.get("schema")
-    screen = screen_contract.get("screen")
-    if not isinstance(schema, Mapping) or schema.get("id") != "trad_elatin.on_chain_miners.screen.v1":
-        raise ValueError("Expected on_chain_miners screen.v1 schema")
-    if not isinstance(screen, Mapping) or screen.get("id") != "on_chain_miners" or screen.get("family") != "on_chain_miners":
-        raise ValueError("Expected on_chain_miners screen identity")
-    if screen_contract.get("stage") != "screen_contract" or not isinstance(screen_contract.get("quality"), Mapping):
-        raise ValueError("Invalid on_chain_miners screen contract")
-    serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f".{destination.name}.", suffix=".tmp",
-                                         dir=destination.parent, delete=False, newline="\n") as handle:
-            temporary = Path(handle.name)
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        return destination
-    except Exception:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise
-
-
-def export_on_chain_miners_screen_json(*, vertical_output: Mapping[str, Any],
-                                       output_path: str | Path =
-                                       "runtime/contracts/hmi/on_chain_miners_screen.json") -> Path:
-    screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
-    if not isinstance(screen, Mapping):
-        raise ValueError("vertical_output must contain a mapping at 'screen'")
-    return write_on_chain_miners_screen_json(screen_contract=screen, output_path=output_path)
-
-
-def write_etf_exchange_flows_screen_json(*, screen_contract: Mapping[str, Any],
-                                         output_path: str | Path) -> Path:
-    if not isinstance(screen_contract, Mapping):
-        raise ValueError("screen_contract must be a mapping")
-    schema = screen_contract.get("schema")
-    screen = screen_contract.get("screen")
-    if not isinstance(schema, Mapping) or schema.get("id") != "trad_elatin.etf_exchange_flows.screen.v1":
-        raise ValueError("Expected etf_exchange_flows screen.v1 schema")
-    if (not isinstance(screen, Mapping) or screen.get("id") != "etf_exchange_flows" or
-            screen.get("family") != "etf_exchange_flows"):
-        raise ValueError("Expected etf_exchange_flows screen identity")
-    if (screen_contract.get("stage") != "screen_contract" or
-            screen_contract.get("version") != "1.4.1-exchange-reserve-realism-v4" or
-            schema.get("version") != "1.4.1-exchange-reserve-realism-v2" or
-            not isinstance(screen_contract.get("quality"), Mapping) or
-            not isinstance(screen_contract.get("capital_flow_analysis"), Mapping)):
-        raise ValueError("Invalid etf_exchange_flows screen contract")
-    serialized = json.dumps(screen_contract, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=False) + "\n"
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f".{destination.name}.", suffix=".tmp",
-                                         dir=destination.parent, delete=False, newline="\n") as handle:
-            temporary = Path(handle.name)
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        return destination
-    except Exception:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise
-
-
-def export_etf_exchange_flows_screen_json(*, vertical_output: Mapping[str, Any],
-                                          output_path: str | Path =
-                                          "runtime/contracts/hmi/etf_exchange_flows_screen.json") -> Path:
-    screen = vertical_output.get("screen") if isinstance(vertical_output, Mapping) else None
-    if not isinstance(screen, Mapping):
-        raise ValueError("vertical_output must contain a mapping at 'screen'")
-    return write_etf_exchange_flows_screen_json(screen_contract=screen, output_path=output_path)
+def export_screen_contracts(
+    contracts: Mapping[str, Mapping[str, Any]],
+    *,
+    screens_contracts_root: str | Path,
+) -> dict[str, Path]:
+    return {
+        family: export_screen_contract(
+            family,
+            contract,
+            screens_contracts_root=screens_contracts_root,
+        )
+        for family, contract in contracts.items()
+    }

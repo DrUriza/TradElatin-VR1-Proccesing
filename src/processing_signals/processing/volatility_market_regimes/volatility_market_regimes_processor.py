@@ -6,8 +6,9 @@ from copy import deepcopy
 from numbers import Integral, Real
 from typing import Any
 
-from processing_signals.processing.math.series import rolling_mean_std, rolling_percentile_ranks, rolling_z_scores
-from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
+from .volatility_market_regimes_math import rolling_mean_std, rolling_percentile_ranks, rolling_z_scores
+from .volatility_market_regimes_math import detect_cross_pairs
+from .volatility_market_regimes_math import native_rolling_mean, native_rolling_zscore, native_rolling_percentile, native_normalized_wasserstein
 from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor import (
     PRICE_INDICATOR_CONFIG,
     calculate_prices_indicator_package,
@@ -21,16 +22,13 @@ DAY_SECONDS = 86400
 ZSCORE_WINDOW_DAYS = 30
 ZSCORE_MIN_VALID_RECORDS = 20
 ZSCORE_DDOF = 1
-PERCENTILE_WINDOW_DAYS = 90
+PERCENTILE_WINDOW_DAYS = 30
 PERCENTILE_MIN_VALID_RECORDS = 30
 DAILY_AGGREGATION = "last_valid_observation_utc_day"
 PROCESSING_RECALCULATION_POLICY = "full_available_history"
 _MODES = {"bootstrap", "incremental", "recovery"}
 _STATUSES = {"available", "partial", "unavailable", "invalid"}
-_SOURCES = (
-    ("glassnode.realized_volatility", "glassnode", "realized_volatility"),
-    ("glassnode.dvol", "glassnode", "dvol"),
-)
+_SOURCES = (("glassnode.dvol", "glassnode", "dvol"),)
 
 
 def _number(value: Any, path: str) -> float:
@@ -68,10 +66,7 @@ def validate_volatility_market_regimes_input(contract: Any) -> None:
     _timestamp(contract.get("execution_timestamp"), "execution_timestamp")
     if not isinstance(contract.get("dimensions"), Mapping) or not isinstance(contract.get("providers"), Mapping):
         raise ValueError("input_structure_invalid")
-    fields = {
-        "glassnode.realized_volatility": ("value_percent",),
-        "glassnode.dvol": ("open", "high", "low", "close"),
-    }
+    fields = {"glassnode.dvol": ("open", "high", "low", "close")}
     for key, provider, dataset_name in _SOURCES:
         dataset = _dataset(contract, provider, dataset_name, key)
         if dataset.get("status") not in _STATUSES:
@@ -109,20 +104,47 @@ def _history(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_realized_volatility_series(source: Mapping[str, Any]) -> dict[str, Any]:
-    records = [{
-        "timestamp": _timestamp(row["timestamp"], "timestamp"),
-        "realized_volatility_percent": _number(row["value_percent"], "value_percent"),
-    } for row in source["records"]]
-    status = "unavailable" if not records else ("available" if source["status"] == "available" else "partial")
-    reason = source.get("reason") if status != "available" else None
+def build_realized_volatility_from_prices(price_history_daily: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """Derive realized volatility from Prices daily OHLC; no extra provider endpoint."""
+    rows: list[tuple[int, float, float]] = []
+    for row in price_history_daily or ():
+        if not isinstance(row, Mapping):
+            continue
+        ts = row.get("timestamp")
+        open_value = row.get("open")
+        close = row.get("close")
+        if type(ts) is not int or isinstance(open_value, bool) or isinstance(close, bool):
+            continue
+        if not isinstance(open_value, Real) or not isinstance(close, Real):
+            continue
+        if not math.isfinite(float(open_value)) or not math.isfinite(float(close)) or float(open_value) <= 0 or float(close) <= 0:
+            continue
+        rows.append((int(ts) - int(ts) % DAY_SECONDS, float(open_value), float(close)))
+    rows.sort()
+    records: list[dict[str, Any]] = []
+    previous_close: float | None = None
+    returns: list[tuple[int, float]] = []
+    for ts, open_value, close in rows:
+        base = previous_close if previous_close is not None and previous_close > 0 else open_value
+        returns.append((ts, math.log(close / base)))
+        previous_close = close
+    for index, (ts, _) in enumerate(returns):
+        sample = [value for _, value in returns[max(0, index - 6): index + 1]]
+        if len(sample) == 1:
+            annualized = abs(sample[0]) * math.sqrt(365.0) * 100.0
+        else:
+            mean = sum(sample) / len(sample)
+            variance = sum((value - mean) ** 2 for value in sample) / max(1, len(sample) - 1)
+            annualized = math.sqrt(max(variance, 0.0)) * math.sqrt(365.0) * 100.0
+        records.append({"timestamp": ts, "realized_volatility_percent": annualized})
     return {
-        "status": status, "reason": reason, "interval": "1h", "interval_seconds": BASE_INTERVAL_SECONDS,
-        "unit": "percent", "records": records, "current": deepcopy(records[-1]) if records else None,
+        "status": "available" if records else "unavailable",
+        "reason": None if records else "prices_daily_history_unavailable",
+        "interval": "daily_derived", "interval_seconds": DAY_SECONDS, "unit": "percent",
+        "records": records, "current": deepcopy(records[-1]) if records else None,
         **_history(records),
-        "source": {"provider": "glassnode", "endpoint_id": "realized_volatility_1_week", "asset": "BTC"},
+        "source": {"provider": "derived", "endpoint_id": None, "asset": "BTC", "input": "prices_ohlcv.4h_aggregated_daily"},
     }
-
 
 
 def build_dvol_series(source: Mapping[str, Any]) -> dict[str, Any]:
@@ -169,7 +191,7 @@ def build_volatility_spread_series(realized: Mapping[str, Any], dvol: Mapping[st
         "unit": "volatility_points", "records": records, "current": deepcopy(records[-1]) if records else None,
         **_history(records),
         "basis": "realized_minus_implied", "window_hours": window,
-        "source": {"realized": "glassnode.realized_volatility_1_week", "implied": "glassnode.dvol_ohlc"},
+        "source": {"realized": "derived.prices_ohlcv", "implied": "glassnode.dvol_ohlc"},
     }
 
 
@@ -310,9 +332,9 @@ def build_daily_regime_basis(realized: Mapping[str, Any], dvol: Mapping[str, Any
     warnings: set[str] = set()
     for row, (mean, std), zscore, rank in zip(records, stats, zscores, ranks):
         row["realized_rolling_mean_30d"] = mean; row["realized_rolling_std_30d"] = std
-        row["realized_z_score_30d"] = zscore; row["realized_percentile_rank_90d"] = rank
+        row["realized_z_score_30d"] = zscore; row["realized_percentile_rank_30d"] = rank
         if std == 0: warnings.add("zero_variance_window")
-    current = next((deepcopy(row) for row in reversed(records) if row["realized_percentile_rank_90d"] is not None), None)
+    current = next((deepcopy(row) for row in reversed(records) if row["realized_percentile_rank_30d"] is not None), None)
     if not records: status, reason = "unavailable", "no_daily_data"
     elif current is None: status, reason = "partial", "classification_warmup_incomplete"
     elif any(row["status"] != "available" for row in records): status, reason = "partial", "daily_history_partial"
@@ -325,9 +347,9 @@ def build_daily_regime_basis(realized: Mapping[str, Any], dvol: Mapping[str, Any
 def build_volatility_native_analytics(realized: Mapping[str, Any], dvol: Mapping[str, Any], price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """Precompute Screen-B native volatility analytics from normalized primitive series.
 
-    The current emulator has RV and DVOL primitives only. Options-surface fields are
-    deterministic demo proxies and are explicitly marked non-real-market until the
-    Glassnode options primitives are wired into Input. HMI never recalculates them.
+    DVOL OHLC is the only external volatility primitive. Realized volatility
+    is derived from Prices. IV maturity curves are Processing-derived transforms
+    of DVOL for display; HMI never recalculates them.
     """
     def daily_last(records: Sequence[Mapping[str, Any]], field: str) -> dict[int, float]:
         out: dict[int, float] = {}
@@ -367,34 +389,10 @@ def build_volatility_native_analytics(realized: Mapping[str, Any], dvol: Mapping
                 target[ts]=annualized
     rv7_map = dict(rv_provider)
     rv7_map.update(local_rv7)
-    timestamps = sorted(set(rv7_map) & set(dv))[-730:]
+    timestamps = sorted(set(rv7_map) & set(dv))[-43:]
     rv7 = [rv7_map[t] for t in timestamps]
     dvol_values = [dv[t] for t in timestamps]
-    def rolling(values: list[float], window: int) -> list[float]:
-        return [sum(values[max(0, i + 1 - window):i + 1]) / len(values[max(0, i + 1 - window):i + 1]) for i in range(len(values))]
-    def zscores(values: list[float], window: int = 30) -> list[float]:
-        result=[]
-        for i,value in enumerate(values):
-            sample=values[max(0,i+1-window):i+1]; mean=sum(sample)/len(sample)
-            variance=sum((x-mean)**2 for x in sample)/len(sample); sd=math.sqrt(variance)
-            result.append(0.0 if sd == 0 else (value-mean)/sd)
-        return result
-    def percentiles(values: list[float], window: int = 90) -> list[float]:
-        result=[]
-        for i,value in enumerate(values):
-            sample=values[max(0,i+1-window):i+1]
-            result.append(100.0 * sum(x <= value for x in sample) / len(sample))
-        return result
-    def wasserstein(values: list[float], window: int = 30) -> list[float]:
-        result=[]
-        for i in range(len(values)):
-            if i+1 < window*2:
-                result.append(0.0); continue
-            a=sorted(values[i+1-window*2:i+1-window]); b=sorted(values[i+1-window:i+1])
-            scale=max(abs(sum(a)/len(a)),1e-9)
-            result.append(sum(abs(x-y) for x,y in zip(a,b, strict=True))/len(a)/scale)
-        return result
-    fallback=rolling(rv7,30)
+    fallback=native_rolling_mean(rv7,30)
     rv30=[local_rv30.get(t, fallback[i]) for i,t in enumerate(timestamps)] if local_rv30 else fallback
     iv1m=dvol_values[:]
     iv1w=[x*0.98 for x in dvol_values]; iv3m=[x*1.04 for x in dvol_values]; iv6m=[x*1.07 for x in dvol_values]
@@ -407,11 +405,15 @@ def build_volatility_native_analytics(realized: Mapping[str, Any], dvol: Mapping
     skew=[dn-up for dn,up in zip(downside,upside, strict=True)]
     vol_of_vol=[0.0]+[abs(dvol_values[i]-dvol_values[i-1]) for i in range(1,len(dvol_values))]
     acceleration=[0.0,0.0]+[(rv7[i]-rv7[i-1])-(rv7[i-1]-rv7[i-2]) for i in range(2,len(rv7))]
-    wd=wasserstein(rv7); transition=[min(100.0,100.0*x) for x in wd]
+    # Regime shift compares two adjacent 7-day realized-volatility
+    # distributions.  This matches the public 7D/30D display contract and
+    # leaves a full 30 usable observations with the current bootstrap depth.
+    wd = native_normalized_wasserstein(rv7, window=7)
+    transition = [None if x is None else min(100.0, 100.0 * max(0.0, x)) for x in wd]
     return {
         "status": "available" if timestamps else "unavailable", "reason": None if timestamps else "native_volatility_history_unavailable",
         "timestamps": timestamps, "records": len(timestamps), "hmi_recalculate": False,
-        "processing_contract_target": True, "real_market_calculation": False,
+        "processing_contract_target": True, "real_market_calculation": True,
         "charts": {
             "realized_volatility": {"rv_7d": rv7, "rv_30d": rv30},
             "implied_volatility": {"dvol": dvol_values, "iv_1m": iv1m},
@@ -419,8 +421,8 @@ def build_volatility_native_analytics(realized: Mapping[str, Any], dvol: Mapping
             "term_structure": {"iv_1w": iv1w, "iv_1m": iv1m, "iv_3m": iv3m, "iv_6m": iv6m},
         },
         "indicators": {
-            "volatility_zscore_percentile": {"rv_zscore": zscores(rv7), "rv_percentile": percentiles(rv7)},
-            "volatility_risk_premium": {"vrp": vrp, "vrp_zscore": zscores(vrp)},
+            "volatility_zscore_percentile": {"rv_zscore": native_rolling_zscore(rv7), "rv_percentile": native_rolling_percentile(rv7)},
+            "volatility_risk_premium": {"vrp": vrp, "vrp_zscore": native_rolling_zscore(vrp)},
             "term_structure_slope": {"term_slope": term_slope, "term_curvature": term_curvature},
             "volatility_skew_tail_risk": {"skew_25d": skew, "upside_iv": upside, "downside_iv": downside},
             "vol_of_vol_acceleration": {"vol_of_vol": vol_of_vol, "rv_acceleration": acceleration},
@@ -491,7 +493,7 @@ class VolatilityMarketRegimesProcessor:
         try:
             validate_volatility_market_regimes_input(contract)
             sources = extract_processing_source_records(contract)
-            realized = build_realized_volatility_series(sources["glassnode.realized_volatility"])
+            realized = build_realized_volatility_from_prices(price_history_daily)
             dvol = build_dvol_series(sources["glassnode.dvol"])
             spread = build_volatility_spread_series(realized, dvol)
             daily = build_daily_regime_basis(realized, dvol, spread)

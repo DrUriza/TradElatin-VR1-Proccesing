@@ -1,1 +1,0 @@
-{"status":{"code":200,"message":"success"},"result":{"type":"miner","data":[{"name":"F2Pool","symbol":"f2pool","is_validated":1,"market_type":0},{"name":"AntPool","symbol":"antpool","is_validated":1,"market_type":0},{"name":"Foundry USA","symbol":"foundryusa","is_validated":1,"market_type":0},{"name":"ViaBTC","symbol":"viabtc","is_validated":1,"market_type":0}]}}

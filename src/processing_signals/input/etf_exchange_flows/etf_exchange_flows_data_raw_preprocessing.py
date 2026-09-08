@@ -10,11 +10,10 @@ from typing import Any
 
 from .etf_exchange_flows_data_raw_extract import FAMILY, ENDPOINT_SPECS, EtfExchangeFlowsRawExtractor
 
-DATASET_KEYS = ("etf_flows_daily", "etf_fund_flows_daily", "etf_funds_snapshot", "etf_net_assets_daily",
-    "etf_premium_discount_daily", "exchange_balances_snapshot", "exchange_balances_history")
+DATASET_KEYS = ("etf_flows_daily", "etf_fund_flows_daily", "etf_funds_snapshot")
 CQ_FIELDS = {"exchange_inflow": ("inflow_total", "inflow_top10", "inflow_mean"),
              "exchange_outflow": ("outflow_total", "outflow_top10", "outflow_mean"),
-             "exchange_netflow": ("netflow_total",), "exchange_reserve": ("reserve",)}
+             "exchange_reserve": ("reserve",)}
 
 ETF_HOURLY_REFRESH_SECONDS = 3_600
 ETF_SLOW_REFRESH_SECONDS = 86_400
@@ -115,59 +114,20 @@ def _normalize_coinglass(endpoint: str, entry: Mapping[str, Any], datasets: dict
                 item = deepcopy(dict(row))
                 for key in ("shares_outstanding", "aum_usd", "management_fee_percent"):
                     item[key] = _number(item.get(key))
-                item.update(ticker=str(item["ticker"]), provider="coinglass", endpoint_id=endpoint)
+                details = item.get("asset_details")
+                if isinstance(details, Mapping):
+                    details = deepcopy(dict(details))
+                    details["premium_discount_percent"] = _number(details.get("premium_discount_percent"))
+                    item["asset_details"] = details
+                raw_snapshot = item.get("last_quote_time", item.get("last_trade_time"))
+                try:
+                    snapshot_timestamp = _timestamp(raw_snapshot)
+                except (TypeError, ValueError):
+                    snapshot_timestamp = _timestamp(entry.get("requested_at", entry.get("timestamp", 1))) if entry.get("requested_at") or entry.get("timestamp") else None
+                item.update(ticker=str(item["ticker"]), snapshot_timestamp=snapshot_timestamp, provider="coinglass", endpoint_id=endpoint)
                 datasets["etf_funds_snapshot"].append(item)
-            elif endpoint == "bitcoin_etf_net_assets_history":
-                datasets["etf_net_assets_daily"].append({"timestamp": _timestamp(row.get("timestamp")), "scope": "aggregate",
-                    "ticker": None, "net_assets_usd": _number(row.get("net_assets_usd")), "change_usd": _number(row.get("change_usd")),
-                    "price_usd": _number(row.get("price_usd")), "provider": "coinglass", "endpoint_id": endpoint})
-            elif endpoint == "bitcoin_etf_premium_discount_history":
-                timestamp = _timestamp(row.get("timestamp"))
-                nested = row.get("list")
-                if not isinstance(nested, list):
-                    raise ValueError("invalid_premium_list")
-                for fund in nested:
-                    datasets["etf_premium_discount_daily"].append({"timestamp": timestamp, "ticker": str(fund["ticker"]),
-                        "nav_usd": _number(fund.get("nav_usd")), "market_price_usd": _number(fund.get("market_price_usd")),
-                        "premium_discount_percent": _number(fund.get("premium_discount_details")), "provider": "coinglass", "endpoint_id": endpoint})
-            elif endpoint == "exchange_balance_list":
-                item = deepcopy(dict(row))
-                item.update(exchange_name=str(item["exchange_name"]), symbol=entry["params"]["symbol"],
-                                                         provider="coinglass", endpoint_id=endpoint)
-                for key, value in list(item.items()):
-                    if key.startswith("balance") or key == "total_balance":
-                        item[key] = _number(value)
-                datasets["exchange_balances_snapshot"].append(item)
             else:
-                times, prices, matrix = row.get("time_list"), row.get("price_list"), row.get("data_map")
-                if not isinstance(times, list):
-                    raise ValueError("matrix_time_list_not_list")
-                if not isinstance(prices, list):
-                    raise ValueError("matrix_price_list_not_list")
-                if not isinstance(matrix, Mapping):
-                    raise ValueError("matrix_data_map_not_mapping")
-                if len(times) != len(prices):
-                    raise ValueError("matrix_length_mismatch")
-                for values in matrix.values():
-                    if not isinstance(values, list):
-                        raise ValueError("matrix_exchange_series_not_list")
-                    if len(values) != len(times):
-                        raise ValueError("matrix_exchange_series_length_mismatch")
-                pending_records = []
-                for position, timestamp_value in enumerate(times):
-                    for exchange, values in matrix.items():
-                        try:
-                            timestamp = _timestamp(timestamp_value)
-                        except ValueError as exc:
-                            raise ValueError("matrix_invalid_timestamp") from exc
-                        try:
-                            balance, price = _number(values[position]), _number(prices[position])
-                        except ValueError as exc:
-                            raise ValueError("matrix_invalid_numeric") from exc
-                        pending_records.append({"timestamp": timestamp, "exchange_name": str(exchange),
-                            "balance_btc": balance, "price_usd": price, "symbol": entry["params"]["symbol"],
-                            "provider": "coinglass", "endpoint_id": endpoint})
-                datasets["exchange_balances_history"].extend(pending_records)
+                raise ValueError("endpoint_not_in_final33")
             valid += 1
         except (KeyError, TypeError, ValueError) as exc:
             _invalid(invalid, "coinglass", endpoint, index, str(exc), row)
@@ -276,19 +236,21 @@ def _refresh_due(existing_contract: Mapping[str, Any] | None, *, now: int, key: 
 
 
 NATURAL_KEYS = {"etf_flows_daily": ("timestamp",), "etf_fund_flows_daily": ("timestamp", "ticker"),
-    "etf_funds_snapshot": ("ticker",), "etf_net_assets_daily": ("timestamp", "scope", "ticker"),
-    "etf_premium_discount_daily": ("timestamp", "ticker"), "exchange_balances_snapshot": ("exchange_name", "symbol"),
-    "exchange_balances_history": ("timestamp", "exchange_name", "symbol")}
+    "etf_funds_snapshot": ("ticker",)}
 CG_DATASETS = {"bitcoin_etf_flows": ("etf_flows_daily", "etf_fund_flows_daily"),
-    "bitcoin_etf_list": ("etf_funds_snapshot",), "bitcoin_etf_net_assets_history": ("etf_net_assets_daily",),
-    "bitcoin_etf_premium_discount_history": ("etf_premium_discount_daily",),
-    "exchange_balance_list": ("exchange_balances_snapshot",), "exchange_balance_chart": ("exchange_balances_history",)}
+    "bitcoin_etf_list": ("etf_funds_snapshot",)}
 
 
 def _upsert(existing: Sequence[Mapping[str, Any]], incoming: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> list[dict[str, Any]]:
-    merged = {tuple(item.get(key) for key in keys): deepcopy(dict(item)) for item in existing}
-    merged.update({tuple(item.get(key) for key in keys): deepcopy(dict(item)) for item in incoming})
-    return sorted(merged.values(), key=lambda item: (item.get("timestamp", 0), *(str(item.get(key)) for key in keys)))
+    # Old/partial states may contain availability placeholders with timestamp=None.
+    # They are valid metadata, but must never participate in numeric timestamp sorting.
+    merged = {tuple(item.get(key) for key in keys): deepcopy(dict(item)) for item in existing if isinstance(item, Mapping)}
+    merged.update({tuple(item.get(key) for key in keys): deepcopy(dict(item)) for item in incoming if isinstance(item, Mapping)})
+    def sort_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        timestamp = item.get("timestamp")
+        safe_timestamp = timestamp if type(timestamp) is int else -1
+        return (safe_timestamp, *(str(item.get(key)) for key in keys))
+    return sorted(merged.values(), key=sort_key)
 
 
 def determine_etf_exchange_flows_input_mode(*, existing_contract=None, recovery_requests=None, requested_mode=None) -> str:
@@ -302,7 +264,7 @@ def determine_etf_exchange_flows_input_mode(*, existing_contract=None, recovery_
         return "recovery"
     datasets = existing_contract.get("datasets", {}) if isinstance(existing_contract, Mapping) else {}
     required = all(datasets.get(key) for key in (
-        "etf_flows_daily", "etf_funds_snapshot", "etf_net_assets_daily", "etf_premium_discount_daily"
+        "etf_flows_daily", "etf_funds_snapshot"
     ))
     required = required and all(
         datasets.get(endpoint, {}).get(window)
@@ -395,7 +357,10 @@ class EtfExchangeFlowsInputPreprocessor:
             timestamps.extend(item["timestamp"] for item in datasets[key] if isinstance(item.get("timestamp"), int))
         for endpoint in CQ_FIELDS:
             for window in ("hour", "day"):
-                timestamps.extend(item["timestamp"] for item in datasets[endpoint][window])
+                timestamps.extend(
+                    item["timestamp"] for item in datasets[endpoint][window]
+                    if isinstance(item, Mapping) and type(item.get("timestamp")) is int
+                )
         primary = [item["status"] for name, item in endpoint_quality.items() if not name.startswith("glassnode.")]
         usable = sum(status in {"available", "partial"} for status in primary)
         global_status = "ok" if primary and all(status == "available" for status in primary) else "partial" if usable else "invalid"

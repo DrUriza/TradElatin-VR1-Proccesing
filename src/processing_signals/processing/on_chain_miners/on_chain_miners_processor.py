@@ -5,22 +5,30 @@ import math
 from collections.abc import Mapping, Sequence
 from typing          import Any
 
-from processing_signals.processing.math.native_analysis import (rolling_zscore, rolling_mean, pct_change as native_pct_change, difference, rolling_wasserstein, latest, score_to_probability)
+from .on_chain_miners_math import (
+    rolling_zscore,
+    rolling_mean,
+    pct_change as native_pct_change,
+    difference,
+    rolling_wasserstein,
+    latest,
+    score_to_probability,
+)
 
 from .on_chain_miners_feature_builder import build_on_chain_miners_features
 
 
 ON_CHAIN_MINERS_FAMILY = "on_chain_miners"
 VALID_MODES            = {"bootstrap", "incremental", "recovery"}
-EXPECTED_UNITS         = {"miner_reserve": "BTC", "sopr": "ratio", "hashrate": "H/s", "difficulty": "provider_native_difficulty", "miner_net_position_change": "BTC/day", "mpi": "z_score"}
-EXTENSION_EXPECTED_UNITS = {"miner_outflow_total": "BTC/day", "miners_unspent_supply": "BTC", "utxo_age_distribution": "mixed", "miner_revenue_total_usd": "USD/day",
-                            "miner_revenue_from_fees": "provider_native_percentage", "nupl": "ratio"}
-CORE_PROCESSING_SERIES = ("miner_reserve_btc", "sopr", "sopr_7d", "hashrate_eh_s", "difficulty_t", "miner_net_position_change", "mpi")
-EXTENSION_PROCESSING_SERIES = ("miners_unspent_supply_btc", "nupl", "miner_outflow_total_btc", "miner_revenue_total_usd",
-                               "miner_block_reward_revenue_usd", "miner_fee_revenue_usd", "miner_fee_share_ratio")
-PROCESSING_SERIES      = CORE_PROCESSING_SERIES + EXTENSION_PROCESSING_SERIES
-DATA_AS_OF_SERIES      = ("miner_reserve_btc", "sopr_7d", "hashrate_eh_s", "difficulty_t", "miner_net_position_change", "mpi")
-EXTENSION_FEATURES     = ("miner_outflow_distribution", "reserve_age_context", "miner_revenue_breakdown", "nupl_phase_basis")
+EXPECTED_UNITS = {
+    "miner_reserve": "BTC", "sopr": "ratio", "hashrate": "H/s",
+    "difficulty": "provider_native_difficulty", "miner_net_position_change": "BTC/day",
+    "mpi": "z_score", "miner_outflow_total": "BTC/day", "miner_revenue_total_usd": "USD/day",
+}
+PROCESSING_SERIES = ("miner_reserve_btc", "sopr", "sopr_7d", "hashrate_eh_s", "difficulty_t",
+                     "miner_net_position_change", "mpi", "miner_outflow_total_btc", "miner_revenue_total_usd")
+DATA_AS_OF_SERIES = ("miner_reserve_btc", "sopr_7d", "hashrate_eh_s", "difficulty_t",
+                     "miner_net_position_change", "mpi", "miner_outflow_total_btc", "miner_revenue_total_usd")
 VALID_SERIES_STATUSES = {"available", "partial", "unavailable", "invalid"}
 VALID_QUALITY_STATUSES = {"ok", "partial", "invalid"}
 
@@ -136,55 +144,6 @@ def validate_on_chain_miners_input(input_contract: Any) -> list[str]:
         for index, record in enumerate(records):
             previous_timestamp, record_errors = _validate_record(metric_id, record, index, previous_timestamp)
             errors.extend(record_errors)
-    context = input_contract.get("context", {})
-    include_extensions = isinstance(context, Mapping) and context.get("include_screen_extensions") is True
-    if include_extensions:
-        for metric_id, expected_unit in EXTENSION_EXPECTED_UNITS.items():
-            payload = series.get(metric_id)
-            if not isinstance(payload, Mapping):
-                errors.append(f"missing_screen_extension_series:{metric_id}")
-                continue
-            if payload.get("status") not in VALID_SERIES_STATUSES:
-                errors.append(f"{metric_id}:invalid_or_missing_series_status")
-            if payload.get("unit") != expected_unit:
-                errors.append(f"{metric_id}:incompatible_unit")
-            errors.extend(_validate_messages(payload.get("warnings"), f"{metric_id}.warnings"))
-            errors.extend(_validate_messages(payload.get("errors"), f"{metric_id}.errors"))
-            records = payload.get("records")
-            if not isinstance(records, Sequence) or isinstance(records, (str, bytes, bytearray)):
-                errors.append(f"{metric_id}.records_must_be_sequence")
-                continue
-            previous_timestamp = None
-            seen: set[int] = set()
-            for record in records:
-                if not isinstance(record, Mapping):
-                    errors.append(f"source_record_must_be_mapping:{metric_id}")
-                    break
-                timestamp = record.get("timestamp")
-                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-                    errors.append(f"source_timestamp_invalid:{metric_id}")
-                    break
-                if timestamp in seen:
-                    errors.append(f"source_duplicate_timestamp:{metric_id}:{timestamp}")
-                    break
-                if previous_timestamp is not None and timestamp < previous_timestamp:
-                    errors.append(f"source_timestamps_not_strictly_ascending:{metric_id}")
-                    break
-                seen.add(timestamp)
-                previous_timestamp = timestamp
-        collections = input_contract.get("collections")
-        if not isinstance(collections, Mapping):
-            errors.append("collections_must_be_mapping")
-        else:
-            for collection_id in ("miner_entities", "miner_outflow_by_pool"):
-                payload = collections.get(collection_id)
-                if not isinstance(payload, Mapping):
-                    errors.append(f"missing_screen_extension_collection:{collection_id}")
-                    continue
-                if payload.get("status") not in VALID_SERIES_STATUSES:
-                    errors.append(f"{collection_id}:invalid_or_missing_collection_status")
-                errors.extend(_validate_messages(payload.get("warnings"), f"{collection_id}.warnings"))
-                errors.extend(_validate_messages(payload.get("errors"), f"{collection_id}.errors"))
     quality = input_contract.get("quality")
     if not isinstance(quality, Mapping):
         errors.append("quality_must_be_mapping")
@@ -203,28 +162,22 @@ def _invalid_series(metric_id: str, reason: str) -> dict[str, Any]:
                          "last_valid_timestamp": None, "calculation_history": "full_available_history", "history_truncated": False}}
 
 
-def _invalid_features(reason: str, include_screen_extensions: bool = False) -> dict[str, Any]:
+def _invalid_features(reason: str) -> dict[str, Any]:
     unavailable = {"status": "unavailable", "value": None, "reason": "invalid_input_contract"}
-    features = {"reserve_trend": {"feature_id": "reserve_trend", "status": "invalid", "default_window_days": 30, "windows": {}, "warnings": [], "errors": [reason]},
-            "miner_pressure_basis": {"source_metric_id": "mpi", "current": unavailable, "previous": None, "change_1d": None, "unit": "z_score"},
-            "sopr_regime_basis": {"source_metric_id": "sopr_7d", "current": unavailable, "raw_sopr_current": unavailable},
-            "net_position_basis": {"source_metric_id": "miner_net_position_change", "current": unavailable}}
-    if include_screen_extensions:
-        features.update({feature_id: {"feature_id": feature_id, "status": "invalid", "records": [], "current": unavailable, "warnings": [], "errors": [reason],
-                                              "metadata": {"data_as_of": None}} for feature_id in EXTENSION_FEATURES})
-    return features
+    return {
+        "reserve_trend": {"feature_id": "reserve_trend", "status": "invalid", "default_window_days": 30, "windows": {}, "warnings": [], "errors": [reason]},
+        "miner_pressure_basis": {"source_metric_id": "mpi", "status": "invalid", "current": unavailable, "previous": None, "change_1d": None, "unit": "z_score"},
+        "sopr_regime_basis": {"source_metric_id": "sopr_7d", "status": "invalid", "current": unavailable, "raw_sopr_current": unavailable},
+        "net_position_basis": {"source_metric_id": "miner_net_position_change", "status": "invalid", "current": unavailable},
+    }
 
 
-def evaluate_on_chain_miners_processing_quality(*, series: Mapping[str, Any], features: Mapping[str, Any], input_quality: Mapping[str, Any],
-                                                input_series: Mapping[str, Any] | None = None, input_collections: Mapping[str, Any] | None = None,
-                                                include_screen_extensions: bool = False) -> dict[str, Any]:
-    required_series = PROCESSING_SERIES if include_screen_extensions else CORE_PROCESSING_SERIES
-    availability = {metric_id: str(series.get(metric_id, {}).get("status", "invalid")) for metric_id in required_series}
+def evaluate_on_chain_miners_processing_quality(*, series: Mapping[str, Any], features: Mapping[str, Any],
+                                                input_quality: Mapping[str, Any], input_series: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    availability = {metric_id: str(series.get(metric_id, {}).get("status", "invalid")) for metric_id in PROCESSING_SERIES}
     availability["reserve_trend"] = str(features.get("reserve_trend", {}).get("status", "invalid"))
-    if include_screen_extensions:
-        availability.update({feature_id: str(features.get(feature_id, {}).get("status", "invalid")) for feature_id in EXTENSION_FEATURES})
     warnings = [f"{metric_id}:{warning}" for metric_id, payload in series.items() for warning in payload.get("warnings", [])]
-    errors   = [f"{metric_id}:{error}" for metric_id, payload in series.items() for error in payload.get("errors", [])]
+    errors = [f"{metric_id}:{error}" for metric_id, payload in series.items() for error in payload.get("errors", [])]
     trend = features.get("reserve_trend", {})
     warnings.extend(f"reserve_trend:{warning}" for warning in trend.get("warnings", []))
     errors.extend(f"reserve_trend:{error}" for error in trend.get("errors", []))
@@ -233,52 +186,30 @@ def evaluate_on_chain_miners_processing_quality(*, series: Mapping[str, Any], fe
     for metric_id, payload in (input_series or {}).items():
         warnings.extend(f"input_series_warning:{metric_id}:{message}" for message in payload.get("warnings", []))
         errors.extend(f"input_series_error:{metric_id}:{message}" for message in payload.get("errors", []))
-    for collection_id, payload in (input_collections or {}).items():
-        warnings.extend(f"input_collection_warning:{collection_id}:{message}" for message in payload.get("warnings", []))
-        errors.extend(f"input_collection_error:{collection_id}:{message}" for message in payload.get("errors", []))
-    missing = [metric_id for metric_id in required_series if series.get(metric_id, {}).get("current", {}).get("status") not in {"available", "partial"}]
+    missing = [metric_id for metric_id in PROCESSING_SERIES if series.get(metric_id, {}).get("current", {}).get("status") not in {"available", "partial"}]
     if availability["reserve_trend"] in {"unavailable", "invalid"}:
         missing.append("reserve_trend")
-    if include_screen_extensions:
-        missing.extend(feature_id for feature_id in EXTENSION_FEATURES if features.get(feature_id, {}).get("metadata", {}).get("data_as_of") is None)
-    trend_status = features.get("reserve_trend", {}).get("status")
     input_status = str(input_quality.get("status", "invalid"))
     if input_status == "invalid":
         errors.append("input_quality_invalid")
     elif input_status == "partial":
         warnings.append("input_quality_partial")
     for metric_id, status_value in availability.items():
-        if status_value == "partial":
-            warnings.append(f"required_series_partial:{metric_id}")
-        elif status_value == "unavailable":
-            warnings.append(f"required_series_unavailable:{metric_id}")
-    if trend_status == "partial":
-        warnings.append("reserve_trend_default_window_incomplete")
-    elif trend_status == "unavailable":
-        warnings.append("reserve_trend_default_window_unavailable")
-    if any(status == "invalid" for status in availability.values()) or input_status == "invalid":
+        if status_value == "partial": warnings.append(f"required_series_partial:{metric_id}")
+        elif status_value == "unavailable": warnings.append(f"required_series_unavailable:{metric_id}")
+    if any(status == "invalid" for status in availability.values()) or input_status == "invalid" or errors:
         status = "invalid"
-    elif not errors and not missing and all(status == "available" for status in availability.values()) and trend_status == "available" and input_status == "ok":
+    elif not missing and all(status == "available" for status in availability.values()) and input_status == "ok":
         status = "ok"
     else:
         status = "partial"
-    current_timestamps = [series[metric_id]["current"].get("timestamp") for metric_id in DATA_AS_OF_SERIES
-                          if series.get(metric_id, {}).get("current", {}).get("status") == "available"]
-    expected_timestamps = len(DATA_AS_OF_SERIES)
-    if include_screen_extensions:
-        current_timestamps.extend(features[feature_id].get("metadata", {}).get("data_as_of") for feature_id in EXTENSION_FEATURES
-                                  if features.get(feature_id, {}).get("metadata", {}).get("data_as_of") is not None)
-        expected_timestamps += len(EXTENSION_FEATURES)
-    data_as_of = min(current_timestamps) if status != "invalid" and len(current_timestamps) == expected_timestamps else None
+    timestamps = [series[mid]["current"].get("timestamp") for mid in DATA_AS_OF_SERIES
+                  if series.get(mid, {}).get("current", {}).get("status") == "available"]
+    data_as_of = min(timestamps) if status != "invalid" and len(timestamps) == len(DATA_AS_OF_SERIES) else None
     if status != "invalid" and data_as_of is None:
         warnings.append("processing_data_as_of_unavailable")
-    warnings = _stable_unique(warnings)
-    errors   = _stable_unique(errors)
-    if status == "partial" and not warnings and not errors and not missing:
-        warnings.append("processing_partial_unspecified")
-    return {"status": status, "availability": availability, "data_as_of": data_as_of, "input_status": input_status, "missing_fields": missing,
-            "warnings": warnings, "errors": errors}
-
+    return {"status": status, "availability": availability, "data_as_of": data_as_of, "input_status": input_status,
+            "missing_fields": _stable_unique(missing), "warnings": _stable_unique(warnings), "errors": _stable_unique(errors)}
 
 
 def _records_map(metric: Mapping[str, Any]) -> dict[int, float | None]:
@@ -319,7 +250,7 @@ def _native_miner_analysis(series_map: Mapping[str, Any]) -> dict[str, Any]:
     puell: list[float | None] = []
     for value, avg in zip(revenue, revenue_ma365, strict=True):
         puell.append(None if value is None or avg in (None, 0) else float(value) / float(avg))
-    revenue_stress = [-v if v is not None else None for v in rolling_zscore(revenue, 90, 30)]
+    revenue_stress = [-v if v is not None else None for v in rolling_zscore(revenue, 30, 7)]
 
     hash_ma30 = rolling_mean(hashrate, 30, 15)
     hash_ma60 = rolling_mean(hashrate, 60, 30)
@@ -354,37 +285,30 @@ class OnChainMinersProcessor:
         self.input_contract = input_contract
 
     def run(self) -> dict[str, Any]:
-        errors  = validate_on_chain_miners_input(self.input_contract)
+        errors = validate_on_chain_miners_input(self.input_contract)
         context = self.input_contract.get("context", {}) if isinstance(self.input_contract, Mapping) else {}
-        mode    = self.input_contract.get("mode") if isinstance(self.input_contract, Mapping) else None
-        include_screen_extensions = isinstance(context, Mapping) and context.get("include_screen_extensions") is True
-        required_series = PROCESSING_SERIES if include_screen_extensions else CORE_PROCESSING_SERIES
+        mode = self.input_contract.get("mode") if isinstance(self.input_contract, Mapping) else None
         output_context = {"asset": context.get("asset"), "data_mode": context.get("data_mode"), "is_demo": context.get("is_demo"),
                           "reference_timestamp": context.get("reference_timestamp"), "execution_timestamp": context.get("execution_timestamp"),
                           "generated_at": context.get("generated_at"),
                           "input_data_as_of": self.input_contract.get("quality", {}).get("data_as_of") if isinstance(self.input_contract, Mapping) else None,
                           "calculation_history": "full_available_history", "presentation_window": None}
         if errors:
-            reason   = ";".join(errors)
-            series   = {metric_id: _invalid_series(metric_id, reason) for metric_id in required_series}
-            features = _invalid_features(reason, include_screen_extensions)
-            invalid_availability = {**{metric_id: "invalid" for metric_id in required_series}, "reserve_trend": "invalid"}
-            if include_screen_extensions:
-                invalid_availability.update({feature_id: "invalid" for feature_id in EXTENSION_FEATURES})
-            quality  = {"status": "invalid", "availability": invalid_availability, "data_as_of": None,
-                        "input_status": self.input_contract.get("quality", {}).get("status") if isinstance(self.input_contract, Mapping) else "invalid",
-                        "missing_fields": list(required_series), "warnings": [], "errors": errors}
+            reason = ";".join(errors)
+            series = {metric_id: _invalid_series(metric_id, reason) for metric_id in PROCESSING_SERIES}
+            features = _invalid_features(reason)
+            quality = {"status": "invalid", "availability": {**{metric_id: "invalid" for metric_id in PROCESSING_SERIES}, "reserve_trend": "invalid"},
+                       "data_as_of": None, "input_status": self.input_contract.get("quality", {}).get("status", "invalid"),
+                       "missing_fields": list(PROCESSING_SERIES), "warnings": [], "errors": errors}
         else:
-            built    = build_on_chain_miners_features(self.input_contract["series"], self.input_contract.get("collections", {}),
-                                                      input_data_as_of=self.input_contract.get("quality", {}).get("data_as_of"),
-                                                      include_screen_extensions=include_screen_extensions)
-            series   = built["series"]
+            built = build_on_chain_miners_features(self.input_contract["series"],
+                                                  input_data_as_of=self.input_contract.get("quality", {}).get("data_as_of"))
+            series = built["series"]
             features = built["features"]
-            quality  = evaluate_on_chain_miners_processing_quality(series=series, features=features, input_quality=self.input_contract.get("quality", {}),
-                                                                    input_series=self.input_contract.get("series", {}),
-                                                                    input_collections=self.input_contract.get("collections", {}),
-                                                                    include_screen_extensions=include_screen_extensions)
-        miner_analysis = _native_miner_analysis(series) if not errors else {"analysis_id":"native_miner_analysis_vr1","status":"invalid","timestamps":[],"indicators":{},"recalculate_in_hmi":False}
+            quality = evaluate_on_chain_miners_processing_quality(series=series, features=features,
+                                                                  input_quality=self.input_contract.get("quality", {}),
+                                                                  input_series=self.input_contract.get("series", {}))
+        miner_analysis = _native_miner_analysis(series) if not errors else {"analysis_id": "native_miner_analysis_vr1", "status": "invalid", "timestamps": [], "indicators": {}, "recalculate_in_hmi": False}
         output = {"family": ON_CHAIN_MINERS_FAMILY, "stage": "processing", "mode": mode, "context": output_context,
                   "series": series, "features": features, "miner_analysis": miner_analysis, "quality": quality}
         output, unsafe = _json_safe_copy(output)
@@ -411,18 +335,15 @@ def process_on_chain_miners(input_contract: Mapping[str, Any]) -> dict[str, Any]
     except Exception as exc:  # Public contract must remain JSON-safe for adversarial Input.
         context = input_contract.get("context", {}) if isinstance(input_contract, Mapping) else {}
         context = context if isinstance(context, Mapping) else {}
-        include_extensions = context.get("include_screen_extensions") is True
-        required_series = PROCESSING_SERIES if include_extensions else CORE_PROCESSING_SERIES
+        required_series = PROCESSING_SERIES
         reason = f"processing_contract_build_failed:{type(exc).__name__}"
         safe_context, _ = _json_safe_copy({"asset": context.get("asset"), "data_mode": context.get("data_mode"), "is_demo": context.get("is_demo"),
                                            "reference_timestamp": context.get("reference_timestamp"), "execution_timestamp": context.get("execution_timestamp"),
                                            "generated_at": context.get("generated_at"), "input_data_as_of": None,
                                            "calculation_history": "full_available_history", "presentation_window": None})
         series = {metric_id: _invalid_series(metric_id, reason) for metric_id in required_series}
-        features = _invalid_features(reason, include_extensions)
+        features = _invalid_features(reason)
         availability = {**{metric_id: "invalid" for metric_id in required_series}, "reserve_trend": "invalid"}
-        if include_extensions:
-            availability.update({feature_id: "invalid" for feature_id in EXTENSION_FEATURES})
         output = {"family": ON_CHAIN_MINERS_FAMILY, "stage": "processing",
                   "mode": input_contract.get("mode") if isinstance(input_contract, Mapping) else None, "context": safe_context,
                   "series": series, "features": features,

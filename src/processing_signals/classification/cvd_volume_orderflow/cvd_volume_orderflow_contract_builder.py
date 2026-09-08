@@ -7,7 +7,6 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from .cvd_sp_v1_5_adapter import align_cvd_contract_to_sp_v1_5
 
 FAMILY = "cvd_volume_orderflow"
 PROCESSING_VERSION = "0.1.0"
@@ -19,8 +18,8 @@ SCREEN_ROUTE = "/cvd-orderflow"
 SCREEN_TITLE = "CVD & ORDER FLOW"
 SCREEN_SUBTITLE = "Cumulative volume delta, trades & market microstructure"
 MARKETS = ("spot", "futures")
-TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+TIMEFRAMES = ("5m", "15m", "4h")
+TIMEFRAME_SECONDS = {"5m": 300, "15m": 900, "4h": 14400}
 DEFAULT_MARKET = "spot"
 DEFAULT_TIMEFRAME = "15m"
 DISPLAY_POINT_LIMIT = 220
@@ -221,7 +220,7 @@ class CvdVolumeOrderflowContractBuilder:
             payload = markets[market]
             if not isinstance(payload, Mapping) or not isinstance(payload.get("timeframes"), Mapping) or set(payload["timeframes"]) != set(TIMEFRAMES):
                 raise ValueError("invalid_processing_timeframes")
-            if not isinstance(payload.get("window_summaries"), Mapping) or set(payload["window_summaries"]) != {"1h", "24h"}:
+            if not isinstance(payload.get("window_summaries"), Mapping) or set(payload["window_summaries"]) != {"4h", "24h"}:
                 raise ValueError("invalid_processing_summaries")
             for timeframe in TIMEFRAMES:
                 source = payload["timeframes"][timeframe]
@@ -238,7 +237,7 @@ class CvdVolumeOrderflowContractBuilder:
                     previous = timestamp
                 if source.get("current") is not None and not isinstance(source["current"], Mapping):
                     raise ValueError("invalid_processing_current")
-            for window in ("1h", "24h"):
+            for window in ("4h", "24h"):
                 if not isinstance(payload["window_summaries"][window], Mapping):
                     raise ValueError("invalid_processing_summary")
                 _status(payload["window_summaries"][window].get("status"), "processing.summary.status")
@@ -265,7 +264,7 @@ class CvdVolumeOrderflowContractBuilder:
             payload = markets[market]
             if not isinstance(payload, Mapping) or not isinstance(payload.get("timeframes"), Mapping) or set(payload["timeframes"]) != set(TIMEFRAMES):
                 raise ValueError("invalid_classification_timeframes")
-            if not isinstance(payload.get("window_summaries"), Mapping) or set(payload["window_summaries"]) != {"1h", "24h"}:
+            if not isinstance(payload.get("window_summaries"), Mapping) or set(payload["window_summaries"]) != {"4h", "24h"}:
                 raise ValueError("invalid_classification_summaries")
 
     def validate_bundle_consistency(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> None:
@@ -297,37 +296,54 @@ class CvdVolumeOrderflowContractBuilder:
 
     def _kpi(self, identifier: str, title: str, value: Any, unit: str, status: str, reason: Any, timestamp: Any,
              classification: Any, paths: Sequence[str], *, secondary: Mapping[str, Any] | None = None,
-             window: str | None = "1h", format_hint: str = "number", market: str = "cross_market") -> dict[str, Any]:
+             window: str | None = "4h", format_hint: str = "number", market: str = "cross_market") -> dict[str, Any]:
         return {"kpi_id": identifier, "title": title, "status": status, "reason": _reason(status, reason), "value": value,
             "unit": unit, "secondary_values": copy.deepcopy(dict(secondary or {})), "timestamp": timestamp,
             "market": market, "window": window, "classification": _classification(classification),
             "format_hint": format_hint, "source_paths": list(paths)}
 
     def build_kpis(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
-        summary = processing["cross_market"]["window_summaries"]["1h"]
-        atoms = classification["classifications"]["cross_market"]["window_summaries"]["1h"]["atoms"]
-        base = "processing.cross_market.window_summaries.1h"
-        cbase = "classification.classifications.cross_market.window_summaries.1h.atoms"
+        summary = processing["cross_market"]["window_summaries"]["4h"]
+        atoms = classification["classifications"]["cross_market"]["window_summaries"]["4h"]["atoms"]
+        base = "processing.cross_market.window_summaries.4h"
+        cbase = "classification.classifications.cross_market.window_summaries.4h.atoms"
         ratio, ratio_status, ratio_reason = _metric(summary["buy_sell_ratio"], f"{base}.buy_sell_ratio")
         imbalance, imbalance_status, imbalance_reason = _metric(summary["order_flow_imbalance"], f"{base}.order_flow_imbalance")
         efficiency, efficiency_status, efficiency_reason = _metric(summary["flow_efficiency"], f"{base}.flow_efficiency")
         buy_share, _, _ = _metric(summary["buy_share"], f"{base}.buy_share")
         sell_share, _, _ = _metric(summary["sell_share"], f"{base}.sell_share")
-        footprint = processing["cross_market"].get("footprint_summaries", {}).get("1h", {})
+        footprint = processing["cross_market"].get("footprint_summaries", {}).get("4h", {})
         footprint_status = _status(footprint.get("status", "unavailable"), "processing.cross_market.footprint.status")
         source_status = _status(summary.get("status"), f"{base}.status")
         timestamp = _timestamp(summary.get("last_timestamp"), f"{base}.last_timestamp")
-        volume_ratio_source = processing["cross_market"]["volume_ratios"]["futures_vs_spot"]["1h"]
+        volume_ratio_source = processing["cross_market"]["volume_ratios"]["futures_vs_spot"]["4h"]
         volume_ratio_status = _status(volume_ratio_source.get("status", "unavailable"), "processing.cross_market.volume_ratio.status")
         volume_ratio = _number(volume_ratio_source.get("value"), "processing.cross_market.volume_ratio.value")
-        volume_ratio_atom = classification["classifications"]["cross_market"]["volume_ratios"]["futures_vs_spot"]["1h"]
+        volume_ratio_atom = classification["classifications"]["cross_market"]["volume_ratios"]["futures_vs_spot"]["4h"]
+        spot_4h = processing["markets"]["spot"]["window_summaries"]["4h"]
+        futures_4h = processing["markets"]["futures"]["window_summaries"]["4h"]
+        persistence = summary.get("directional_persistence", {})
+        persistence_status = _status(persistence.get("status", "unavailable"), "processing.cross_market.window_summaries.4h.directional_persistence.status")
+        technical = processing.get("technical_analysis", {}).get("markets", {}).get(self.selected_market, {}).get("timeframes", {}).get(self.selected_timeframe, {}).get("indicators", {})
+        dynamics = technical.get("cvd_slope_acceleration", {})
+        delta_z = technical.get("delta_zscore", {})
+        price_div = technical.get("price_cvd_divergence", {})
+        slope_current = dynamics.get("current", {}) if isinstance(dynamics, Mapping) else {}
+        delta_z_current = delta_z.get("current", {}) if isinstance(delta_z, Mapping) else {}
+        price_div_current = price_div.get("current", {}) if isinstance(price_div, Mapping) else {}
         return {
-            "delta_1h": self._kpi("delta_1h", "Delta 1H", _number(summary.get("volume_delta_usd"), f"{base}.volume_delta_usd"), "USD", source_status, summary.get("reason"), timestamp, atoms.get("delta_state"), [f"{base}.volume_delta_usd", f"{cbase}.delta_state"], format_hint="currency"),
-            "buy_sell_ratio_1h": self._kpi("buy_sell_ratio_1h", "Buy/Sell", ratio, "ratio", ratio_status, ratio_reason, timestamp, atoms.get("buy_sell_pressure_state"), [f"{base}.buy_sell_ratio.value", f"{base}.buy_share.value", f"{base}.sell_share.value", f"{cbase}.buy_sell_pressure_state"], secondary={"buy_share": {"value": buy_share, "unit": "decimal"}, "sell_share": {"value": sell_share, "unit": "decimal"}}),
-            "futures_vs_spot_volume_ratio_1h": {**self._kpi("futures_vs_spot_volume_ratio_1h", "Futures vs Spot Volume Ratio", volume_ratio, "ratio", volume_ratio_status, volume_ratio_source.get("reason"), volume_ratio_source.get("timestamp"), volume_ratio_atom, ["processing.cross_market.volume_ratios.futures_vs_spot.1h"], secondary={"futures_volume_usd": {"value": volume_ratio_source.get("futures_volume_usd"), "unit": "USD"}, "spot_volume_usd": {"value": volume_ratio_source.get("spot_volume_usd"), "unit": "USD"}}), "provider_group": "API Market", "recalculate_in_hmi": False},
-            "flow_efficiency_1h": self._kpi("flow_efficiency_1h", "Flow Efficiency", efficiency, "decimal", efficiency_status, efficiency_reason, timestamp, atoms.get("flow_efficiency_state"), [f"{base}.flow_efficiency.value", f"{cbase}.flow_efficiency_state"]),
-            "vwap_1h": self._kpi("vwap_1h", "VWAP 1H", _number(footprint.get("vwap_usd"), "processing.cross_market.footprint.vwap"), "USD", footprint_status, footprint.get("reason"), timestamp, None, ["processing.cross_market.footprint_summaries.1h.vwap_usd"], format_hint="currency"),
-            "order_flow_imbalance_1h": self._kpi("order_flow_imbalance_1h", "Order Flow Imbalance", imbalance, "decimal", imbalance_status, imbalance_reason, timestamp, atoms.get("order_flow_state"), [f"{base}.order_flow_imbalance.value", f"{cbase}.order_flow_state"]),
+            "delta_4h": self._kpi("delta_4h", "Delta 4H", _number(summary.get("volume_delta_usd"), f"{base}.volume_delta_usd"), "USD", source_status, summary.get("reason"), timestamp, atoms.get("delta_state"), [f"{base}.volume_delta_usd", f"{cbase}.delta_state"], format_hint="currency"),
+            "buy_sell_ratio_4h": self._kpi("buy_sell_ratio_4h", "Buy/Sell", ratio, "ratio", ratio_status, ratio_reason, timestamp, atoms.get("buy_sell_pressure_state"), [f"{base}.buy_sell_ratio.value", f"{base}.buy_share.value", f"{base}.sell_share.value", f"{cbase}.buy_sell_pressure_state"], secondary={"buy_share": {"value": buy_share, "unit": "decimal"}, "sell_share": {"value": sell_share, "unit": "decimal"}}),
+            "futures_vs_spot_volume_ratio_4h": {**self._kpi("futures_vs_spot_volume_ratio_4h", "Futures vs Spot Volume Ratio", volume_ratio, "ratio", volume_ratio_status, volume_ratio_source.get("reason"), volume_ratio_source.get("timestamp"), volume_ratio_atom, ["processing.cross_market.volume_ratios.futures_vs_spot.4h"], secondary={"futures_volume_usd": {"value": volume_ratio_source.get("futures_volume_usd"), "unit": "USD"}, "spot_volume_usd": {"value": volume_ratio_source.get("spot_volume_usd"), "unit": "USD"}}), "provider_group": "API Market", "recalculate_in_hmi": False},
+            "flow_efficiency_4h": self._kpi("flow_efficiency_4h", "Flow Efficiency", efficiency, "decimal", efficiency_status, efficiency_reason, timestamp, atoms.get("flow_efficiency_state"), [f"{base}.flow_efficiency.value", f"{cbase}.flow_efficiency_state"]),
+            "vwap_4h": self._kpi("vwap_4h", "VWAP 4H", _number(footprint.get("vwap_usd"), "processing.cross_market.footprint.vwap"), "USD", footprint_status, footprint.get("reason"), timestamp, None, ["processing.cross_market.footprint_summaries.4h.vwap_usd"], format_hint="currency"),
+            "order_flow_imbalance_4h": self._kpi("order_flow_imbalance_4h", "Order Flow Imbalance", imbalance, "decimal", imbalance_status, imbalance_reason, timestamp, atoms.get("order_flow_state"), [f"{base}.order_flow_imbalance.value", f"{cbase}.order_flow_state"]),
+            "spot_delta_4h": self._kpi("spot_delta_4h", "Spot Delta 4H", _number(spot_4h.get("volume_delta_usd"), "processing.markets.spot.window_summaries.4h.volume_delta_usd"), "USD", _status(spot_4h.get("status"), "processing.markets.spot.window_summaries.4h.status"), spot_4h.get("reason"), spot_4h.get("last_timestamp"), None, ["processing.markets.spot.window_summaries.4h.volume_delta_usd"], format_hint="currency", market="spot"),
+            "futures_delta_4h": self._kpi("futures_delta_4h", "Futures Delta 4H", _number(futures_4h.get("volume_delta_usd"), "processing.markets.futures.window_summaries.4h.volume_delta_usd"), "USD", _status(futures_4h.get("status"), "processing.markets.futures.window_summaries.4h.status"), futures_4h.get("reason"), futures_4h.get("last_timestamp"), None, ["processing.markets.futures.window_summaries.4h.volume_delta_usd"], format_hint="currency", market="futures"),
+            "flow_persistence_4h": self._kpi("flow_persistence_4h", "Flow Persistence 4H", _number(persistence.get("value"), "processing.cross_market.window_summaries.4h.directional_persistence.value"), "decimal", persistence_status, persistence.get("reason"), timestamp, None, ["processing.cross_market.window_summaries.4h.directional_persistence"]),
+            "delta_zscore": self._kpi("delta_zscore", f"Delta Z-Score {self.selected_timeframe.upper()}", _number(delta_z_current.get("zscore"), "processing.technical_analysis.delta_zscore.current.zscore"), "decimal", _status(delta_z.get("status", "unavailable"), "processing.technical_analysis.delta_zscore.status"), None, timestamp, None, [f"processing.technical_analysis.markets.{self.selected_market}.timeframes.{self.selected_timeframe}.indicators.delta_zscore"], market=self.selected_market, window=self.selected_timeframe),
+            "cvd_slope": self._kpi("cvd_slope", f"CVD Slope {self.selected_timeframe.upper()}", _number(slope_current.get("slope"), "processing.technical_analysis.cvd_slope.current.slope"), "score", _status(dynamics.get("status", "unavailable"), "processing.technical_analysis.cvd_slope.status"), None, timestamp, None, [f"processing.technical_analysis.markets.{self.selected_market}.timeframes.{self.selected_timeframe}.indicators.cvd_slope_acceleration"], secondary={"acceleration": {"value": slope_current.get("acceleration"), "unit": "score"}}, market=self.selected_market, window=self.selected_timeframe),
+            "price_cvd_divergence": self._kpi("price_cvd_divergence", f"Price/CVD Divergence {self.selected_timeframe.upper()}", _number(price_div_current.get("divergence"), "processing.technical_analysis.price_cvd_divergence.current.divergence"), "score", _status(price_div.get("status", "unavailable"), "processing.technical_analysis.price_cvd_divergence.status"), None, timestamp, None, [f"processing.technical_analysis.markets.{self.selected_market}.timeframes.{self.selected_timeframe}.indicators.price_cvd_divergence"], market=self.selected_market, window=self.selected_timeframe),
         }
 
     def _visual_status(self, source: Mapping[str, Any], count: int) -> tuple[str, str | None]:
@@ -437,17 +453,17 @@ class CvdVolumeOrderflowContractBuilder:
 
     def build_widgets(self, processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
         market = self.selected_market
-        summary = processing["markets"][market]["window_summaries"]["1h"]
+        summary = processing["markets"][market]["window_summaries"]["4h"]
         metric, status, reason = _metric(summary["order_flow_imbalance"], "processing.order_flow_imbalance")
-        atom = classification["classifications"]["markets"][market]["window_summaries"]["1h"]["atoms"]["order_flow_state"]
-        agreement = classification["confirmations"]["market_agreement_1h"]
+        atom = classification["classifications"]["markets"][market]["window_summaries"]["4h"]["atoms"]["order_flow_state"]
+        agreement = classification["confirmations"]["market_agreement_4h"]
         temporal = classification["confirmations"]["temporal_alignment"][market]
-        return {"volume_by_side_1h": self._side_widget(processing, "1h"), "volume_by_side_24h": self._side_widget(processing, "24h"),
-            "order_flow_imbalance_1h": {"widget_id": "order_flow_imbalance_1h", "title": "Order Flow Imbalance", "widget_type": "gauge",
+        return {"volume_by_side_4h": self._side_widget(processing, "4h"), "volume_by_side_24h": self._side_widget(processing, "24h"),
+            "order_flow_imbalance_4h": {"widget_id": "order_flow_imbalance_4h", "title": "Order Flow Imbalance", "widget_type": "gauge",
                 "minimum": -1, "maximum": 1, "value": metric, "state": atom.get("state"), "direction": atom.get("direction"),
-                "status": status, "reason": reason, "source_paths": [f"processing.markets.{market}.window_summaries.1h.order_flow_imbalance.value", f"classification.classifications.markets.{market}.window_summaries.1h.atoms.order_flow_state"]},
-            "market_agreement_1h": {"widget_id": "market_agreement_1h", "title": "Market Agreement 1H", "widget_type": "state",
-                **_copy_classification(agreement), "source_path": "classification.confirmations.market_agreement_1h"},
+                "status": status, "reason": reason, "source_paths": [f"processing.markets.{market}.window_summaries.4h.order_flow_imbalance.value", f"classification.classifications.markets.{market}.window_summaries.4h.atoms.order_flow_state"]},
+            "market_agreement_4h": {"widget_id": "market_agreement_4h", "title": "Market Agreement 4H", "widget_type": "state",
+                **_copy_classification(agreement), "source_path": "classification.confirmations.market_agreement_4h"},
             "temporal_alignment": {"widget_id": "temporal_alignment", "title": "Temporal Alignment", "widget_type": "state",
                 **_copy_classification(temporal), "source_path": f"classification.confirmations.temporal_alignment.{market}"}}
 
@@ -477,7 +493,7 @@ class CvdVolumeOrderflowContractBuilder:
                 overview.append(row)
         comparisons = []
         for market in MARKETS:
-            for window in ("1h", "24h"):
+            for window in ("4h", "24h"):
                 source = processing["markets"][market]["window_summaries"][window]
                 comparisons.append({"market": market, "window": window, "first_timestamp": copy.deepcopy(source.get("first_timestamp")),
                     "last_timestamp": copy.deepcopy(source.get("last_timestamp")), "volume_delta_usd": copy.deepcopy(source.get("volume_delta_usd")),
@@ -498,14 +514,14 @@ class CvdVolumeOrderflowContractBuilder:
         atoms = classification["classifications"]["markets"][market]["timeframes"][timeframe].get("atoms", {})
         footprint_rows = []
         for item in MARKETS:
-            source = processing["markets"][item].get("footprint_summaries", {}).get("1h", {})
+            source = processing["markets"][item].get("footprint_summaries", {}).get("4h", {})
             footprint_rows.append({"market": item, **{key: copy.deepcopy(source.get(key)) for key in ("vwap_usd", "base_volume", "quote_volume", "records_used", "levels_used", "calculation_basis", "aggregation_scope", "status", "reason")},
-                "source_path": f"processing.markets.{item}.footprint_summaries.1h"})
+                "source_path": f"processing.markets.{item}.footprint_summaries.4h"})
         return {"current_market_detail": {"drilldown_id": "current_market_detail", "market": market, "timeframe": timeframe,
                 "current": copy.deepcopy(current), "atoms": _copy_classification(atoms), "source_paths": [f"processing.markets.{market}.timeframes.{timeframe}.current", f"classification.classifications.markets.{market}.timeframes.{timeframe}.atoms"]},
-            "market_agreement_detail": {"drilldown_id": "market_agreement_detail", "value": _copy_classification(classification["confirmations"]["market_agreement_1h"]), "source_path": "classification.confirmations.market_agreement_1h"},
+            "market_agreement_detail": {"drilldown_id": "market_agreement_detail", "value": _copy_classification(classification["confirmations"]["market_agreement_4h"]), "source_path": "classification.confirmations.market_agreement_4h"},
             "temporal_alignment_detail": {"drilldown_id": "temporal_alignment_detail", "value": _copy_classification(classification["confirmations"]["temporal_alignment"]), "source_path": "classification.confirmations.temporal_alignment"},
-            "footprint_vwap_scope": {"drilldown_id": "footprint_vwap_scope", "rows": footprint_rows, "source_paths": [f"processing.markets.{item}.footprint_summaries.1h" for item in MARKETS]},
+            "footprint_vwap_scope": {"drilldown_id": "footprint_vwap_scope", "rows": footprint_rows, "source_paths": [f"processing.markets.{item}.footprint_summaries.4h" for item in MARKETS]},
             "classification_snapshots": {"drilldown_id": "classification_snapshots", "value": _copy_classification(classification.get("snapshots", {})), "source_path": "classification.snapshots"}}
 
     def build_events(self, classification: Mapping[str, Any]) -> dict[str, Any]:
@@ -529,13 +545,13 @@ class CvdVolumeOrderflowContractBuilder:
     def _inventory(self, selectors: Mapping[str, Any], kpis: Mapping[str, Any], charts: Mapping[str, Any], widgets: Mapping[str, Any],
                    tables: Mapping[str, Any], drilldowns: Mapping[str, Any], events: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         required_objects = {"selectors.market": selectors["market"], "selectors.timeframe": selectors["timeframe"],
-            **{f"kpis.{key}": kpis[key] for key in ("delta_1h", "buy_sell_ratio_1h", "futures_vs_spot_volume_ratio_1h", "flow_efficiency_1h", "order_flow_imbalance_1h")},
+            **{f"kpis.{key}": kpis[key] for key in ("delta_4h", "buy_sell_ratio_4h", "futures_vs_spot_volume_ratio_4h", "flow_efficiency_4h", "order_flow_imbalance_4h")},
             **{f"charts.{key}": value for key, value in charts.items()},
-            **{f"widgets.{key}": widgets[key] for key in ("volume_by_side_1h", "volume_by_side_24h", "order_flow_imbalance_1h")},
+            **{f"widgets.{key}": widgets[key] for key in ("volume_by_side_4h", "volume_by_side_24h", "order_flow_imbalance_4h")},
             **{f"tables.{key}": value for key, value in tables.items()}}
         optional_objects = {
-            **{f"kpis.{key}": kpis[key] for key in ("vwap_1h",)},
-            **{f"widgets.{key}": widgets[key] for key in ("market_agreement_1h", "temporal_alignment")},
+            **{f"kpis.{key}": kpis[key] for key in ("vwap_4h",)},
+            **{f"widgets.{key}": widgets[key] for key in ("market_agreement_4h", "temporal_alignment")},
             **{f"drilldowns.{key}": value for key, value in drilldowns.items()}, "events.recent_events": events}
         def entry(obj: Mapping[str, Any], name: str) -> dict[str, Any]:
             status = obj.get("status", obj.get("availability", {}).get("status", "available"))
@@ -586,7 +602,7 @@ class CvdVolumeOrderflowContractBuilder:
     def build_badges(self, context: Mapping[str, Any], quality: Mapping[str, Any]) -> list[dict[str, Any]]:
         badges = []
         if context["data_mode"] == "synthetic" and context["is_demo"] is True:
-            badges.append({"id": "demo", "text": "DEMO", "status": "active"})
+            badges.append({"id": "synthetic", "text": "SYNTHETIC", "status": "active"})
         badges.append({"id": "data_quality", "text": quality["status"].upper(), "status": quality["status"]})
         return badges
 
@@ -648,7 +664,7 @@ class CvdVolumeOrderflowContractBuilder:
         source_ta = processing.get("technical_analysis", {})
         context = processing.get("context", {})
         is_demo = bool(context.get("is_demo", False))
-        data_mode = "synthetic_demo_runtime" if is_demo else "runtime_processing"
+        data_mode = "synthetic_emulator" if is_demo else "runtime_processing"
         classification_basis = "processing_precomputed_native"
         selector_contract = {
             "trend": ["ema_9", "ema_21", "sma_20", "sma_50", "wma_20", "wma_50"],
@@ -818,8 +834,8 @@ class CvdVolumeOrderflowContractBuilder:
                 "all_visible_moving_averages_warm": min((payload["calculation_history_records"] for market in technical_analysis.get("markets", {}).values() for payload in market.get("timeframes", {}).values()), default=0) >= 200,
                 "technical_indicators_precomputed": True,
                 "hmi_recalculation": False,
-                "synthetic_fixture": bool(context.get("is_demo", False)),
-                "fixture_seed": 20260807 if bool(context.get("is_demo", False)) else None,
+                "synthetic_fixture": False,
+                "fixture_seed": None,
                 "note": (
                     f"Up to {CALCULATION_HISTORY_LIMIT} calculation records are retained per Spot/Futures CVD timeframe; "
                     f"current minimum available history is {min((payload['calculation_history_records'] for market in technical_analysis.get('markets', {}).values() for payload in market.get('timeframes', {}).values()), default=0)} records. "
@@ -838,3 +854,102 @@ def build_cvd_volume_orderflow_contract(bundle: Mapping[str, Any], *, selected_m
                                         display_point_limit: int = DISPLAY_POINT_LIMIT) -> dict[str, Any]:
     return CvdVolumeOrderflowContractBuilder(selected_market=selected_market, selected_timeframe=selected_timeframe,
         display_point_limit=display_point_limit).run(bundle)
+
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+import json
+
+from pathlib import Path
+
+from typing import Any, Mapping
+
+_screen_SCHEMA_VERSION = '1.5.0'
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_MISSING = object()
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_is_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+def _screen_project(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project runtime data onto the exact frozen CVD Screen-SP shape.
+
+    Static presentation policy comes from the SP.  Runtime values, arrays,
+    statuses, timestamps and provenance are supplied by the ordinary builder.
+    Extra runtime keys are deliberately discarded so the HMI contract remains
+    structurally stable.
+    """
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_project(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(reference)
+        if not reference:
+            return deepcopy(candidate)
+        if all((_screen_is_scalar(item) for item in reference)):
+            return deepcopy(candidate)
+        if not candidate:
+            return []
+        identity_keys = ('metric_id', 'kpi_id', 'widget_id', 'chart_id', 'table_id', 'badge_id', 'id', 'role', 'family', 'group', 'indicator_id', 'event_type', 'event_group', 'market', 'timeframe', 'window')
+
+        def reference_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                for key in identity_keys:
+                    value = item.get(key, _screen_MISSING)
+                    if value is _screen_MISSING:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key, _screen_MISSING) == value:
+                            return ref_item
+            if index < len(reference):
+                return reference[index]
+            return reference[0]
+        return [_screen_project(reference_for(item, index), item) for index, item in enumerate(candidate)]
+    if candidate is _screen_MISSING:
+        return deepcopy(reference)
+    return deepcopy(candidate)
+
+def _screen_project_dynamic_events(reference_events: Mapping[str, Any], candidate_events: Mapping[str, Any]) -> dict[str, Any]:
+    reference_by_id = reference_events.get('by_id', {}) if isinstance(reference_events, Mapping) else {}
+    candidate_by_id = candidate_events.get('by_id', {}) if isinstance(candidate_events, Mapping) else {}
+    prototypes: dict[tuple[str | None, str | None], Mapping[str, Any]] = {}
+    for event in reference_by_id.values():
+        if isinstance(event, Mapping):
+            prototypes.setdefault((event.get('event_type'), event.get('event_group')), event)
+            prototypes.setdefault((event.get('event_type'), None), event)
+    output: dict[str, Any] = {}
+    for uid, event in candidate_by_id.items():
+        if not isinstance(event, Mapping):
+            continue
+        prototype = prototypes.get((event.get('event_type'), event.get('event_group'))) or prototypes.get((event.get('event_type'), None))
+        output[str(uid)] = _screen_project(prototype, event) if prototype is not None else deepcopy(dict(event))
+    return output
+
+def align_cvd_contract_to_sp_v1_5(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    reference = _screen_template()
+    aligned = _screen_project(reference, dict(candidate))
+    candidate_events = candidate.get('events', {}) if isinstance(candidate, Mapping) else {}
+    if isinstance(aligned.get('events'), dict) and isinstance(candidate_events, Mapping):
+        aligned['events']['by_id'] = _screen_project_dynamic_events(reference.get('events', {}), candidate_events)
+        aligned['events']['technical_cross_ids'] = list(aligned['events']['by_id'])
+    aligned['schema'] = {'id': 'trad_elatin.cvd_volume_orderflow.screen.v1', 'version': _screen_SCHEMA_VERSION}
+    context = aligned.get('context', {})
+    is_demo = bool(context.get('is_demo', False))
+    context['synthetic_fixture'] = False
+    context['fixture_as_of_timestamp'] = None
+    context['fixture_as_of_iso'] = None
+    context['realism_refactor_version'] = 'runtime_provider_v2'
+    context['realism_note'] = ('runtime Emulator aggressor-flow state; no Screen fixture history is injected'
+                               if is_demo else
+                               'runtime provider data; CVD OHLC is constructed in Processing from interval aggressor-flow observations')
+    aligned['context'] = context
+    json.dumps(aligned, ensure_ascii=False, allow_nan=False)
+    return aligned

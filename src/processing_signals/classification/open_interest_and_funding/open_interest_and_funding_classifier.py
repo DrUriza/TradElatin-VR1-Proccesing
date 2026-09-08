@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 FAMILY = "open_interest_and_funding"
 VERSION = "0.1"
-TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+TIMEFRAMES = ("5m", "15m", "4h")
 MODES = {"bootstrap", "incremental", "recovery"}
 STATUSES = {"available", "partial", "unavailable", "invalid"}
 REQUIRED_TYPES = ("open_interest_change_state", "funding_state", "oi_funding_quadrant")
@@ -412,41 +412,10 @@ def _provider_copy(payload: Any) -> dict[str, Any]:
 
 
 def _confirmations(source: Mapping[str, Any]) -> dict[str, Any]:
-    output: dict[str, Any] = {}
-    for metric in ("open_interest", "funding_rate"):
-        providers = source.get(metric)
-        if not isinstance(providers, Mapping):
-            providers = {}
-        output[metric] = {provider: _provider_copy(providers.get(provider)) for provider in ("cryptoquant", "glassnode")}
     leverage = source.get("estimated_leverage_ratio")
     if not isinstance(leverage, Mapping):
         leverage = {}
-    output["estimated_leverage_ratio"] = {"glassnode": _provider_copy(leverage.get("glassnode"))}
-    comparisons = source.get("comparisons")
-    if not isinstance(comparisons, Mapping):
-        output["comparisons"] = {"status": "invalid", "reason": "classification_input_invalid",
-                                 "provider_state": "provider_invalid"}
-    elif any(metric in comparisons for metric in ("open_interest", "funding_rate")):
-        normalized = {}
-        for metric in ("open_interest", "funding_rate"):
-            payload = comparisons.get(metric)
-            if not isinstance(payload, Mapping):
-                normalized[metric] = {"status": "invalid", "reason": "classification_input_invalid",
-                                      "provider_state": "provider_invalid"}
-                continue
-            copied = _json_copy(payload)
-            copied.update(status="unavailable", reason="provider_scope_not_proven_comparable")
-            if "provider_state" in copied:
-                copied["provider_state"] = "provider_unavailable"
-            normalized[metric] = copied
-        output["comparisons"] = normalized
-    else:
-        copied = _json_copy(comparisons)
-        copied.update(status="unavailable", reason="provider_scope_not_proven_comparable")
-        if "provider_state" in copied:
-            copied["provider_state"] = "provider_unavailable"
-        output["comparisons"] = copied
-    return output
+    return {"estimated_leverage_ratio": {"glassnode": _provider_copy(leverage.get("glassnode"))}}
 
 
 def _availability(by_timeframe: Mapping[str, Any], snapshots: Mapping[str, Any], confirmations: Mapping[str, Any],
@@ -468,8 +437,6 @@ def _availability(by_timeframe: Mapping[str, Any], snapshots: Mapping[str, Any],
     passthrough = {"snapshots": {name: payload.get("status", "invalid") if isinstance(payload, Mapping) else "invalid"
                                   for name, payload in snapshots.items()},
                    "confirmations": {
-                       "open_interest": {provider: confirmations["open_interest"][provider]["status"] for provider in ("cryptoquant", "glassnode")},
-                       "funding_rate": {provider: confirmations["funding_rate"][provider]["status"] for provider in ("cryptoquant", "glassnode")},
                        "estimated_leverage_ratio": {"glassnode": confirmations["estimated_leverage_ratio"]["glassnode"]["status"]},
                    }}
     unavailable_names = {
@@ -482,7 +449,7 @@ def _availability(by_timeframe: Mapping[str, Any], snapshots: Mapping[str, Any],
         payload = processing_availability.get(source_name)
         unavailable[output_name] = (_json_copy(payload) if isinstance(payload, Mapping) else
                                     {"status": "unavailable", "reason": "classification_source_unavailable"})
-    unavailable["provider_comparisons"] = {"status": "unavailable", "reason": "provider_scope_not_proven_comparable"}
+    unavailable["provider_comparisons"] = {"status": "unavailable", "reason": "oi_provider_comparisons_not_contracted_final33"}
     unavailable["series_snapshot_comparison"] = {"status": "unavailable", "reason": "observation_scope_or_timestamp_not_comparable"}
     return {"required": required, "optional": optional, "passthrough": passthrough, "unavailable": unavailable}
 
@@ -604,9 +571,6 @@ def classify_open_interest_and_funding(processing_contract: Mapping[str, Any]) -
                 *(f"optional_{status}:{name}" for name, status in optional_statuses.items() if status != "available")]
     warnings.extend(f"snapshot_{payload.get('status', 'invalid')}:{name}" for name, payload in snapshots.items()
                     if not isinstance(payload, Mapping) or payload.get("status") == "invalid")
-    for metric in ("open_interest", "funding_rate"):
-        warnings.extend(f"confirmation_{confirmations[metric][provider]['status']}:{metric}.{provider}"
-                        for provider in ("cryptoquant", "glassnode") if confirmations[metric][provider]["status"] == "invalid")
     if confirmations["estimated_leverage_ratio"]["glassnode"]["status"] == "invalid":
         warnings.append("confirmation_invalid:estimated_leverage_ratio.glassnode")
     errors = [f"required_invalid:{name}" for name, status in required_statuses.items() if status == "invalid"]

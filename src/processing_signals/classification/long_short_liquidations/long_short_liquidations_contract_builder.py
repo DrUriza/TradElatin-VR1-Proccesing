@@ -5,26 +5,21 @@ from collections.abc import Mapping
 from copy import deepcopy
 import json
 import math
-import os
-from pathlib import Path
-import tempfile
 from typing import Any
 
-from .long_short_liquidations_sp_v1_3_adapter import align_long_short_liquidations_to_sp_v1_3
 
 VALID_STATUS = {"available", "partial", "unavailable", "invalid"}
 INTERVALS = {
     "1m": (None, "1m", None), "5m": (None, "5m", None), "15m": (None, "15m", "classifications.events.15m"),
-    "1h": ("1h", "1h", None), "4h": ("4h", "4h", None), "1d": ("24h", "24h", None),
+    "4h": ("4h", "4h", "classifications.events.4h"),
 }
-DEFAULT_SELECTION = {"interval": "1h", "exchange": "aggregate", "map": "aggregate"}
-MAP_OPTIONS = {"aggregate", "hyperliquid", "binance"}
+DEFAULT_SELECTION = {"interval": "15m", "exchange": "aggregate", "map": "aggregate"}
+MAP_OPTIONS = {"aggregate"}
 REQUIRED_VIEWS = ["current_price", "total_liquidations_24h", "long_liquidations_24h",
                   "short_liquidations_24h", "pressure_score", "realized_side_24h",
                   "aggregate_liquidation_map", "event_activity_15m", "exchange_concentration"]
 OPTIONAL_VIEWS = ["selected_realized_side", "selected_realized_imbalance", "estimated_side",
-                  "estimated_imbalance", "map_concentrations", "clusters", "provider_confirmations",
-                  "max_pain", "hyperliquid_map", "binance_leverage_map", "event_1h_classification"]
+                  "estimated_imbalance", "map_concentrations", "clusters", "event_4h_classification"]
 STATUS_RANK = {"available": 0, "partial": 1, "unavailable": 2, "invalid": 3}
 CLASS_TOKENS = {
     "low_pressure": "pressure_low", "moderate_pressure": "pressure_moderate",
@@ -396,9 +391,15 @@ def _cluster_payload(processing: Mapping[str, Any], classification: Mapping[str,
 
 
 def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, Any], context: Mapping[str, Any], *,
-                   generated_at: int) -> dict[str, Any]:
-    source = _mapping(_at(processing, "maps.aggregated"), "maps.aggregated")
-    aligned = _mapping(_at(processing, "maps.aligned_exchanges"), "maps.aligned_exchanges")
+                   generated_at: int, range_id: str | None = None) -> dict[str, Any]:
+    selected_range = str(range_id or "1d").lower()
+    maps_root = _mapping(_at(processing, "maps"), "maps")
+    agg_ranges = maps_root.get("aggregated_by_range", {}) if isinstance(maps_root.get("aggregated_by_range"), Mapping) else {}
+    aligned_ranges = maps_root.get("aligned_exchanges_by_range", {}) if isinstance(maps_root.get("aligned_exchanges_by_range"), Mapping) else {}
+    source_candidate = agg_ranges.get(selected_range, maps_root.get("aggregated"))
+    aligned_candidate = aligned_ranges.get(selected_range, maps_root.get("aligned_exchanges"))
+    source = _mapping(source_candidate, f"maps.aggregated_by_range.{selected_range}")
+    aligned = _mapping(aligned_candidate, f"maps.aligned_exchanges_by_range.{selected_range}")
     reference = _mapping(_at(processing, "maps.reference_price"), "maps.reference_price")
     status, reason = _view_status(source, "maps.aggregated")
     ref_status, ref_reason = _view_status(reference, "maps.reference_price")
@@ -421,10 +422,10 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
     exchange_points = {item["exchange"]: {point["bucket_index"]: point for point in item["points"]} for item in series}
     raw_long_curve = source.get("curves", {}).get("estimated_long", [])
     raw_short_curve = source.get("curves", {}).get("estimated_short", [])
-    long_curve = {item["price"]: item["cumulative_share"] for item in raw_long_curve
-                  if isinstance(item, Mapping) and "price" in item and "cumulative_share" in item}
-    short_curve = {item["price"]: item["cumulative_share"] for item in raw_short_curve
-                   if isinstance(item, Mapping) and "price" in item and "cumulative_share" in item}
+    long_curve = {item["price"]: item["cumulative_level"] for item in raw_long_curve
+                  if isinstance(item, Mapping) and "price" in item and "cumulative_level" in item}
+    short_curve = {item["price"]: item["cumulative_level"] for item in raw_short_curve
+                   if isinstance(item, Mapping) and "price" in item and "cumulative_level" in item}
     visual_buckets = [{"bucket_index": item["bucket_index"], "price_low": item["lower_price"],
         "price_center": item["center_price"], "price_high": item["upper_price"],
         "bars": {exchange.lower(): exchange_points.get(exchange, {}).get(item["bucket_index"], {}).get("level_total", 0)
@@ -447,7 +448,8 @@ def _aggregate_map(processing: Mapping[str, Any], classification: Mapping[str, A
             "aggregate": _classification_model(_at(classification, "classifications.concentration.aggregate_map")),
             "estimated_long": _classification_model(_at(classification, "classifications.concentration.estimated_long")),
             "estimated_short": _classification_model(_at(classification, "classifications.concentration.estimated_short"))},
-        "status": status, "reason": deepcopy(reason),
+        "status": status, "reason": deepcopy(reason), "selected_range": selected_range,
+        "ranges": ["1d", "7d", "30d"],
         "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level",
         "visual_contract": {"renderer": "stacked_bars_plus_dual_cumulative_curves", "reference_line": {"field": "current_price", "label": "CURRENT PRICE"},
             "barmode": "stack", "x_axis": "linear_price", "hmi_calculation": False, "bucket_count": len(visual_buckets)}}
@@ -463,110 +465,6 @@ def _curve_points(curves: Mapping[str, Any] | None, side: str) -> list[dict[str,
     if not isinstance(raw, list):
         return []
     return [dict(item) for item in raw if isinstance(item, Mapping)]
-
-
-def _exchange_visual(processing: Mapping[str, Any], context: Mapping[str, Any], key: str, *, leverage: bool) -> dict[str, Any]:
-    raw_source = _at(processing, f"maps.by_exchange.{key}", None)
-    if not isinstance(raw_source, Mapping):
-        return {"id": "binance_leverage_map" if leverage else "hyperliquid_map",
-            "chart_id": "binance_leverage_map" if leverage else "hyperliquid_map",
-            "title": f"{key} Liquidation Map", "status": "unavailable", "reason": "exchange_map_not_available",
-            "proxy": False, "current_price": None, "reference_price": None, "axes": {}, "bar_series": [], "buckets": [],
-            "provenance": {}, "unit": "provider_level", "visual_contract": {"hmi_calculation": False, "bucket_count": 0}}
-    source = _mapping(raw_source, f"maps.by_exchange.{key}")
-    reference = _mapping(_at(processing, "maps.reference_price"), "maps.reference_price")
-    status, reason = _view_status(source, f"maps.by_exchange.{key}")
-    raw = source.get("buckets", {}).get("items", []) if _usable(status) else []
-    long_points = _curve_points(source.get("curves"), "estimated_long")
-    short_points = _curve_points(source.get("curves"), "estimated_short")
-    long_curve = {item.get("price"): item.get("cumulative_share", 0) for item in long_points if item.get("price") is not None}
-    short_curve = {item.get("price"): item.get("cumulative_share", 0) for item in short_points if item.get("price") is not None}
-    leverage_ids = sorted({str(value).removesuffix(".0") + "x" for item in raw for value in item.get("leverage_breakdown", {})}, key=lambda value: float(value[:-1]))
-    series_ids = leverage_ids if leverage else ["long", "short"]
-    buckets = []
-    for item in raw:
-        if leverage:
-            bars = {str(value).removesuffix(".0") + "x": amount for value, amount in item.get("leverage_breakdown", {}).items()}
-        else:
-            bars = {"long": item["level_total"] if item.get("region") == "estimated_long" else 0,
-                    "short": item["level_total"] if item.get("region") == "estimated_short" else 0}
-        buckets.append({"bucket_index": item["bucket_index"], "price_low": item["lower_price"],
-            "price_center": item["center_price"], "price_high": item["upper_price"], "bars": bars,
-            "cumulative_long": long_curve.get(item["center_price"], 0), "cumulative_short": short_curve.get(item["center_price"], 0)})
-    quote = context["quote_asset"]
-    return {"id": "binance_leverage_map" if leverage else "hyperliquid_map",
-        "chart_id": "binance_leverage_map" if leverage else "hyperliquid_map",
-        "title": f"{key} {context['base_asset']}/{quote} Liquidation Map", "status": status, "reason": reason,
-        "proxy": False, "current_price": reference.get("value"),
-        "reference_price": {"value": reference.get("value"), "unit": quote, "timestamp": reference.get("timestamp"),
-            "status": reference.get("status"), "reason": reference.get("reason"),
-            "provenance": {"source_family": reference.get("source_family"), "source_market": reference.get("source_market"),
-                "source_timeframe": reference.get("source_timeframe"), "price_field": reference.get("price_field")}},
-        "axes": {"x": {"field": "price_center", "unit": quote, "type": "linear"},
-            "bar_axis": {"unit": "provider_level", "side": "left"},
-            "cumulative_axis": {"unit": "normalized_level", "side": "right", "range": [0, 1]}},
-        "bar_series": [{"series_id": item, "label": item} for item in series_ids], "buckets": buckets,
-        "provenance": deepcopy(source.get("provenance", {})), "unit": "provider_level",
-        "visual_contract": {"renderer": "stacked_bars_plus_dual_cumulative_curves", "reference_line": {"field": "current_price", "label": "CURRENT PRICE"},
-            "barmode": "stack", "x_axis": "linear_price", "hmi_calculation": False, "bucket_count": len(buckets)}}
-
-
-def _hyperliquid(processing: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
-    return _exchange_visual(processing, context, "Hyperliquid", leverage=False)
-
-
-def _binance(processing: Mapping[str, Any], config: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
-    key = config.get("binance_exchange_key", "Binance")
-    display_pair = f"{context['base_asset']}/{context['quote_asset']}"
-    title = f"Binance {display_pair} Liquidation Map"
-    leverage_title = f"Binance {display_pair} Liquidation Map by Leverage"
-    if not isinstance(key, str) or not key:
-        raise _error("config.binance_exchange_key")
-    maps = _mapping(_at(processing, "maps.by_exchange", {}), "maps.by_exchange")
-    if key not in maps:
-        return {"id": "binance_leverage_map", "title": title, "leverage_title": leverage_title, "exchange_key": key,
-                "status": "unavailable", "reason": "exchange_map_not_available", "provider_levels": [], "buckets": [],
-                "estimated_long_curve": [], "estimated_short_curve": [], "stacked_buckets": [], "leverage_curves": [], "badges": []}
-    visual = _exchange_visual(processing, context, key, leverage=True)
-    visual.update(leverage_title=leverage_title, exchange_key=key)
-    return visual
-
-
-def _confirmations(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
-    processing_items = _mapping(_at(processing, "realized.confirmations"), "realized.confirmations")
-    class_items = _mapping(_at(classification, "classifications.confirmations"), "classifications.confirmations")
-    rows = []
-    for provider, atom in class_items.items():
-        metrics = _mapping(processing_items.get(provider), f"realized.confirmations.{provider}")
-        model = _classification_model(atom)
-        def value(name):
-            metric = _mapping(metrics.get(name), f"realized.confirmations.{provider}.{name}")
-            return deepcopy(metric.get("value")) if _usable(_status(metric.get("status"), f"{name}.status")) else None
-        endpoint = "aggregate/hour" if provider == "cryptoquant" else "futures_liquidated_volume_{long,short}_sum"
-        rows.append({"provider": provider, "endpoint": endpoint,
-            "confirmation": {"classification": model["classification"], "confidence": model["confidence"],
-                "status": model["status"], "evidence": model["evidence"]},
-            "classification": model["classification"], "confidence": model["confidence"],
-            "aligned_point_count": value("aligned_point_count"), "coverage_ratio": value("coverage_ratio"),
-            "pearson_correlation": value("pearson_correlation"), "mape": value("median_absolute_percentage_error"),
-            "status": model["status"], "reason": model["reason"], "evidence": model["evidence"], "provenance": model["provenance"]})
-    status = "available" if not rows else _combined_status(*(row["status"] for row in rows))
-    reason = None if status != "unavailable" else next(
-        (row["reason"] for row in rows if row.get("reason")),
-        "provider_confirmations_unavailable",
-    )
-    return {"id": "provider_confirmations", "status": status, "reason": reason, "rows": rows}
-
-
-def _max_pain(processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
-    source = _mapping(_at(processing, "maps.max_pain"), "maps.max_pain")
-    status, reason = _view_status(source, "maps.max_pain")
-    model = _classification_model(_at(classification, "classifications.max_pain"))
-    fields = ("provider_price", "provider_price_difference_bps", "long_max_pain_price", "short_max_pain_price",
-              "long_max_pain_level", "short_max_pain_level", "long_distance_bps", "short_distance_bps")
-    return {"id": "max_pain", **{name: deepcopy(source.get(name)) if _usable(status) else None for name in fields},
-            "classification": model["classification"], "confidence": model["confidence"], "status": status,
-            "reason": deepcopy(reason or model["reason"]), "provenance": deepcopy(source.get("provenance", {}))}
 
 
 def _providers(processing: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -663,8 +561,6 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
                     "classification": _classification_model(event15_atom)}
     exchange = _exchange_table(processing, classification)
     aggregate = _aggregate_map(processing, classification, screen_context, generated_at=runtime["generated_at"])
-    hyperliquid, binance = _hyperliquid(processing, screen_context), _binance(processing, config, screen_context)
-    confirmations, max_pain = _confirmations(processing, classification), _max_pain(processing, classification)
     interval_window = INTERVALS[selected["interval"]][0]
     if interval_window is None:
         selected_side = {"id": "selected_realized_side", "label": "Selected Realized Side", **_classification_model(
@@ -703,8 +599,7 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
              "exchange_concentration": concentration, "selected_realized_side": selected_side,
              "selected_realized_imbalance": selected_imbalance, "estimated_side": estimated_side,
              "estimated_imbalance": estimated_imbalance, "map_concentrations": map_concentration, "clusters": clusters,
-             "provider_confirmations": confirmations, "max_pain": max_pain, "hyperliquid_map": hyperliquid,
-             "binance_leverage_map": binance, "event_1h_classification": {"status": "unavailable"}}
+             "event_4h_classification": {"status": "unavailable"}}
     distribution_provenance = _at(processing, "exchange_distribution.provenance", {})
     realized_anchor = (_at(processing, "realized.windows.24h.window_end", None), "realized.windows.24h.window_end")
     distribution_anchor = distribution_provenance.get("source_data_as_of")
@@ -735,19 +630,15 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
     errors = list(dict.fromkeys([*deepcopy(_at(processing, "quality.errors", [])),
         *deepcopy(_at(classification, "quality.errors", [])), *quality["errors"]]))
     event_provenance = _at(processing, "events.provenance", {})
-    divergent = any(row["classification"] == "provider_divergent" for row in confirmations["rows"])
-    badges = [_badge("demo", "Demo", runtime["is_demo"], None, "context.synthetic_fixture"),
-        _badge("synthetic", "Synthetic", runtime["data_mode"] == "synthetic", None, "context.data_mode"),
+    badges = [_badge("synthetic", "Synthetic", runtime["data_mode"] == "synthetic", None, "context.data_mode"),
         _badge("estimated", "Estimated", True, None, "maps.aggregated"),
         _badge("interpolated", "Interpolated", False, None, "maps.aggregated.provenance.interpolation_enabled"),
-        _badge("proxy", "Proxy", False, None, "charts.hyperliquid_map.proxy"),
         _badge("partial", "Partial", quality["status"] == "partial", None, "quality.status"),
         _badge("stale_reference", "Stale Reference", _at(processing, "maps.reference_price.reason", None) == "stale_reference_price",
                _at(processing, "maps.reference_price.reason", None), "maps.reference_price.reason"),
         _badge("truncated_events", "Truncated Events", event_provenance.get("truncation_detected") is True, None,
                "events.provenance.truncation_detected"),
-        _badge("lower_bound", "Lower Bound", events["is_lower_bound"], None, f"events.aggregate.{events['window']}.is_lower_bound"),
-        _badge("provider_divergence", "Provider Divergence", divergent, None, "classifications.confirmations")]
+        _badge("lower_bound", "Lower Bound", events["is_lower_bound"], None, f"events.aggregate.{events['window']}.is_lower_bound")]
     providers, source_selection = _providers(processing)
     side_items = [by_id["pressure_score"], selected_side, selected_imbalance, by_id["realized_side_24h"],
         by_id["realized_imbalance_24h"], estimated_side, estimated_imbalance,
@@ -761,7 +652,6 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
                        "value": clusters["nearest_estimated_long_cluster"]}, view_id="nearest_estimated_long_cluster"),
         _with_view_id({"status": clusters["status"], "reason": clusters["reason"],
                        "value": clusters["nearest_estimated_short_cluster"]}, view_id="nearest_estimated_short_cluster"),
-        _with_view_id({**confirmations, "items": confirmations["rows"]}, view_id="provider_confirmations"), max_pain,
         _with_view_id({"status": quality["status"], "reason": None, "warnings": quality["warnings"],
                        "errors": quality["errors"]}, view_id="screen_quality_summary")]
     result = {"contract_version": "1.3.0-native-liquidations-b", "screen_id": "long_short_liquidations", "family": "long_short_liquidations",
@@ -779,14 +669,14 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
             "exchange_scope": selected["exchange"], "selected_interval": selected["interval"], "data_as_of": data_as_of,
             "updated_at": runtime["updated_at"], "badges": deepcopy(badges), "status": quality["status"]},
         "kpis": kpis, "selectors": _selectors(selected, processing, config),
-        "charts": {"aggregate_map": aggregate, "hyperliquid_map": hyperliquid, "binance_leverage_map": binance},
+        "charts": {"aggregate_map": aggregate},
         "side_panel": {"id": "liquidation_target_summary", "title": "LIQUIDATION TARGET SUMMARY", "items": side_items},
-        "tables": {"exchange_distribution": exchange, "provider_confirmations": confirmations}, "badges": badges,
+        "tables": {"exchange_distribution": exchange}, "badges": badges,
         "providers": providers, "source_selection": source_selection,
-        "calculation_history": {"source_interval": _at(processing, "realized.provenance.source_interval", "1h"),
+        "calculation_history": {"source_interval": _at(processing, "realized.provenance.source_interval", "15m"),
             "records_available": len(_at(processing, "realized.series", [])), "fabricated_records": 0,
             "warmup_records": 0, "owner": "Processing"},
-        "history_contract": {"source_resolution": "1h", "map_time_semantics": "snapshot",
+        "history_contract": {"source_resolution": "15m", "map_time_semantics": "snapshot",
             "hmi_calculation": False, "fabricated_records": 0},
         "quality": quality, "warnings": warnings, "errors": errors}
     result = align_long_short_liquidations_to_sp_v1_3(result, processing, classification, runtime)
@@ -794,40 +684,489 @@ def build_long_short_liquidations_contract(processing_contract: Mapping[str, Any
     return result
 
 
-class LongShortLiquidationsContractBuilder:
-    def __init__(self, *, context: Mapping[str, Any], runtime_context: Mapping[str, Any], config: Mapping[str, Any] | None = None):
-        self._context = _validate_context(context)
-        self._runtime = _validate_runtime(runtime_context)
-        self._config = deepcopy(dict(_mapping(config, "config"))) if config is not None else None
-        _json_safe(self._config, "config")
 
-    def build(self, processing_contract: Mapping[str, Any], classification_contract: Mapping[str, Any], *,
-              selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        return build_long_short_liquidations_contract(processing_contract, classification_contract, context=self._context,
-            runtime_context=self._runtime, selection=selection, config=self._config)
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+from datetime import datetime, timezone
+
+import json
+
+import math
+
+from pathlib import Path
+
+from typing import Any, Mapping
+
+_screen_VERSION = '1.5.0-liquidations-maps3'
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_MISSING = object()
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_finite(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+        return None
+    return 0.0 if value == 0 else float(value)
+
+def _screen_iso(timestamp: Any) -> str | None:
+    if type(timestamp) is not int or timestamp <= 0:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def _screen_shape(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project runtime values onto the exact frozen SP key/nesting shape."""
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_shape(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(reference)
+        if not reference:
+            return deepcopy(candidate)
+        if all((not isinstance(item, (dict, list)) for item in reference)):
+            return deepcopy(candidate)
+        identity_keys = ('id', 'provider', 'series_id', 'exchange', 'badge_id')
+
+        def ref_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                for key in identity_keys:
+                    value = item.get(key, _screen_MISSING)
+                    if value is _screen_MISSING:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key, _screen_MISSING) == value:
+                            return ref_item
+            return reference[index] if index < len(reference) else reference[0]
+        return [_screen_shape(ref_for(item, index), item) for index, item in enumerate(candidate)]
+    return deepcopy(reference if candidate is _screen_MISSING else candidate)
+
+def _screen_kpis(reference: list[Any], candidate: list[Any]) -> list[dict[str, Any]]:
+    by_id = {str(item.get('id')): deepcopy(item) for item in candidate if isinstance(item, Mapping)}
+    output: list[dict[str, Any]] = []
+    for ref in reference:
+        identifier = str(ref.get('id'))
+        item = deepcopy(by_id.get(identifier, {}))
+        item.setdefault('id', identifier)
+        item.setdefault('label', ref.get('label'))
+        if identifier in {'total_liquidations_24h', 'long_liquidations_24h', 'short_liquidations_24h'}:
+            value = _screen_finite(item.get('value'))
+            if value is not None:
+                item['value'] = value / 1000000.0
+                item['display_value'] = f"${item['value']:.1f}M"
+                item['unit'] = 'M USD'
+        elif identifier == 'current_price':
+            value = _screen_finite(item.get('value'))
+            if value is not None:
+                item['display_value'] = f'${value:,.0f}'
+                item['unit'] = 'USDT'
+        elif identifier == 'realized_imbalance_24h':
+            value = _screen_finite(item.get('value'))
+            if value is not None:
+                item['display_value'] = f'{value * 100:+.1f}%'
+                item['unit'] = 'ratio'
+        elif identifier == 'realized_side_24h':
+            classification = item.get('classification')
+            side = {'realized_long_liquidations_dominant': 'LONGS', 'realized_short_liquidations_dominant': 'SHORTS', 'realized_balanced': 'BALANCED'}.get(classification)
+            item.update({'value': side, 'display_value': side or '—', 'unit': 'side'})
+        output.append(_screen_shape(ref, item))
+    return output
+
+def _screen_filter_aggregate_chart(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    item = deepcopy(dict(candidate))
+    item['id'] = reference.get('id')
+    item['chart_id'] = reference.get('chart_id')
+    item['title'] = reference.get('title')
+    allowed = {'binance', 'okx', 'bybit'}
+    item['bar_series'] = [row for row in item.get('bar_series', []) if str(row.get('series_id', '')).lower() in allowed]
+    buckets = []
+    for row in item.get('buckets', []):
+        if not isinstance(row, Mapping):
+            continue
+        copied = deepcopy(dict(row))
+        copied['bars'] = {k: v for k, v in copied.get('bars', {}).items() if str(k).lower() in allowed}
+        buckets.append(copied)
+    item['buckets'] = buckets
+    item['provider'] = 'coinglass'
+    item['unit'] = 'provider_level'
+    item.setdefault('axes', {}).setdefault('bar_axis', {})['unit'] = 'provider_level'
+    provenance = item.get('provenance') if isinstance(item.get('provenance'), Mapping) else {}
+    item['provenance'] = {'provider': 'coinglass', 'endpoint_id': provenance.get('endpoint_id', 'aggregated_liquidation_map'), 'source_dataset': provenance.get('source_dataset', 'coinglass.aggregated_map'), 'source_snapshot_timestamp': provenance.get('source_snapshot_timestamp'), 'side_assignment_method': provenance.get('side_assignment_method', 'spatial_convention_v1')}
+    item.setdefault('visual_contract', {})['bucket_count'] = len(buckets)
+    return _screen_shape(reference, item)
+
+def _screen_exchange_chart(reference: Mapping[str, Any], candidate: Mapping[str, Any], *, exchange: str) -> dict[str, Any]:
+    item = deepcopy(dict(candidate))
+    item['unit'] = 'provider_level'
+    item.setdefault('axes', {}).setdefault('bar_axis', {})['unit'] = 'provider_level'
+    item.setdefault('visual_contract', {})['bucket_count'] = len(item.get('buckets', []))
+    source_provenance = item.get('provenance') if isinstance(item.get('provenance'), Mapping) else {}
+    snapshot_ts = source_provenance.get('source_snapshot_timestamp')
+    reference_price = item.get('reference_price') if isinstance(item.get('reference_price'), Mapping) else {}
+    reference_ts = reference_price.get('timestamp')
+    aligned = type(snapshot_ts) is int and type(reference_ts) is int and (abs(snapshot_ts - reference_ts) <= 120)
+    if reference_price:
+        reference_price = deepcopy(dict(reference_price))
+        reference_price['provenance'] = {**(deepcopy(reference_price.get('provenance')) if isinstance(reference_price.get('provenance'), Mapping) else {}), 'map_provider': 'coinglass', 'map_source_dataset': f'coinglass.pair_maps.{exchange}', 'map_data_as_of': snapshot_ts, 'reference_price_as_of': reference_ts, 'temporally_aligned': aligned, 'coverage_bucket_count': len(item.get('buckets', []))}
+        item['reference_price'] = reference_price
+    item['proxy'] = False
+    item['provenance'] = {'provider': 'coinglass', 'endpoint_id': source_provenance.get('endpoint_id', 'pair_liquidation_map'), 'source_dataset': f'coinglass.pair_maps.{exchange}', 'source_snapshot_timestamp': snapshot_ts, 'side_assignment_method': source_provenance.get('side_assignment_method', 'spatial_convention_v1'), 'proxy': False}
+    return _screen_shape(reference, item)
+
+def _screen_pair_map_chart(reference: Mapping[str, Any], processing: Mapping[str, Any], *, exchange: str, range_id: str | None = None) -> dict[str, Any]:
+    selected_range = str(range_id or '1d').lower()
+    maps = processing.get('maps', {}) if isinstance(processing.get('maps'), Mapping) else {}
+    all_ranges = maps.get('by_exchange_by_range', {}) if isinstance(maps.get('by_exchange_by_range'), Mapping) else {}
+    by_exchange = all_ranges.get(selected_range, maps.get('by_exchange', {}))
+    by_exchange = by_exchange if isinstance(by_exchange, Mapping) else {}
+    source = by_exchange.get(exchange, {}) if isinstance(by_exchange.get(exchange), Mapping) else {}
+    reference_payload = maps.get('reference_price', {}) if isinstance(maps.get('reference_price'), Mapping) else {}
+    ref_value = _screen_finite(reference_payload.get('value'))
+    bucket_block = source.get('buckets', {}) if isinstance(source.get('buckets'), Mapping) else {}
+    bucket_items = bucket_block.get('items', []) if isinstance(bucket_block.get('items'), list) else []
+    curves = source.get('curves', {}) if isinstance(source.get('curves'), Mapping) else {}
+    def curve_map(name: str) -> dict[float, float]:
+        raw = curves.get(name, [])
+        if isinstance(raw, Mapping):
+            raw = raw.get('points', [])
+        out = {}
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, Mapping) and isinstance(item.get('price'), (int, float)) and isinstance(item.get('cumulative_level'), (int, float)):
+                    out[float(item['price'])] = float(item['cumulative_level'])
+        return out
+    long_curve, short_curve = curve_map('estimated_long'), curve_map('estimated_short')
+    visual_buckets = []
+    for item in bucket_items:
+        if not isinstance(item, Mapping):
+            continue
+        center = item.get('center_price')
+        if not isinstance(center, (int, float)):
+            continue
+        if exchange == 'Hyperliquid':
+            bars = {
+                'long': item.get('level_total', 0) if ref_value is not None and float(center) < float(ref_value) else 0,
+                'short': item.get('level_total', 0) if ref_value is not None and float(center) > float(ref_value) else 0,
+            }
+        elif exchange == 'Binance':
+            breakdown = item.get('leverage_breakdown', {}) if isinstance(item.get('leverage_breakdown'), Mapping) else {}
+            bars = {f'{lev}x': float(breakdown.get(str(lev), breakdown.get(f'{float(lev):.1f}', 0)) or 0) for lev in (10, 25, 50, 100)}
+        else:
+            bars = {exchange.lower(): item.get('level_total', 0)}
+        visual_buckets.append({
+            'bucket_index': item.get('bucket_index'), 'price_low': item.get('lower_price'),
+            'price_center': center, 'price_high': item.get('upper_price'),
+            'bars': bars,
+            'cumulative_long': long_curve.get(float(center), 0),
+            'cumulative_short': short_curve.get(float(center), 0),
+        })
+    status = source.get('status', 'unavailable')
+    ref_status = reference_payload.get('status', 'unavailable')
+    ref_view = {
+        'value': ref_value, 'display_value': f'{ref_value:,.2f}' if ref_value is not None else '—',
+        'unit': 'USDT', 'classification': None, 'confidence': 0.0, 'status': ref_status,
+        'reason': reference_payload.get('reason'), 'color_token': 'status_available' if ref_value is not None else 'status_unavailable',
+        'timestamp': reference_payload.get('timestamp'), 'provenance': deepcopy(reference_payload.get('provenance', {})) if isinstance(reference_payload.get('provenance'), Mapping) else {},
+    }
+    candidate = {
+        'id': reference.get('id'), 'chart_id': reference.get('chart_id'), 'title': reference.get('title'),
+        'status': status if visual_buckets else 'unavailable', 'reason': source.get('reason') if not visual_buckets else None,
+        'map_semantics': 'estimated', 'map_time_semantics': 'snapshot', 'provider': 'coinglass',
+        'selected_range': selected_range, 'ranges': ['1d','7d','30d'],
+        'current_price': ref_value, 'reference_price': ref_view,
+        'axes': {'x': {'field':'price_center','unit':'USDT','type':'linear'}, 'bar_axis': {'unit':'provider_level','side':'left'}, 'cumulative_axis': {'unit':'provider_level','side':'right'}},
+        'bar_series': ([{'series_id':'long','label':'Long'}, {'series_id':'short','label':'Short'}]
+                       if exchange == 'Hyperliquid' else
+                       [{'series_id':f'{lev}x','label':f'{lev}x Leverage'} for lev in (10,25,50,100)]
+                       if exchange == 'Binance' else
+                       [{'series_id': exchange.lower(), 'label': exchange}]),
+        'buckets': visual_buckets, 'unit': 'provider_level',
+        'provenance': deepcopy(source.get('provenance', {})) if isinstance(source.get('provenance'), Mapping) else {},
+        'visual_contract': {'renderer':'stacked_bars_plus_dual_cumulative_curves','reference_line':{'field':'current_price','label':'CURRENT PRICE'},'barmode':'stack','x_axis':'linear_price','hmi_calculation':False,'bucket_count':len(visual_buckets)},
+    }
+    return _screen_exchange_chart(reference, candidate, exchange=exchange)
+
+def _screen_attach_range_blocks(variants: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    ranges = ["1d", "7d", "30d"]
+    base = deepcopy(dict(variants.get("1d", {})))
+    base["selected_range"] = "1d"
+    base["ranges"] = ranges
+    keys = ("status", "reason", "current_price", "bar_series", "buckets", "reference_price", "provenance", "unit", "visual_contract")
+    base["range_blocks"] = {
+        range_id: {key: deepcopy(variants.get(range_id, {}).get(key)) for key in keys}
+        for range_id in ranges
+    }
+    return base
 
 
-def export_long_short_liquidations_contract(contract: Mapping[str, Any], path: str | Path =
-                                             "runtime/contracts/hmi/long_short_liquidations_screen.json") -> Path:
-    contract = _mapping(contract, "contract")
-    _json_safe(contract, "contract")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".tmp", prefix=f".{destination.name}.",
-                                         dir=destination.parent, delete=False, newline="\n") as handle:
-            temporary = Path(handle.name)
-            json.dump(contract, handle, ensure_ascii=False, allow_nan=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        return destination
-    except Exception:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
+def _screen_exchange_distribution_table(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    item = deepcopy(dict(candidate))
+    rows = [deepcopy(dict(row)) for row in item.get('rows', []) if isinstance(row, Mapping) and str(row.get('exchange_key', '')).lower() not in {'all', 'all_exchange', 'aggregate'}]
+    item['rows'] = rows
+    return _screen_shape(reference, item)
+
+def _screen_side_panel(reference: Mapping[str, Any], candidate: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    kpis = {str(item.get('id')): item for item in candidate.get('kpis', []) if isinstance(item, Mapping)}
+    pressure = kpis.get('pressure_score', {})
+    imbalance = kpis.get('realized_imbalance_24h', {})
+    side = kpis.get('realized_side_24h', {})
+    classification = pressure.get('classification')
+    pressure_state = {'low_pressure': ('low', 'Baja'), 'moderate_pressure': ('moderate', 'Moderada'), 'high_pressure': ('high', 'Alta'), 'extreme_pressure': ('extreme', 'Extrema')}.get(classification, (None, '—'))
+    realized_side = {'realized_long_liquidations_dominant': 'LONGS', 'realized_short_liquidations_dominant': 'SHORTS', 'realized_balanced': 'BALANCED'}.get(side.get('classification'))
+    rows = candidate.get('tables', {}).get('exchange_distribution', {}).get('rows', [])
+    exchange_rows = [row for row in rows if isinstance(row, Mapping) and str(row.get('exchange_key', '')).lower() != 'all']
+    total = sum((float(row.get('computed_total_usd', 0) or 0) for row in exchange_rows))
+    top_share = max((float(row.get('computed_total_usd', 0) or 0) / total for row in exchange_rows), default=None) if total > 0 else None
+    event24 = processing.get('events', {}).get('aggregate', {}).get('24h', {})
+    event4h = processing.get('events', {}).get('aggregate', {}).get('4h', {})
+    max_event = event24.get('max_event') if isinstance(event24.get('max_event'), Mapping) else None
+    max_event_usd = _screen_finite(max_event.get('usd_value')) if max_event else None
+    spike_usd = _screen_finite(event4h.get('event_usd_total'))
+    agg = processing.get('maps', {}).get('aggregated', {})
+    clusters = agg.get('clusters', {}) if isinstance(agg, Mapping) else {}
+    long_clusters = clusters.get('estimated_long', []) if isinstance(clusters, Mapping) else []
+    short_clusters = clusters.get('estimated_short', []) if isinstance(clusters, Mapping) else []
+
+    def cluster_price(rows: Any) -> float | None:
+        if not isinstance(rows, list) or not rows:
+            return None
+        row = rows[0]
+        if not isinstance(row, Mapping):
+            return None
+        for key in ('weighted_centroid_price', 'peak_bucket_price', 'center_price', 'price', 'cluster_center_price'):
+            value = _screen_finite(row.get(key))
+            if value is not None:
+                return value
+        return None
+    long_price = cluster_price(long_clusters)
+    short_price = cluster_price(short_clusters)
+    score = _screen_finite(pressure.get('value'))
+    side_imbalance = _screen_finite(imbalance.get('value'))
+    dynamic = {'pressure_score': {'id': 'pressure_score', 'label': 'Pressure Score', 'value': score, 'display_value': f'{score:.2f}' if score is not None else '—', 'unit': 'score', 'status': pressure.get('status', 'unavailable')}, 'pressure_label': {'id': 'pressure_label', 'label': 'Pressure Label', 'value': pressure_state[0], 'display_value': pressure_state[1], 'unit': 'state', 'status': pressure.get('status', 'unavailable')}, 'dominant_side': {'id': 'dominant_side', 'label': 'Dominant Side', 'value': realized_side, 'display_value': realized_side or '—', 'unit': 'side', 'status': side.get('status', 'unavailable')}, 'side_imbalance': {'id': 'side_imbalance', 'label': 'Side Imbalance', 'value': side_imbalance, 'display_value': f'{side_imbalance:+.4f}' if side_imbalance is not None else '—', 'unit': 'ratio', 'status': imbalance.get('status', 'unavailable')}, 'top_exchange_concentration': {'id': 'top_exchange_concentration', 'label': 'Top Exchange Conc.', 'value': top_share, 'display_value': f'{top_share:.4f}' if top_share is not None else '—', 'unit': 'ratio', 'status': 'available' if top_share is not None else 'unavailable'}, 'max_event_spike': {'id': 'max_event_spike', 'label': 'Max Event Spike', 'value': spike_usd / 1000000.0 if spike_usd is not None else None, 'display_value': f'${spike_usd / 1000000.0:.2f}M' if spike_usd is not None else '—', 'unit': 'M USD', 'status': event4h.get('status', 'unavailable')}, 'max_single_liquidation': {'id': 'max_single_liquidation', 'label': 'Max Single Liq.', 'value': max_event_usd / 1000000.0 if max_event_usd is not None else None, 'display_value': f"{max_event.get('exchange')} ${max_event_usd / 1000000.0:.2f}M" if max_event_usd is not None else '—', 'unit': 'M USD', 'status': event24.get('status', 'unavailable')}, 'nearest_long_cluster': {'id': 'nearest_long_cluster', 'label': 'Nearest Long Cluster', 'value': long_price, 'display_value': f'${long_price:,.0f}' if long_price is not None else '—', 'unit': 'USDT', 'status': 'available' if long_price is not None else 'unavailable'}, 'nearest_short_cluster': {'id': 'nearest_short_cluster', 'label': 'Nearest Short Cluster', 'value': short_price, 'display_value': f'${short_price:,.0f}' if short_price is not None else '—', 'unit': 'USDT', 'status': 'available' if short_price is not None else 'unavailable'}}
+    items = [_screen_shape(ref, dynamic.get(str(ref.get('id')), {})) for ref in reference.get('items', [])]
+    return {'id': reference.get('id'), 'title': reference.get('title'), 'items': items}
+
+def _screen_selectors(reference: Mapping[str, Any], charts: Mapping[str, Any]) -> dict[str, Any]:
+    del reference, charts
+    return {
+        'exchange': {'selected': 'Binance', 'options': ['Binance', 'OKX', 'Bybit']},
+        'timeframe': {'selected': '15m', 'options': ['1m', '5m', '15m', '4h']},
+        'range': {'selected': '1d', 'options': ['1d', '7d', '30d']},
+    }
+
+def _screen_history(reference: Mapping[str, Any], processing: Mapping[str, Any], runtime_context: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    series = [row for row in processing.get('realized', {}).get('series', []) if isinstance(row, Mapping)]
+    totals = [float(row.get('total_liquidation_usd', 0) or 0) for row in series]
+    max_total = max(totals) if totals else 0.0
+    current_price = _screen_finite(processing.get('maps', {}).get('reference_price', {}).get('value'))
+    agg = processing.get('maps', {}).get('aggregated', {})
+    clusters = agg.get('clusters', {}) if isinstance(agg, Mapping) else {}
+
+    def nearest_distance(side: str) -> float | None:
+        if current_price is None or not isinstance(clusters, Mapping):
+            return None
+        rows = clusters.get(side, [])
+        if not isinstance(rows, list) or not rows:
+            return None
+        values = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            price = _screen_finite(row.get('center_price', row.get('price')))
+            if price is not None:
+                values.append(abs(price / current_price - 1.0) * 100.0)
+        return min(values) if values else None
+    long_distance = nearest_distance('estimated_long')
+    short_distance = nearest_distance('estimated_short')
+    records = []
+    for row in series:
+        long_v = _screen_finite(row.get('long_liquidation_usd')) or 0.0
+        short_v = _screen_finite(row.get('short_liquidation_usd')) or 0.0
+        total = long_v + short_v
+        imbalance = 0.0 if total == 0 else (long_v - short_v) / total
+        records.append({'timestamp': row.get('timestamp'), 'price': current_price, 'long_liquidation_intensity': 0.0 if max_total == 0 else long_v / max_total, 'short_liquidation_intensity': 0.0 if max_total == 0 else short_v / max_total, 'liquidation_imbalance': imbalance, 'nearest_long_cluster_distance_percent': long_distance, 'nearest_short_cluster_distance_percent': short_distance, 'estimated_long_liquidation_usd': long_v, 'estimated_short_liquidation_usd': short_v, 'is_synthetic': bool(runtime_context.get('is_demo'))})
+    calculation = {'record_count': len(records), 'resolution': '15m', 'records': records, 'purpose': deepcopy(reference.get('calculation_history', {}).get('purpose', [])), 'map_bucket_semantics': 'Current maps are spatial price buckets; temporal selector intentionally absent.'}
+    history = deepcopy(dict(reference.get('history_contract', {})))
+    history.update({'calculation_records': len(records), 'minimum_warmup_records': 200, 'maximum_standard_indicator_period': 200, 'all_visible_moving_averages_warm': len(records) >= 200, 'technical_indicators_precomputed': True, 'hmi_recalculation': False, 'synthetic_fixture': False, 'fixture_seed': None, 'resolution': '15m', 'note': f'{len(records)} temporal liquidation-context snapshots; map buckets remain spatial price buckets.'})
+    return (_screen_shape(reference.get('history_contract', {}), history), _screen_shape(reference.get('calculation_history', {}), calculation))
+
+def _screen_quality(reference: Mapping[str, Any], candidate: Mapping[str, Any], charts: Mapping[str, Any], runtime_context: Mapping[str, Any], history_count: int) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    status = candidate.get('quality', {}).get('status', 'unavailable')
+    bucket_counts = {key: len(value.get('buckets', [])) for key, value in charts.items() if isinstance(value, Mapping)}
+    missing = [name for name, value in charts.items() if value.get('status') not in {'available', 'partial'}]
+    out.update({'status': status, 'synthetic_fixture': False, 'required_view_models': ['current_price', 'hyperliquid_map', 'exchange_maps', 'binance_map', 'long_short_positioning'], 'missing_view_models': missing, 'warnings': deepcopy(candidate.get('quality', {}).get('warnings', [])), 'errors': deepcopy(candidate.get('quality', {}).get('errors', [])), 'visual_fixture': {'status': status, 'synthetic': bool(runtime_context.get('is_demo')), 'bucket_count': max(bucket_counts.values(), default=0), 'maps': list(charts), 'hmi_calculation': False}})
+    ext = deepcopy(out.get('extensions', {}))
+    if 'temporal_history_730_v1' in ext:
+        ext['temporal_history_730_v1'].update({'status': 'available' if history_count else 'unavailable', 'temporal_records': history_count, 'map_bucket_count_per_map': bucket_counts, 'buckets_are_spatial_not_temporal': True})
+    if 'realism_v1' in ext:
+        ext['realism_v1'].update({'status': 'available' if status in {'available', 'partial'} else status, 'fixture_as_of_timestamp': None, 'fixture_as_of_iso': None, 'deterministic_seed': None, 'synthetic_not_live': bool(runtime_context.get('is_demo')), 'bucket_count_per_map': max(bucket_counts.values(), default=0), 'temporal_history_records': history_count, 'temporal_selector': 'NONE', 'common_as_of_contract': _screen_iso(candidate.get('reference_timestamp'))})
+    out['extensions'] = ext
+    shaped = _screen_shape(reference, out)
+    badge_state = {str(row.get('id')): bool(row.get('active')) for row in candidate.get('badges', []) if isinstance(row, Mapping)}
+    shaped.setdefault('extensions', {})['event_badge_contract_v1'] = {'truncated_events': {'active': badge_state.get('truncated_events', False), 'semantic': 'true_when_event_stream_is_truncated', 'processing_must_populate': True}, 'lower_bound': {'active': badge_state.get('lower_bound', False), 'semantic': 'true_when_reported_liquidation_aggregate_is_only_a_lower_bound', 'processing_must_populate': True}}
+    return shaped
+
+def _screen_positioning_chart(reference: Mapping[str, Any], processing: Mapping[str, Any], runtime_context: Mapping[str, Any]) -> dict[str, Any]:
+    native = processing.get('liquidation_analysis', {}) if isinstance(processing.get('liquidation_analysis'), Mapping) else {}
+    history_cube = native.get('positioning_history_by_exchange_timeframe', {}) if isinstance(native.get('positioning_history_by_exchange_timeframe'), Mapping) else {}
+
+    def _point_from_ratio_row(row: Mapping[str, Any]) -> dict[str, Any] | None:
+        if type(row.get('timestamp')) is not int:
+            return None
+        value = _screen_finite(row.get('long_short_ratio'))
+        long_share = None if value is None or value <= 0 else value / (1.0 + value)
+        short_share = None if long_share is None else 1.0 - long_share
+        return {
+            'timestamp': int(row['timestamp']),
+            'data_mode': 'synthetic_emulator' if runtime_context.get('is_demo') else 'live_provider',
+            'long_short_ratio': value,
+            'long_share': long_share,
+            'short_share': short_share,
+            'long_percent': None if long_share is None else long_share * 100.0,
+            'short_percent': None if short_share is None else short_share * 100.0,
+        }
+
+    series_by_exchange: dict[str, Any] = {}
+    any_points = False
+    for exchange in ('Binance', 'OKX', 'Bybit'):
+        tf_blocks: dict[str, Any] = {}
+        source_exchange = history_cube.get(exchange, {}) if isinstance(history_cube.get(exchange), Mapping) else {}
+        for timeframe in ('1m', '5m', '15m', '4h'):
+            source_tf = source_exchange.get(timeframe, {}) if isinstance(source_exchange.get(timeframe), Mapping) else {}
+            points = []
+            for row in source_tf.get('points', [])[-500:]:
+                if isinstance(row, Mapping):
+                    point = _point_from_ratio_row(row)
+                    if point is not None:
+                        points.append(point)
+            any_points = any_points or bool(points)
+            tf_blocks[timeframe] = {'timeframe': timeframe, 'status': 'available' if points else 'unavailable', 'points': points, 'current': deepcopy(points[-1]) if points else None}
+        series_by_exchange[exchange] = {'exchange': exchange, 'selected_timeframe': '15m', 'series_by_timeframe': tf_blocks}
+
+    default_points = deepcopy(series_by_exchange['Binance']['series_by_timeframe']['15m']['points'])
+    candidate = {'id':'long_short_positioning','chart_id':'long_short_positioning','title':'LONG / SHORT POSITIONING','status':'available' if any_points else 'unavailable','unit':'ratio','exchange':'Binance','timeframe':'15m','selected_timeframe':'15m','timeframes':['1m','5m','15m','4h'],'primary_series':'long_short_ratio','reference_value':1.0,'data_mode':'synthetic_emulator' if runtime_context.get('is_demo') else 'live_provider','processing_contract_target':True,'real_market_calculation':not bool(runtime_context.get('is_demo')),'points':default_points,'series_by_exchange':series_by_exchange,'series_semantics':deepcopy(reference.get('series_semantics', {}))}
+    return _screen_shape(reference, candidate)
+
+def _screen_realized_liquidations_chart(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    rows = processing.get('realized', {}).get('series', []) if isinstance(processing.get('realized'), Mapping) else []
+    points = []
+    for row in rows[-500:]:
+        if not isinstance(row, Mapping) or type(row.get('timestamp')) is not int:
+            continue
+        points.append({'timestamp':int(row['timestamp']),'long_liquidation_usd':_screen_finite(row.get('long_liquidation_usd')),'short_liquidation_usd':_screen_finite(row.get('short_liquidation_usd')),'total_liquidation_usd':_screen_finite(row.get('total_liquidation_usd'))})
+    candidate={'id':'realized_liquidations','chart_id':'realized_liquidations','title':'REALIZED LIQUIDATIONS','status':'available' if points else 'unavailable','reason':None if points else 'source_unavailable','unit':'USD','timeframe':'15m','points':points,'series_semantics':deepcopy(reference.get('series_semantics', {})),'provenance':deepcopy(processing.get('realized', {}).get('provenance', {})) if isinstance(processing.get('realized'), Mapping) else {}}
+    return _screen_shape(reference, candidate)
+
+def _screen_liquidation_pressure_chart(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    native = processing.get('liquidation_analysis', {}) if isinstance(processing.get('liquidation_analysis'), Mapping) else {}
+    timestamps = list(native.get('timestamps', []))[-500:]
+    indicators = native.get('indicators', {}) if isinstance(native.get('indicators'), Mapping) else {}
+    crowd = indicators.get('crowding_liquidation_pressure', {}) if isinstance(indicators.get('crowding_liquidation_pressure'), Mapping) else {}
+    pressure_values = list(crowd.get('liquidation_pressure_score', []))[-len(timestamps):] if timestamps else []
+    combined_values = list(crowd.get('crowding_liquidation_score', []))[-len(timestamps):] if timestamps else []
+    points=[]
+    for idx,ts in enumerate(timestamps):
+        points.append({'timestamp':int(ts),'liquidation_pressure_score':_screen_finite(pressure_values[idx]) if idx < len(pressure_values) else None,'crowding_liquidation_score':_screen_finite(combined_values[idx]) if idx < len(combined_values) else None})
+    current = _screen_finite(processing.get('pressure', {}).get('score')) if isinstance(processing.get('pressure'), Mapping) else None
+    candidate={'id':'liquidation_pressure','chart_id':'liquidation_pressure','title':'LIQUIDATION PRESSURE','status':'available' if points or current is not None else 'unavailable','reason':None if points or current is not None else 'source_unavailable','unit':'score','points':points,'current_pressure_score':current,'series_semantics':deepcopy(reference.get('series_semantics', {})),'provenance':deepcopy(processing.get('pressure', {}).get('provenance', {})) if isinstance(processing.get('pressure'), Mapping) else {}}
+    return _screen_shape(reference, candidate)
+
+def _screen_regime_label(value: Any) -> str | None:
+    score = _screen_finite(value)
+    if score is None:
+        return None
+    if score >= 0.65:
+        return 'SHORT_SQUEEZE'
+    if score <= -0.65:
+        return 'LONG_SQUEEZE_FLUSH'
+    if abs(score) <= 0.2:
+        return 'CALM'
+    if abs(score) >= 0.45:
+        return 'BUILDING_PRESSURE'
+    return 'NORMAL'
+
+def _screen_native_analysis(reference: Mapping[str, Any], processing: Mapping[str, Any], runtime_context: Mapping[str, Any]) -> dict[str, Any]:
+    native = processing.get('liquidation_analysis', {}) if isinstance(processing.get('liquidation_analysis'), Mapping) else {}
+    timestamps = list(native.get('timestamps', []))[-730:]
+    indicators = native.get('indicators', {}) if isinstance(native.get('indicators'), Mapping) else {}
+    built = deepcopy(dict(reference))
+    built.update({'status': native.get('status', 'unavailable'), 'data_mode': 'synthetic' if runtime_context.get('is_demo') else 'live', 'processing_contract_target': True, 'real_market_calculation': not bool(runtime_context.get('is_demo')), 'hmi_recalculate': False})
+    for iid in reference.get('indicator_order', []):
+        ref_ind = reference.get('indicators', {}).get(iid, {})
+        src = indicators.get(iid, {}) if isinstance(indicators.get(iid), Mapping) else {}
+        point_ref = (ref_ind.get('points') or [{}])[0]
+        fields = [str(spec.get('field')) for spec in ref_ind.get('series', []) if isinstance(spec, Mapping) and spec.get('field')]
+        if not fields:
+            fields = [key for key in point_ref if key not in {'timestamp', 'regime'}]
+        points = []
+        for index, ts in enumerate(timestamps):
+            row = {'timestamp': ts}
+            for field in fields:
+                values = src.get(field, []) if isinstance(src.get(field), list) else []
+                row[field] = values[-len(timestamps) + index] if len(values) >= len(timestamps) else values[index] if index < len(values) else None
+            if iid == 'liquidation_regime_hmi' or 'regime' in point_ref:
+                score = row.get('liquidation_regime_score')
+                row['regime'] = _screen_regime_label(score)
+            points.append(row)
+        candidate = deepcopy(dict(ref_ind))
+        candidate['status'] = 'available' if points else 'unavailable'
+        candidate['points'] = points
+        built['indicators'][iid] = _screen_shape(ref_ind, candidate)
+    return _screen_shape(reference, built)
+
+def align_long_short_liquidations_to_sp_v1_3(candidate: Mapping[str, Any], processing: Mapping[str, Any], classification: Mapping[str, Any], runtime_context: Mapping[str, Any]) -> dict[str, Any]:
+    ref = _screen_template()
+    is_demo = bool(runtime_context.get('is_demo'))
+    context = deepcopy(dict(ref['context']))
+    context.update({'symbol': candidate.get('context', {}).get('symbol', 'BTCUSDT'), 'base_asset': candidate.get('context', {}).get('base_asset', 'BTC'), 'quote_asset': candidate.get('context', {}).get('quote_asset', 'USDT'), 'market': candidate.get('context', {}).get('market', 'futures'), 'price_precision': candidate.get('context', {}).get('price_precision', 2), 'exchange_scope': 'aggregate', 'selected_interval': '15m', 'available_intervals': ['1m', '5m', '15m', '4h'], 'fixture_as_of_timestamp': None, 'fixture_as_of_iso': None, 'data_mode': runtime_context.get('data_mode'), 'synthetic_fixture': False, 'realism_refactor_version': 'runtime_emulator_v1' if is_demo else 'runtime_provider_v1', 'realism_note': 'CoinGlass final-33 liquidation primitives only; HMI performs no liquidation calculations.'})
+    public_ranges = ('1d', '7d', '30d')
+    hyper_variants = {r: _screen_pair_map_chart(ref['charts']['hyperliquid_map'], processing, exchange='Hyperliquid', range_id=r) for r in public_ranges}
+    binance_variants = {r: _screen_pair_map_chart(ref['charts']['binance_map'], processing, exchange='Binance', range_id=r) for r in public_ranges}
+    generated_at = runtime_context.get('generated_at')
+    if type(generated_at) is not int:
+        generated_at = int(candidate.get('reference_timestamp') or processing.get('reference_timestamp') or 1)
+    screen_context = candidate.get('context', {}) if isinstance(candidate.get('context'), Mapping) else {}
+    aggregate_variants = {r: _screen_filter_aggregate_chart(
+        ref['charts']['exchange_maps'],
+        _aggregate_map(processing, classification, screen_context, generated_at=generated_at, range_id=r),
+    ) for r in public_ranges}
+    charts = {
+        'hyperliquid_map': _screen_attach_range_blocks(hyper_variants),
+        'exchange_maps': _screen_attach_range_blocks(aggregate_variants),
+        'binance_map': _screen_attach_range_blocks(binance_variants),
+        'long_short_positioning': _screen_positioning_chart(ref['charts']['long_short_positioning'], processing, runtime_context),
+    }
+    history_contract, calculation_history = _screen_history(ref, processing, runtime_context)
+    history_count = calculation_history.get('record_count', 0)
+    source_selection = deepcopy(candidate.get('source_selection', {}))
+    for name in ('exchange_maps', 'events'):
+        if name in source_selection and isinstance(source_selection[name], Mapping):
+            status = source_selection[name].get('status')
+            source_selection[name]['selected'] = status in {'available', 'partial'}
+    if 'exchange_maps' in source_selection:
+        source_selection['exchange_maps']['role'] = 'screen_a_pair_maps'
+    providers = deepcopy(candidate.get('providers', []))
+    allowed_badge_ids = {item.get('id') for item in ref.get('badges', []) if isinstance(item, Mapping)}
+    public_badges = [deepcopy(item) for item in candidate.get('badges', [])
+                     if isinstance(item, Mapping) and item.get('id') in allowed_badge_ids]
+    built = {'contract_version': _screen_VERSION, 'screen_id': 'long_short_liquidations', 'family': 'long_short_liquidations', 'stage': 'screen_contract_final', 'reference_timestamp': candidate.get('reference_timestamp'), 'context': context, 'timestamps': deepcopy(candidate.get('timestamps', {})), 'mode': runtime_context.get('data_mode'), 'header': deepcopy(candidate.get('header', {})), 'kpis': _screen_kpis(ref['kpis'], [*candidate.get('kpis', []), {'id': 'long_short_position_ratio', 'label': 'Long/Short Ratio', 'value': processing.get('liquidation_analysis', {}).get('current', {}).get('long_short_ratio'), 'status': 'available', 'unit': 'ratio'}, {'id': 'crowding_score', 'label': 'Crowding Score', 'value': next((v for v in reversed(processing.get('liquidation_analysis', {}).get('indicators', {}).get('crowding_liquidation_pressure', {}).get('crowding_score', [])) if v is not None), None), 'status': 'available', 'unit': 'score'}]), 'selectors': _screen_selectors(ref['selectors'], charts), 'charts': charts, 'side_panel': _screen_side_panel(ref['side_panel'], candidate, processing), 'tables': {'exchange_distribution': _screen_exchange_distribution_table(ref['tables']['exchange_distribution'], candidate.get('tables', {}).get('exchange_distribution', {}))}, 'badges': public_badges, 'providers': providers, 'source_selection': _screen_shape(ref['source_selection'], source_selection), 'quality': {}, 'warnings': deepcopy(candidate.get('warnings', [])), 'errors': deepcopy(candidate.get('errors', [])), 'history_contract': history_contract, 'calculation_history': calculation_history, 'liquidation_analysis': _screen_native_analysis(ref['liquidation_analysis'], processing, runtime_context), 'screen_layout': deepcopy(ref['screen_layout'])}
+    built['header']['badges'] = deepcopy(built['badges'])
+    built['header']['status'] = candidate.get('quality', {}).get('status', 'unavailable')
+    built['quality'] = _screen_quality(ref['quality'], candidate, charts, runtime_context, history_count)
+    shaped = _screen_shape(ref, built)
+    native_current = processing.get('liquidation_analysis', {}).get('current', {})
+    side_by_id = {item.get('id'): item for item in shaped.get('side_panel', {}).get('items', []) if isinstance(item, Mapping)}
+    ls_ratio = native_current.get('long_short_ratio')
+    if 'long_short_ratio' in side_by_id:
+        side_by_id['long_short_ratio'].update({'value': ls_ratio, 'display_value': f'{float(ls_ratio):.3f}' if ls_ratio is not None else '—', 'unit': 'ratio', 'status': 'available' if ls_ratio is not None else 'unavailable'})
+    regime = _screen_regime_label(native_current.get('liquidation_regime_score'))
+    if 'liquidation_regime' in side_by_id:
+        side_by_id['liquidation_regime'].update({'value': regime, 'display_value': regime or '—', 'unit': 'state', 'status': 'available' if regime else 'unavailable'})
+    shaped['quality'].setdefault('extensions', {})['event_badge_contract_v1'] = deepcopy(built['quality']['extensions']['event_badge_contract_v1'])
+    return shaped

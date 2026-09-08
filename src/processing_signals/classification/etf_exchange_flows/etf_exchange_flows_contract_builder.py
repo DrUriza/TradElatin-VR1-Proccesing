@@ -1,7 +1,6 @@
 """ETF & Exchange Flows Screen Contract Builder; SP 1.4 adapter is final authority."""
 from __future__ import annotations
 
-from .etf_exchange_flows_sp_v1_4_adapter import align_etf_exchange_flows_contract_to_sp_v1_4
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -14,9 +13,9 @@ UPSTREAM_VERSION = "0.1"
 CONTRACT_VERSION = "1.4.1-exchange-reserve-realism-v4"
 SCHEMA_ID = "trad_elatin.etf_exchange_flows.screen.v1"
 SCHEMA_VERSION = "1.4.1-exchange-reserve-realism-v2"
-RANGE_SECONDS = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000, "90d": 7_776_000, "360d": 31_104_000}
-CLASSIFICATION_RANGES = ("1d", "7d", "30d", "90d")
-DISPLAY_RANGES = ("30d", "90d", "360d")
+RANGE_SECONDS = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000}
+CLASSIFICATION_RANGES = ("1d", "7d", "30d")
+DISPLAY_RANGES = ("7d", "30d")
 BUILDABLE_RANGES = tuple(RANGE_SECONDS)
 VALID_STATUSES = {"available", "partial", "unavailable", "invalid"}
 
@@ -33,7 +32,7 @@ OPTIONAL_VIEWS = (
     "kpis.gbtc_premium", "classification_states.gbtc_premium_regime",
     "classification_states.exchange_netflow_regime",
     "classification_states.aum_reconciliation_state", "provider_reconciliation",
-    "charts.exchange_balance.overlays.glassnode_balance_secondary", "tables.etf_funds.issuer_flow",
+    "tables.etf_funds.issuer_flow",
 )
 
 SCREEN_LAYOUT_CONTRACT = {'top_kpis': ['etf_net_flow',
@@ -215,13 +214,16 @@ def _chart(*, chart_id: str, source: Any, value_field: str, unit: str, source_pa
             continue
         provider = _identity(record.get("provider"))
         endpoint_id = _identity(record.get("endpoint_id"))
-        if value is None or provider is None or endpoint_id is None:
+        # Processing-owned identities may legitimately have no endpoint_id.
+        # They are derived from already contracted primitives and must not be
+        # mislabeled as a fourth provider endpoint.
+        if value is None or provider is None or (endpoint_id is None and provider != "calculated"):
             invalid += 1
             continue
         points.append({"timestamp": timestamp, "value": value, **identity_values,
                        "provider": provider, "endpoint_id": endpoint_id})
     points.sort(key=lambda item: (item["timestamp"], *(item.get(field, "") for field in identities),
-                                  item["provider"], item["endpoint_id"]))
+                                  item["provider"], item.get("endpoint_id") or ""))
     if points:
         status = "partial" if invalid else "available"
         reason = "source_points_invalid" if invalid else None
@@ -244,7 +246,7 @@ def _history_chart(*, chart_id: str, source: Any, value_field: str, unit: str, s
         item = dict(point)
         item["is_synthetic"] = synthetic
         if etf_calendar:
-            item["session_type"] = "weekday_trading_session_fixture" if synthetic else "provider_trading_session"
+            item["session_type"] = "weekday_trading_session_emulator" if synthetic else "provider_trading_session"
         enriched.append(item)
     history = {"record_count": len(enriched), "points": enriched}
     if etf_calendar:
@@ -293,8 +295,7 @@ def _candlestick_chart(source: Any, *, source_points: Any, anchor: int, data_mod
     synthetic = data_mode == "synthetic"
     return {"chart_id": "exchange_balance", "status": status, "reason": None if candles else "source_series_empty",
         "unit": "BTC", "source_path": "series.exchange_balance", "data_as_of": candles[-1]["timestamp"] if candles else None,
-        "warnings": [], "overlays": {"glassnode_balance_secondary": {"status": "unavailable",
-            "reason": "overlay_semantics_not_confirmed", "series": []}}, "chart_type": "candlestick",
+        "warnings": [], "overlays": {}, "chart_type": "candlestick",
         "preferred_representation": "candlestick", "title": "Exchange Balance (BTC)", "source_points": valid_source_points,
         "candles": candles, "candle_count": len(candles), "ohlc_contract": {
             "required_fields": ["timestamp", "open", "high", "low", "close"], "series_container": "candles",
@@ -421,7 +422,7 @@ def _technical_analysis(source: Any, event_source: Any = None, *, data_mode: str
         "status": "available" if timestamps else "unavailable", "warmup_contract": {
             "calculation_records": len(timestamps), "minimum_warmup_records": 200, "maximum_standard_indicator_period": 200,
             "all_visible_moving_averages_warm": len(timestamps) >= 200, "technical_indicators_precomputed": True,
-            "hmi_recalculation": False, "synthetic_fixture": data_mode == "synthetic", "fixture_seed": 20260807 if data_mode == "synthetic" else None,
+            "hmi_recalculation": False, "synthetic_fixture": False, "fixture_seed": None,
             "visible_records": len(timestamps), "resolution": "1d"},
         "indicator_cross_policy": {"macd": {"bullish": "MACD crosses above Signal", "bearish": "MACD crosses below Signal"},
             "adx": {"bullish": "DI+ crosses above DI-", "bearish": "DI+ crosses below DI-"},
@@ -575,7 +576,7 @@ def _fallback(errors: Sequence[str], *, selected_range: str, mode: Any = None,
         "range_selector": {"selected": selected_range, "default": "30d",
             "options": [{"id": key, "label": key.upper(), "days": RANGE_SECONDS[key] // 86_400,
                          "seconds": RANGE_SECONDS[key]} for key in DISPLAY_RANGES],
-            "selector_type": "RANGE", "source_resolution": "1D"},
+            "selector_type": "RANGE"},
         "kpis": {}, "charts": {}, "tables": {}, "classification_states": {}, "provider_reconciliation": {},
         "technical_analysis": _technical_analysis({}), "history_contract": {},
         "operational_status": {"quality_status": "invalid", "connection_status": "not_reported",
@@ -680,7 +681,7 @@ def build_etf_exchange_flows_contract(*, processing_contract: Mapping[str, Any],
         "range_selector": {"selected": selected_range, "default": "30d",
             "options": [{"id": key, "label": key.upper(), "days": RANGE_SECONDS[key] // 86_400,
                          "seconds": RANGE_SECONDS[key]} for key in DISPLAY_RANGES],
-            "selector_type": "RANGE", "source_resolution": "1D"},
+            "selector_type": "RANGE"},
         "kpis": kpis, "charts": charts, "tables": tables, "classification_states": classification_states,
         "provider_reconciliation": reconciliation,
         "operational_status": {"quality_status": None, "connection_status": "not_reported", "cache_status": "not_reported",
@@ -703,7 +704,7 @@ def build_etf_exchange_flows_contract(*, processing_contract: Mapping[str, Any],
             "maximum_standard_indicator_period": 200,
             "all_visible_moving_averages_warm": len(charts["exchange_balance"]["candles"]) >= 200,
             "technical_indicators_precomputed": True, "hmi_recalculation": False,
-            "synthetic_fixture": data_mode == "synthetic", "fixture_seed": 20260807,
+            "synthetic_fixture": False, "fixture_seed": None,
             "resolution": "1d", "note": "730 daily calculation records for ETF Flow, Exchange Net Flow and Exchange Balance."}}
     statuses = _view_statuses(root, selected_range)
     available = sorted(name for name, status in statuses.items() if status == "available")
@@ -804,3 +805,187 @@ class EtfExchangeFlowsContractBuilder:
               selected_range: str = "30d", generated_at: Any = None) -> dict[str, Any]:
         return build_etf_exchange_flows_contract(processing_contract=processing_contract,
             classification_contract=classification_contract, selected_range=selected_range, generated_at=generated_at)
+
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+from datetime import datetime, timezone
+
+import json
+
+import math
+
+from pathlib import Path
+
+from typing import Any, Mapping, Sequence
+
+_screen_SCHEMA_VERSION = '1.4.1-exchange-reserve-realism-v2'
+
+_screen_CONTRACT_VERSION = '1.4.1-exchange-reserve-realism-v4'
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_MISSING = object()
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_is_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+def _screen_project(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project runtime ETF values onto the exact current Screens shape."""
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_project(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(reference)
+        if not reference or all((_screen_is_scalar(item) for item in reference)):
+            return deepcopy(candidate)
+        if not candidate:
+            return []
+        identity_keys = ('metric_id', 'kpi_id', 'widget_id', 'chart_id', 'table_id', 'badge_id', 'id', 'role', 'indicator_id', 'market', 'timeframe', 'ticker')
+
+        def reference_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                for key in identity_keys:
+                    value = item.get(key, _screen_MISSING)
+                    if value is _screen_MISSING:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key, _screen_MISSING) == value:
+                            return ref_item
+            return reference[index] if index < len(reference) else reference[0]
+        return [_screen_project(reference_for(item, index), item) for index, item in enumerate(candidate)]
+    return deepcopy(reference if candidate is _screen_MISSING else candidate)
+
+def _screen_iso(timestamp: int | None) -> str | None:
+    if type(timestamp) is not int:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def _screen_finite(value: Any) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+        return None
+    return 0.0 if value == 0 else value
+
+def _screen_compact_btc(value: Any) -> str:
+    value = _screen_finite(value)
+    if value is None:
+        return '—'
+    absolute = abs(float(value))
+    if absolute >= 1000000:
+        return f'{value / 1000000:.3f}M BTC'
+    if absolute >= 1000:
+        return f'{value / 1000:.2f}K BTC'
+    return f'{value:.2f} BTC'
+
+def _screen_day_rows(processing: Mapping[str, Any], name: str) -> list[Mapping[str, Any]]:
+    series = processing.get('series', {})
+    if not isinstance(series, Mapping):
+        return []
+    root = series.get(name, {})
+    rows = root.get('day', []) if isinstance(root, Mapping) else []
+    return [row for row in rows if isinstance(row, Mapping) and type(row.get('timestamp')) is int]
+
+def _screen_exchange_flow_chart(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    inflow = {int(row['timestamp']): _screen_finite(row.get('inflow_total')) for row in _screen_day_rows(processing, 'exchange_inflow')}
+    outflow = {int(row['timestamp']): _screen_finite(row.get('outflow_total')) for row in _screen_day_rows(processing, 'exchange_outflow')}
+    reported = {int(row['timestamp']): _screen_finite(row.get('netflow_total')) for row in _screen_day_rows(processing, 'exchange_netflow')}
+    timestamps = sorted(set(inflow) | set(outflow))[-730:]
+    is_demo = bool(processing.get('is_demo'))
+
+    def points(kind: str) -> list[dict[str, Any]]:
+        result = []
+        for timestamp in timestamps:
+            if kind == 'inflow':
+                value, provider, endpoint = (inflow.get(timestamp), 'cryptoquant', 'exchange_inflow')
+            elif kind == 'outflow':
+                value, provider, endpoint = (outflow.get(timestamp), 'cryptoquant', 'exchange_outflow')
+            else:
+                value = reported.get(timestamp)
+                if value is None and inflow.get(timestamp) is not None and (outflow.get(timestamp) is not None):
+                    value = float(inflow[timestamp]) - float(outflow[timestamp])
+                    provider, endpoint = ('calculated', None)
+                else:
+                    provider, endpoint = ('calculated', None)
+            if value is None:
+                continue
+            result.append({'timestamp': timestamp, 'value': value, 'provider': provider, 'endpoint_id': endpoint, 'is_synthetic': is_demo})
+        return result
+    dynamic = {'chart_id': 'exchange_net_flow', 'title': 'Exchange Inflow / Outflow / Net Flow', 'status': 'available' if timestamps else 'unavailable', 'unit': 'BTC', 'chart_type': 'multi_series', 'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'processing_contract_target': True, 'real_market_calculation': not is_demo, 'hmi_recalculate': False, 'series': [{'id': 'inflow', 'label': 'Inflow', 'representation': 'bar', 'points': points('inflow')}, {'id': 'outflow', 'label': 'Outflow', 'representation': 'bar', 'points': points('outflow')}, {'id': 'net_flow', 'label': 'Net Flow', 'representation': 'line', 'points': points('net_flow')}], 'data_as_of': max(timestamps) if timestamps else None, 'warnings': []}
+    return _screen_project(reference, dynamic)
+
+def _screen_reserve_chart(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    rows = _screen_day_rows(processing, 'exchange_reserve')
+    is_demo = bool(processing.get('is_demo'))
+    data_mode = 'synthetic_emulator' if is_demo else 'live_provider'
+    points = [{'timestamp': int(row['timestamp']), 'value': _screen_finite(row.get('reserve')), 'provider': 'cryptoquant', 'endpoint_id': 'exchange_reserve', 'is_synthetic': is_demo, 'data_mode': data_mode} for row in rows if _screen_finite(row.get('reserve')) is not None]
+    series_root = processing.get('series', {}) if isinstance(processing.get('series'), Mapping) else {}
+    candles = series_root.get('exchange_balance', [])
+    candles = [deepcopy(dict(row)) for row in candles if isinstance(row, Mapping)] if isinstance(candles, list) else []
+    dynamic = {'chart_id': 'exchange_balance', 'status': 'available' if points else 'unavailable', 'reason': None if points else 'source_series_empty', 'unit': 'BTC', 'source_path': 'series.exchange_reserve.day', 'data_as_of': points[-1]['timestamp'] if points else None, 'warnings': [], 'chart_type': 'line', 'preferred_representation': 'line_area', 'title': 'Exchange Reserve / Balance (BTC)', 'source_points': len(points), 'synthetic_history': {'status': 'available' if is_demo and points else 'not_applicable' if not is_demo else 'unavailable', 'points': len(points), 'resolution': '1d', 'purpose': 'contract_hmi_validation' if is_demo else 'live_provider_history'}, 'calculation_history': {'record_count': len(points), 'candles': candles, 'purpose': 'processing_history_only_not_candlestick_hmi'}, 'records_available': len(points), 'records_returned': len(points), 'points': points, 'technical_analysis_allowed': False, 'analysis_note': 'Use the daily reserve series directly. HMI must not fabricate or smooth reserve values.', 'data_mode': data_mode, 'real_market_calculation': not is_demo, 'realism_note': 'provider-shaped emulator reserve series used for contract/HMI validation' if is_demo else 'runtime CryptoQuant exchange reserve; Processing publishes the provider series without HMI reconstruction', 'processing_contract_target': True, 'hmi_recalculate': False}
+    return _screen_project(reference, dynamic)
+
+def _screen_capital_flow(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    native = processing.get('capital_flow_analysis', {})
+    native = native if isinstance(native, Mapping) else {}
+    is_demo = bool(processing.get('is_demo'))
+    support = native.get('supporting_series', {}) if isinstance(native.get('supporting_series'), Mapping) else {}
+    timestamps = deepcopy(support.get('timestamps', [])) if isinstance(support.get('timestamps'), list) else []
+    indicators: dict[str, Any] = {}
+    native_indicators = native.get('indicators', {}) if isinstance(native.get('indicators'), Mapping) else {}
+    for indicator_id, ref_indicator in reference.get('indicators', {}).items():
+        candidate = native_indicators.get(indicator_id, {})
+        candidate = deepcopy(dict(candidate)) if isinstance(candidate, Mapping) else {}
+        candidate.update({'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'processing_contract_target': True, 'real_market_calculation': not is_demo, 'hmi_recalculate': False})
+        candidate['thresholds'] = deepcopy(ref_indicator.get('thresholds', []))
+        indicators[indicator_id] = _screen_project(ref_indicator, candidate)
+
+    def support_package(values: Any) -> dict[str, Any]:
+        return {'timestamps': timestamps, 'values': deepcopy(values) if isinstance(values, list) else [], 'data_mode': 'synthetic_emulator' if is_demo else 'live_provider'}
+    dynamic = {'analysis_id': 'etf_exchange_capital_flow_native_v1', 'contract_family': 'etf_exchange_flows', 'target_title': 'ETF & Exchange Capital Analytics', 'status': native.get('status', 'available' if indicators else 'unavailable'), 'recalculate_in_hmi': False, 'source_resolution': '1D', 'selector_contract': deepcopy(reference.get('selector_contract', {})), 'data_contract': {'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'processing_contract_target': True, 'real_market_calculation': not is_demo, 'hmi_recalculate': False, 'rule': 'Market API provides primitive flows/reserves/price; Processing derives native capital-flow analytics; HMI only renders JSON.'}, 'indicators': indicators, 'supporting_series': {'btc_price_proxy': support_package(support.get('btc_price')), 'exchange_inflow_proxy': support_package(support.get('exchange_inflow')), 'exchange_outflow_proxy': support_package(support.get('exchange_outflow'))}}
+    return _screen_project(reference, dynamic)
+
+def align_etf_exchange_flows_contract_to_sp_v1_4(candidate: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    reference = _screen_template()
+    dynamic = deepcopy(dict(candidate))
+    dynamic.pop('technical_analysis', None)
+    dynamic['schema'] = {'id': 'trad_elatin.etf_exchange_flows.screen.v1', 'version': _screen_SCHEMA_VERSION}
+    dynamic['version'] = _screen_CONTRACT_VERSION
+    context = deepcopy(dict(dynamic.get('context', {})))
+    processing_as_of = processing.get('data_as_of') if type(processing.get('data_as_of')) is int else context.get('processing_data_as_of')
+    is_demo = bool(processing.get('is_demo'))
+    reserve_rows = _screen_day_rows(processing, 'exchange_reserve')
+    reserve_values = [_screen_finite(row.get('reserve')) for row in reserve_rows]
+    reserve_values = [float(value) for value in reserve_values if value is not None]
+    recent = reserve_values[-30:]
+    context.update({'generated_at': processing.get('generated_at', context.get('generated_at')), 'processing_data_as_of': processing_as_of, 'data_as_of': processing_as_of, 'data_mode': 'synthetic_calibrated' if is_demo else processing.get('data_mode', 'live'), 'synthetic_fixture': False, 'fixture_as_of_timestamp': None, 'fixture_as_of_iso': None, 'realism_refactor_version': 'exchange_realism_v2' if is_demo else 'runtime_provider_v1', 'realism_note': 'provider-shaped ETF/exchange-flow emulator data; native capital-flow analytics are computed in Processing' if is_demo else 'runtime ETF/exchange-flow provider data; native capital-flow analytics are computed in Processing', 'analysis_contract': 'capital_flow_analysis_v1', 'hmi_calculation': False, 'screen_revision': 'ETF_NATIVE_CAPITAL_FLOW_B_V1', 'exchange_reserve_emulator_policy': {'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'points': len(reserve_rows), 'resolution': '1d', 'latest_value_btc': reserve_values[-1] if reserve_values else None, 'last_30d_min_btc': min(recent) if recent else None, 'last_30d_max_btc': max(recent) if recent else None, 'last_30d_range_btc': max(recent) - min(recent) if recent else None, 'real_market_calculation': not is_demo, 'purpose': 'runtime emulator realism and contract validation' if is_demo else 'runtime provider reserve contract'}})
+    dynamic['context'] = context
+    charts = deepcopy(dict(dynamic.get('charts', {})))
+    charts['exchange_net_flow'] = _screen_exchange_flow_chart(reference['charts']['exchange_net_flow'], processing)
+    charts['exchange_balance'] = _screen_reserve_chart(reference['charts']['exchange_balance'], processing)
+    dynamic['charts'] = charts
+    kpis = deepcopy(dict(dynamic.get('kpis', {})))
+    if isinstance(kpis.get('exchange_balance'), Mapping):
+        kpis['exchange_balance'] = deepcopy(dict(kpis['exchange_balance']))
+        kpis['exchange_balance']['display_value'] = _screen_compact_btc(kpis['exchange_balance'].get('value'))
+    dynamic['kpis'] = kpis
+    dynamic['capital_flow_analysis'] = _screen_capital_flow(reference['capital_flow_analysis'], processing)
+    calculation_records = max(len(charts.get('etf_flow_daily', {}).get('calculation_history', {}).get('points', [])) if isinstance(charts.get('etf_flow_daily'), Mapping) else 0, len(_screen_day_rows(processing, 'exchange_inflow')), len(reserve_rows))
+    dynamic['history_contract'] = {'calculation_records': calculation_records, 'minimum_analysis_history_records': 90, 'hmi_recalculation': False, 'synthetic_fixture': False, 'fixture_seed': None, 'resolution': '1d', 'note': reference.get('history_contract', {}).get('note', '730 daily records support ETF, exchange-flow, reserve and native capital-flow analytics.')}
+    quality = deepcopy(dict(dynamic.get('quality', {})))
+    extensions = deepcopy(dict(quality.get('extensions', {})))
+    extensions = {key: deepcopy(value) for key, value in reference.get('quality', {}).get('extensions', {}).items()}
+    extensions['native_capital_flow_screen_b_v1'] = {'status': 'available' if dynamic['capital_flow_analysis'].get('status') in {'available', 'ok'} else dynamic['capital_flow_analysis'].get('status'), 'indicators': list(reference['capital_flow_analysis']['indicators']), 'classical_price_ta_removed': True, 'exchange_reserve_representation': 'line_area', 'hmi_recalculation': False, 'data_mode': 'synthetic_emulator' if is_demo else 'live_provider'}
+    extensions['exchange_reserve_realism_v2'] = {'status': 'synthetic_emulator' if is_demo else 'live_provider', 'records': len(reserve_rows), 'behavior': 'provider_series_no_hmi_fabrication', 'display_policy': 'local_y_range_not_zero_baseline'}
+    extensions['exchange_reserve_realism_v4'] = {'records': len(reserve_rows), 'unique_timestamps': len({int(row['timestamp']) for row in reserve_rows}), 'last_30d_range_btc': max(recent) - min(recent) if recent else None, 'flat_line_detected': bool(recent and max(recent) == min(recent))}
+    quality['extensions'] = extensions
+    dynamic['quality'] = quality
+    aligned = _screen_project(reference, dynamic)
+    aligned.pop('technical_analysis', None)
+    json.dumps(aligned, ensure_ascii=False, allow_nan=False)
+    return aligned

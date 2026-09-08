@@ -10,14 +10,22 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from processing_signals.processing.math.indicators.trend.moving_averages import ema, sma, wma
-from processing_signals.processing.math.technical_cross_signals import detect_numeric_crosses
-from processing_signals.processing.math.native_analysis import (rolling_zscore, rolling_percentile, pct_change as native_pct_change, difference as native_difference, latest, interpolated_cross)
+from .open_interest_and_funding_math import ema, sma, wma
+from .open_interest_and_funding_math import detect_numeric_crosses
+from .open_interest_and_funding_math import (
+    open_interest_wasserstein_frame,
+    rolling_zscore,
+    rolling_percentile,
+    pct_change as native_pct_change,
+    difference as native_difference,
+    latest,
+    interpolated_cross,
+)
 from processing_signals.processing.open_interest_and_funding.open_interest_and_funding_feature_builder import OpenInterestAndFundingFeatureBuilder
 
 FAMILY            = "open_interest_and_funding"
-TIMEFRAMES        = ("1m", "5m", "15m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
+TIMEFRAMES        = ("5m", "15m", "4h")
+TIMEFRAME_SECONDS = {"5m": 300, "15m": 900, "4h": 14_400}
 CHANGE_24H_WARMUP = {timeframe: 86_400 // seconds + 1 for timeframe, seconds in TIMEFRAME_SECONDS.items()}
 VALID_STATUSES    = {"available", "partial", "unavailable", "invalid"}
 CONTEXT_FIELDS    = ("asset", "exchange_scope", "primary_provider", "confirmation_providers", "data_mode", "is_demo",
@@ -269,14 +277,55 @@ def _indicator_packages(records: Sequence[Mapping[str, Any]], bounds: Sequence[t
 
     roc_package = _wrapper(timestamps=timestamps, series=_oi_roc(records, bounds), units={"roc": "percent"}, source=source, parameters={"period": 12}, warmup=13,
         calculation="100*(close[t]/close[t-12]-1)", source_status=source_status, bounds=bounds, gaps=gaps)
-    wasserstein_values = _segment_calculation(records, bounds, ("distance",), _wasserstein, 60)
+
+    def bollinger_calc(frame: pd.DataFrame) -> dict[str, pd.Series]:
+        close = pd.to_numeric(frame["close"], errors="coerce")
+        middle = close.rolling(window=20, min_periods=20).mean()
+        sigma = close.rolling(window=20, min_periods=20).std(ddof=0)
+        upper = middle + 2.0 * sigma
+        lower = middle - 2.0 * sigma
+        width = upper - lower
+        bandwidth = 100.0 * width / middle.replace(0.0, np.nan)
+        percent_b = (close - lower) / width.replace(0.0, np.nan)
+        return {"middle": middle, "upper": upper, "lower": lower, "bandwidth": bandwidth, "percent_b": percent_b}
+
+    bollinger_values = _segment_calculation(
+        records, bounds, ("middle", "upper", "lower", "bandwidth", "percent_b"), bollinger_calc, 20
+    )
+    bollinger_package = _wrapper(
+        timestamps=timestamps,
+        series=bollinger_values,
+        units={"middle": "USD", "upper": "USD", "lower": "USD", "bandwidth": "percent", "percent_b": "ratio"},
+        source=source,
+        parameters={"period": 20, "standard_deviations": 2.0, "std_ddof": 0},
+        warmup=20,
+        calculation="oi_close_rolling_mean_20_plus_minus_2_population_std",
+        source_status=source_status,
+        bounds=bounds,
+        gaps=gaps,
+    )
+
+    regression_values = _regression_channel_series(records, bounds, window=100, deviation_multiplier=2.0)
+    regression_package = _wrapper(
+        timestamps=timestamps,
+        series=regression_values,
+        units={"middle": "USD", "upper": "USD", "lower": "USD"},
+        source=source,
+        parameters={"window": 100, "residual_standard_deviations": 2.0},
+        warmup=100,
+        calculation="rolling_ols_on_oi_close_with_plus_minus_2_residual_population_std",
+        source_status=source_status,
+        bounds=bounds,
+        gaps=gaps,
+    )
+
+    wasserstein_values = _segment_calculation(records, bounds, ("distance",), open_interest_wasserstein_frame, 60)
     wasserstein_package = _wrapper(timestamps=timestamps, series=wasserstein_values, units={"distance": "ratio"}, source=source,
         parameters={"recent_window_returns": 20, "reference_window_returns": 40}, warmup=61,
         calculation="first_wasserstein_distance_between_recent_and_reference_open_interest_returns",
         source_status=source_status, bounds=bounds, gaps=gaps)
     retired_fields = {
-        "bollinger_bands": ("middle", "upper", "lower", "bandwidth", "percent_b"),
-        "regression_channel": ("middle", "upper", "lower"), "bollinger_band_width": ("bandwidth",),
+        "bollinger_band_width": ("bandwidth",),
         "macd": ("macd", "signal", "histogram"), "rsi": ("rsi",), "tsi": ("tsi", "signal"),
         "adx": ("adx", "di_plus", "di_minus"), "stochastic": ("k", "d"),
         "williams_r": ("williams_r",), "atr": ("atr",), "cci": ("cci",), "mfi": (),
@@ -287,19 +336,14 @@ def _indicator_packages(records: Sequence[Mapping[str, Any]], bounds: Sequence[t
             forced_reason="retired_by_open_interest_indicator_policy")
         for name, fields in retired_fields.items()
     }
-    return {"moving_averages": moving, "wasserstein_distance": wasserstein_package, "oi_roc": roc_package, **retired}
-
-def _wasserstein(frame: pd.DataFrame) -> dict[str, pd.Series]:
-    returns = pd.to_numeric(frame["close"], errors="coerce").pct_change()
-    values = pd.Series(index=frame.index, dtype="float64")
-    for index in range(60, len(frame)):
-        reference = np.sort(returns.iloc[index - 60:index - 20].dropna().to_numpy())
-        recent = np.sort(returns.iloc[index - 20:index].dropna().to_numpy())
-        if len(reference) and len(recent):
-            quantiles = np.linspace(0.0, 1.0, max(len(reference), len(recent)))
-            values.iloc[index] = float(np.mean(np.abs(
-                np.quantile(reference, quantiles) - np.quantile(recent, quantiles))))
-    return {"distance": values}
+    return {
+        "moving_averages": moving,
+        "bollinger_bands": bollinger_package,
+        "regression_channel": regression_package,
+        "wasserstein_distance": wasserstein_package,
+        "oi_roc": roc_package,
+        **retired,
+    }
 
 
 def _renamed_bollinger(frame: pd.DataFrame) -> dict[str, pd.Series]:
@@ -327,7 +371,8 @@ def _processed_frame(metric_id: str, timeframe: str, input_frame: Mapping[str, A
     bounds, gaps = _segments(records, TIMEFRAME_SECONDS[timeframe])
     status = "invalid" if error else ("unavailable" if source_status == "unavailable" or not records else ("partial" if source_status == "partial" or gaps else source_status))
     current = copy.deepcopy(records[-1]) if records and status != "invalid" else None
-    result = {"status": status, "reason": error or (input_frame.get("reason") if isinstance(input_frame, Mapping) else None), "timeframe": timeframe,
+    source_reason = input_frame.get("reason") if isinstance(input_frame, Mapping) else None
+    result = {"status": status, "reason": error or source_reason or ("source_partial" if status == "partial" else None), "timeframe": timeframe,
         "expected_interval_seconds": TIMEFRAME_SECONDS[timeframe], "unit": SOURCE_IDS[metric_id][1],
         "representation": "percentage_points" if metric_id == "funding_rate_ohlc" else None, "source": _source(metric_id, timeframe),
         "records": copy.deepcopy(records), "current": current, "coverage": {"records": len(records), "segment_count": len(bounds),
@@ -407,100 +452,51 @@ def _events_for_timeframe(timeframe: str, oi_frame: Mapping[str, Any], funding_f
 
 
 def _snapshot_sections(input_snapshots: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    source = input_snapshots if isinstance(input_snapshots, Mapping) else {}
-
-    def normalized_snapshot(name: str) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-        raw = source.get(name)
-        if not isinstance(raw, Mapping):
-            return {"status": "invalid", "reason": "snapshot_payload_not_mapping"}, [], []
-        payload = copy.deepcopy(dict(raw))
-        if payload.get("status") in ("unavailable", "invalid"):
-            return payload, [], []
-        raw_records = payload.get("records")
-        if not isinstance(raw_records, list):
-            payload.update(status="invalid", reason="snapshot_records_not_list")
-            return payload, [], []
-        records = [copy.deepcopy(dict(row)) for row in raw_records if isinstance(row, Mapping)]
-        invalid = [{"index": index, "reason": "snapshot_record_not_mapping"}
-            for index, row in enumerate(raw_records) if not isinstance(row, Mapping)]
-        if invalid:
-            payload.update(status="partial" if records else "invalid",
-                reason="invalid_snapshot_records_isolated" if records else "snapshot_records_incompatible")
-        return payload, records, invalid
-
-    oi, oi_records, oi_invalid = normalized_snapshot("open_interest_by_exchange")
-    funding, funding_records, funding_invalid = normalized_snapshot("funding_rate_by_exchange")
-    options, option_records, option_invalid = normalized_snapshot("options_open_interest")
-
-    def aggregate(payload: dict[str, Any], records: list[dict[str, Any]]) -> Mapping[str, Any] | None:
-        raw = payload.get("aggregate_record")
-        if isinstance(raw, Mapping):
-            return copy.deepcopy(dict(raw))
-        if "aggregate_record" in payload and payload.get("status") not in ("unavailable", "invalid"):
-            payload.update(status="partial" if records else "invalid", reason="aggregate_record_incompatible")
-        return None
-
-    oi_aggregate = aggregate(oi, oi_records)
-    option_aggregate = aggregate(options, option_records)
-    reported = {key: value for key, value in (oi_aggregate or {}).items() if key.startswith("open_interest_change_percent_")}
+    # Final-33 OI does not contract exchange snapshot/options endpoints. Preserve
+    # explicit unavailable shells for schema compatibility without fabricating
+    # provider observations or referencing retired endpoint IDs.
     snapshots = {
-        "open_interest_by_exchange": {"status": oi.get("status", "unavailable"), "reason": oi.get("reason"), "records": oi_records, "invalid_records": oi_invalid,
-            "aggregate_record": copy.deepcopy(oi_aggregate), "exchange_count": len({row.get("exchange") for row in oi_records if row.get("exchange") != "All"}),
-            "current_total_usd": (oi_aggregate or {}).get("open_interest_usd"), "reported_changes": reported},
-        "funding_rate_by_exchange": {"status": funding.get("status", "unavailable"), "reason": funding.get("reason"), "records": funding_records, "invalid_records": funding_invalid,
-            "stablecoin_margin_records": [copy.deepcopy(row) for row in funding_records if row.get("margin_type") == "stablecoin"],
-            "token_margin_records": [copy.deepcopy(row) for row in funding_records if row.get("margin_type") == "token"],
-            "exchange_count": len({row.get("exchange") for row in funding_records}),
-            "next_funding_timestamps": sorted({row.get("next_funding_timestamp") for row in funding_records if type(row.get("next_funding_timestamp")) is int})},
-        "options_open_interest": {"status": options.get("status", "unavailable"), "reason": options.get("reason"), "records": option_records, "invalid_records": option_invalid,
-            "aggregate_record": copy.deepcopy(option_aggregate), "current_options_open_interest_usd": (option_aggregate or {}).get("open_interest_usd"),
-            "current_options_contracts": (option_aggregate or {}).get("open_interest_contracts")}}
-    reported_status = ("invalid" if oi.get("status") == "invalid" else
-        ("available" if _finite((oi_aggregate or {}).get("open_interest_change_percent_24h")) is not None else "unavailable"))
-    metrics = {"reported_24h_percent": {"status": reported_status, "reason": None if reported_status == "available" else "reported_24h_percent_unavailable",
-        "value": _finite((oi_aggregate or {}).get("open_interest_change_percent_24h")), "unit": "percent", "provider": "coinglass",
-        "endpoint_id": "open_interest_exchange_list", "source_scope": "all_exchanges", "observation_timestamp": None},
-        "current_open_interest": {"series_current_close_usd": {}, "snapshot_current_usd": snapshots["open_interest_by_exchange"]["current_total_usd"],
-            "comparison": {"status": "unavailable", "reason": "observation_scope_or_timestamp_not_comparable"}}}
+        "open_interest_by_exchange": {"status": "unavailable", "reason": "not_contracted_final33",
+            "records": [], "invalid_records": [], "aggregate_record": None, "exchange_count": 0,
+            "current_total_usd": None, "reported_changes": {}},
+        "funding_rate_by_exchange": {"status": "unavailable", "reason": "not_contracted_final33",
+            "records": [], "invalid_records": [], "stablecoin_margin_records": [], "token_margin_records": [],
+            "exchange_count": 0, "next_funding_timestamps": []},
+        "options_open_interest": {"status": "unavailable", "reason": "not_contracted_final33",
+            "records": [], "invalid_records": [], "aggregate_record": None,
+            "current_options_open_interest_usd": None, "current_options_contracts": None},
+    }
+    metrics = {
+        "reported_24h_percent": {"status": "unavailable", "reason": "not_contracted_final33",
+            "value": None, "unit": "percent", "provider": None, "endpoint_id": None,
+            "source_scope": "all_exchanges", "observation_timestamp": None},
+        "current_open_interest": {"series_current_close_usd": {}, "snapshot_current_usd": None,
+            "comparison": {"status": "unavailable", "reason": "snapshot_not_contracted_final33"}},
+    }
     return snapshots, metrics
-
 
 def _confirmations(input_confirmations: Any) -> dict[str, Any]:
     source = input_confirmations if isinstance(input_confirmations, Mapping) else {}
-    open_interest = source.get("open_interest") if isinstance(source.get("open_interest"), Mapping) else {}
-    funding_rate = source.get("funding_rate") if isinstance(source.get("funding_rate"), Mapping) else {}
     leverage = source.get("estimated_leverage_ratio") if isinstance(source.get("estimated_leverage_ratio"), Mapping) else {}
-    metadata = {
-        ("open_interest", "cryptoquant"): {"provider": "cryptoquant", "endpoint_id": "open_interest", "unit": "USD", "provider_window": "hour"},
-        ("open_interest", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_open_interest_sum", "unit": "USD", "provider_interval": "1h"},
-        ("funding_rate", "cryptoquant"): {"provider": "cryptoquant", "endpoint_id": "funding_rates", "unit": "percent", "provider_window": "hour"},
-        ("funding_rate", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_funding_rate_perpetual", "unit": "percent", "provider_interval": "1h"},
-        ("estimated_leverage_ratio", "glassnode"): {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "unit": "ratio", "provider_interval": "1h"},
-    }
-
-    def normalized(metric: str, provider: str, payload: Any) -> dict[str, Any]:
-        base = metadata[(metric, provider)]
-        if not isinstance(payload, Mapping):
-            return {**base, "status": "invalid", "reason": "confirmation_payload_not_mapping", "records": []}
-        result = {**copy.deepcopy(dict(payload)), **base}
+    payload = leverage.get("glassnode")
+    base = {"provider": "glassnode", "endpoint_id": "futures_estimated_leverage_ratio", "unit": "ratio", "provider_interval": "1h"}
+    if not isinstance(payload, Mapping):
+        normalized = {**base, "status": "invalid", "reason": "confirmation_payload_not_mapping", "records": []}
+    else:
+        normalized = {**copy.deepcopy(dict(payload)), **base}
         records = payload.get("records")
         if not isinstance(records, list):
-            return {**result, "status": "invalid", "reason": "confirmation_records_not_list", "records": []}
-        valid = [copy.deepcopy(dict(row)) for row in records if isinstance(row, Mapping)]
-        invalid = [{"index": index, "reason": "confirmation_record_not_mapping"}
-            for index, row in enumerate(records) if not isinstance(row, Mapping)]
-        result["records"] = valid
-        if invalid:
-            result.update(status="partial" if valid else "invalid",
-                reason="invalid_confirmation_records_isolated" if valid else "confirmation_records_incompatible",
-                invalid_records=invalid)
-        return result
-
-    return {"open_interest": {provider: normalized("open_interest", provider, open_interest.get(provider)) for provider in ("cryptoquant", "glassnode")},
-        "funding_rate": {provider: normalized("funding_rate", provider, funding_rate.get(provider)) for provider in ("cryptoquant", "glassnode")},
-        "estimated_leverage_ratio": {"glassnode": normalized("estimated_leverage_ratio", "glassnode", leverage.get("glassnode"))},
-        "comparisons": {"open_interest": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable"},
-                        "funding_rate": {"status": "unavailable", "reason": "provider_scope_not_proven_comparable"}}}
+            normalized.update(status="invalid", reason="confirmation_records_not_list", records=[])
+        else:
+            valid = [copy.deepcopy(dict(row)) for row in records if isinstance(row, Mapping)]
+            invalid = [{"index": index, "reason": "confirmation_record_not_mapping"}
+                for index, row in enumerate(records) if not isinstance(row, Mapping)]
+            normalized["records"] = valid
+            if invalid:
+                normalized.update(status="partial" if valid else "invalid",
+                    reason="invalid_confirmation_records_isolated" if valid else "confirmation_records_incompatible",
+                    invalid_records=invalid)
+    return {"estimated_leverage_ratio": {"glassnode": normalized}}
 
 
 def _aggregate(packages: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -523,8 +519,7 @@ def _availability(series: Mapping[str, Any], indicators: Mapping[str, Any], snap
         availability[key] = _aggregate({tf: frame[key] for tf, frame in indicator_frames.items()})
     availability.update({"contract_type_split": {"status": "unavailable", "reason": "dated_futures_open_interest_not_separated_by_current_sources"},
         "funding_8h_aggregate": {"status": "unavailable", "reason": "cross_exchange_8h_weighting_not_defined"},
-        "confirmations": {metric: {provider: payload.get("status", "unavailable") for provider, payload in confirmations[metric].items()}
-                          for metric in ("open_interest", "funding_rate", "estimated_leverage_ratio")}})
+        "confirmations": {"estimated_leverage_ratio": {"glassnode": confirmations["estimated_leverage_ratio"]["glassnode"].get("status", "unavailable")}}})
     return availability
 
 
@@ -532,7 +527,7 @@ def _quality(series: Mapping[str, Any], indicators: Mapping[str, Any], snapshots
     source_statuses = {f"{metric}.{timeframe}": frame["status"] for metric, metric_payload in series.items()
         for timeframe, frame in metric_payload["timeframes"].items()}
     calculation_statuses = {f"{name}.{timeframe}": package[name]["status"] for timeframe, package in indicators["open_interest"]["timeframes"].items()
-        for name in ("moving_averages", "wasserstein_distance", "oi_roc")}
+        for name in ("moving_averages", "bollinger_bands", "regression_channel", "wasserstein_distance", "oi_roc")}
     calculation_statuses.update({f"oi_delta.{timeframe}": frame["derived"]["oi_delta"]["status"] for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items()})
     oi_change_statuses = {f"oi_change_24h.{timeframe}": frame["derived"]["oi_change_24h"]["status"]
         for timeframe, frame in series["open_interest_ohlc"]["timeframes"].items()}
@@ -547,24 +542,50 @@ def _quality(series: Mapping[str, Any], indicators: Mapping[str, Any], snapshots
     required_statuses = list(source_statuses.values()) + required_calculation_statuses
     if any(status == "invalid" for status in source_statuses.values()):
         status = "invalid"
-    elif any(item != "available" for item in required_statuses) or gaps_present or any(snapshots[name]["status"] != "available" for name in ("open_interest_by_exchange", "funding_rate_by_exchange")):
+    elif any(item != "available" for item in required_statuses) or gaps_present:
         status = "partial"
     else:
         status = "ok"
-    optional_invalid = [f"{metric}.{provider}" for metric in ("open_interest", "funding_rate", "estimated_leverage_ratio") for provider, payload in confirmations[metric].items()
-        if not isinstance(payload, Mapping) or payload.get("status") == "invalid"]
+    leverage_payload = confirmations.get("estimated_leverage_ratio", {}).get("glassnode", {})
+    optional_invalid = ["estimated_leverage_ratio.glassnode"] if not isinstance(leverage_payload, Mapping) or leverage_payload.get("status") == "invalid" else []
     snapshot_warnings = [f"snapshot_{name}_invalid_records" for name in
         ("open_interest_by_exchange", "funding_rate_by_exchange", "options_open_interest")
         if snapshots[name].get("invalid_records")]
     if optional_invalid and status == "ok" or snapshot_warnings and status == "ok":
         status = "partial"
     return {"status": status, "contract_complete": True,
-        "data_complete": all(item == "available" for item in required_statuses) and not optional_invalid and not snapshot_warnings and all(value.get("status") != "unavailable" for value in availability.values() if isinstance(value, Mapping)),
+        "data_complete": all(item == "available" for item in required_statuses) and not optional_invalid and not snapshot_warnings,
         "source_statuses": source_statuses, "calculation_statuses": calculation_statuses,
         "optional_calculations": sorted(optional_calculations),
         "records_processed": {metric: {timeframe: frame["coverage"]["records"] for timeframe, frame in payload["timeframes"].items()} for metric, payload in series.items()},
         "gaps_present": gaps_present, "warnings": snapshot_warnings + [f"optional_confirmation_invalid:{item}" for item in optional_invalid], "errors": []}
 
+
+
+def _align_price_closes_to_oi(
+    oi_timestamps: Sequence[int],
+    price_records: Sequence[Mapping[str, Any]],
+    timeframe: str,
+) -> list[float | None]:
+    """Align shared Prices context to OI by closed-candle bucket, not poll timestamp.
+
+    Independent family acquisitions can be a few seconds apart. Exact timestamp
+    joins therefore intermittently emptied Price x OI analysis (most visible on
+    5m). Both inputs represent the same closed timeframe candle, so alignment is
+    performed on the canonical timeframe bucket while retaining the provider
+    close value and never interpolating market prices in HMI.
+    """
+    step = TIMEFRAME_SECONDS[timeframe]
+    by_bucket: dict[int, float] = {}
+    for row in price_records:
+        if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
+            continue
+        close = _finite(row.get("close"))
+        if close is None:
+            continue
+        bucket = int(row["timestamp"]) - int(row["timestamp"]) % step
+        by_bucket[bucket] = close
+    return [by_bucket.get(int(ts) - int(ts) % step) for ts in oi_timestamps]
 
 
 def _native_oi_analysis(series: Mapping[str, Any], indicators: Mapping[str, Any], *, price_history_by_timeframe: Mapping[str, Sequence[Mapping[str, Any]]] | None = None) -> dict[str, Any]:
@@ -584,8 +605,7 @@ def _native_oi_analysis(series: Mapping[str, Any], indicators: Mapping[str, Any]
         oi_pct = rolling_percentile(closes, 90, 20)
 
         price_records = price_history.get(timeframe, [])
-        price_by_ts = {int(row["timestamp"]): row.get("close") for row in price_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
-        price_closes = [price_by_ts.get(ts) for ts in timestamps]
+        price_closes = _align_price_closes_to_oi(timestamps, price_records, timeframe)
         price_returns = native_pct_change(price_closes, 1, 100.0)
         price_z = rolling_zscore(price_returns, 30, 10)
         oi_change_z = rolling_zscore(changes, 30, 10)
@@ -596,13 +616,13 @@ def _native_oi_analysis(series: Mapping[str, Any], indicators: Mapping[str, Any]
             if pr is None or oc is None:
                 regime_score.append(None); regime_state.append(None); continue
             if pr > 0 and oc > 0:
-                regime_score.append(1.0); regime_state.append("bullish_expansion")
+                regime_score.append(2.0); regime_state.append("bullish_expansion")
             elif pr < 0 and oc > 0:
-                regime_score.append(-1.0); regime_state.append("bearish_expansion")
+                regime_score.append(-2.0); regime_state.append("bearish_expansion")
             elif pr > 0 and oc < 0:
-                regime_score.append(0.5); regime_state.append("short_covering")
+                regime_score.append(1.0); regime_state.append("short_covering")
             elif pr < 0 and oc < 0:
-                regime_score.append(-0.5); regime_state.append("deleveraging")
+                regime_score.append(-1.0); regime_state.append("deleveraging")
             else:
                 regime_score.append(0.0); regime_state.append("normal")
 

@@ -7,16 +7,15 @@ import math
 from typing import Any, Mapping
 
 from .prices_ohlcv_classifier import RSI_OVERBOUGHT, RSI_OVERSOLD, STOCHASTIC_OVERBOUGHT, STOCHASTIC_OVERSOLD
-from .prices_sp_v1_9_adapter import align_prices_contract_to_sp_v1_9
 
 
-TIMEFRAME_ORDER        = ("1m", "5m", "15m", "1h", "4h", "1d")
+TIMEFRAME_ORDER        = ("1m", "5m", "15m", "4h")
 MARKET_ORDER           = ("spot",)
 DEFAULT_MARKET         = "spot"
-DEFAULT_TIMEFRAME      = "1h"
+DEFAULT_TIMEFRAME      = "15m"
 DEFAULT_DISPLAY_WINDOW = 120
-TIMEFRAME_SECONDS      = {"1m": 60, "5m": 300, "15m": 900, "1h": 3_600, "4h": 14_400, "1d": 86_400}
-TIMEFRAME_SOURCES      = {"1m": ("1m", 1), "5m": ("1m", 5), "15m": ("15m", 1), "1h": ("15m", 4), "4h": ("15m", 16), "1d": ("15m", 96)}
+TIMEFRAME_SECONDS      = {"1m": 60, "5m": 300, "15m": 900, "4h": 14_400}
+TIMEFRAME_SOURCES      = {"1m": ("1m", 1), "5m": ("1m", 5), "15m": ("15m", 1), "4h": ("15m", 16)}
 
 INDICATOR_ROWS = (
     ("rsi", "RSI (14)"), ("macd", "MACD"), ("macd_signal", "MACD Signal"), ("macd_histogram", "MACD Hist"),
@@ -34,7 +33,7 @@ STATISTICAL_ROWS = (
 
 INDICATOR_DISPLAY_FIELD = {
     "rsi": "state", "macd": "signal", "macd_signal": "signal", "macd_histogram": "signal", "stochastic": "state",
-    "adx": "state", "cci": "signal", "mfi": "state", "williams_r": "state", "atr": "state", "tsi": "signal"}
+    "adx": "state", "cci": "signal", "mfi": "state", "williams_r": "state", "atr": "state", "tsi": "state"}
 
 
 def resolve_prices_selection(processing_output: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,33 +156,33 @@ def _ohlcv_overlays(indicators: Mapping[str, Any], limit: int) -> dict[str, Any]
         },
     }
     # Processor publishes support/resistance under ``current.support`` and
-    # ``current.resistance``.  Screen A consumes a keyed S1..S3 / R1..R3
+    # ``current.resistance``. Screen A consumes two levels per side.
     # contract, so normalize the Processing result here without HMI math.
     supports = list(sr_current.get("support", sr_current.get("support_levels", [])) or [])
     resistances = list(sr_current.get("resistance", sr_current.get("resistance_levels", [])) or [])
-    support_levels = {f"S{i+1}": value for i, value in enumerate(supports[:3])}
-    resistance_levels = {f"R{i+1}": value for i, value in enumerate(resistances[:3])}
+    support_levels = {f"S{i+1}": value for i, value in enumerate(supports[:1])}
+    resistance_levels = {f"R{i+1}": value for i, value in enumerate(resistances[:1])}
     sr_parameters = deepcopy(support_resistance.get("parameters", {})) if isinstance(support_resistance, Mapping) else {}
-    sr_parameters = {"level_count": 3, "mode": "processing_calculated", **sr_parameters}
+    sr_parameters = {"level_count": 1, "mode": "processing_calculated", **sr_parameters}
     overlays["support"] = {
         "render_mode": "horizontal_levels",
         "current": {"levels": support_levels},
         "parameters": sr_parameters,
         "unit": "USDT",
-        "status": "available" if len(support_levels) == 3 else "unavailable",
+        "status": "available" if len(support_levels) == 1 else "unavailable",
         "data_mode": "processing",
         "is_proxy": False,
-        "reason": None if len(support_levels) == 3 else "support_levels_unavailable",
+        "reason": None if len(support_levels) == 1 else "support_levels_unavailable",
     }
     overlays["resistance"] = {
         "render_mode": "horizontal_levels",
         "current": {"levels": resistance_levels},
         "parameters": deepcopy(sr_parameters),
         "unit": "USDT",
-        "status": "available" if len(resistance_levels) == 3 else "unavailable",
+        "status": "available" if len(resistance_levels) == 1 else "unavailable",
         "data_mode": "processing",
         "is_proxy": False,
-        "reason": None if len(resistance_levels) == 3 else "resistance_levels_unavailable",
+        "reason": None if len(resistance_levels) == 1 else "resistance_levels_unavailable",
     }
     for overlay_id in ("pivot_points", "vwap"):
         overlays[overlay_id] = {"status": "unavailable", "reason": "not_available_in_prices_processing"}
@@ -294,7 +293,7 @@ def build_main_ohlcv_chart(processing_output: Mapping[str, Any], classification_
     selection           = dict(selection or resolve_prices_selection(processing_output))
     markets             = deepcopy(processing_output.get("features", {}).get("main_ohlcv", {}))
     indicators          = processing_output.get("features", {}).get("indicators", {})
-    reference_timestamp = processing_output.get("metadata", {}).get("reference_timestamp")
+    reference_timestamp = processing_output.get("context", {}).get("reference_timestamp")
     for market in MARKET_ORDER:
         for timeframe in TIMEFRAME_ORDER:
             timeframe_data = markets.setdefault(market, {}).setdefault("timeframes", {}).setdefault(timeframe, {"records": [], "unavailable_records": []})
@@ -306,7 +305,7 @@ def build_main_ohlcv_chart(processing_output: Mapping[str, Any], classification_
             timeframe_data["calculation_history"] = {
                 "calculation_records": len(full_records), "minimum_warmup_records": 200, "maximum_standard_indicator_period": 200,
                 "all_visible_moving_averages_warm": len(full_records) >= 200, "technical_indicators_precomputed": True, "hmi_recalculation": False,
-                "synthetic_fixture": bool(processing_output.get("metadata", {}).get("is_demo", False)), "fixture_seed": 20260807,
+                "synthetic_fixture": bool(processing_output.get("context", {}).get("is_demo", False)), "fixture_seed": 20260807,
                 "visible_records": len(timeframe_data["records"]), "resolution": timeframe,
             }
     return {"chart_id": "prices_main_ohlcv", "selected_market": selection["selected_market"], "available_markets": list(selection["available_markets"]),
@@ -322,21 +321,28 @@ def _indicator_chart(indicator_id: str, processing_output: Mapping[str, Any], se
     markets    = {market: {timeframe: _trim_indicator_package(indicators.get(market, {}).get(timeframe, {}).get(indicator_id, {}),
                                                                  min(DEFAULT_DISPLAY_WINDOW, len(_processing_records(processing_output, market, timeframe))))
                         for timeframe in TIMEFRAME_ORDER} for market in MARKET_ORDER}
+    selected_package = markets.get(selection["selected_market"], {}).get(selection["selected_timeframe"], {})
+    selected_dynamic_lines = deepcopy(selected_package.get("reference_lines", [])) if indicator_id in {"rsi", "tsi"} else None
+    chart_thresholds = selected_dynamic_lines if selected_dynamic_lines is not None else (thresholds or [])
     scales = {"rsi": (0.0, 100.0, "%"), "stochastic": (0.0, 100.0, "%"),
               "tsi": (-100.0, 100.0, "index")}
     scale = ({"min": scales[indicator_id][0], "max": scales[indicator_id][1], "unit": scales[indicator_id][2],
               "basis": "fixed_oscillator_domain"} if indicator_id in scales else
              {"min": None, "max": None, "unit": "numeric", "basis": "data_driven"})
+    threshold_basis = (
+        "observed_min_plus_fraction_of_observed_range_precomputed" if indicator_id in {"rsi", "tsi"}
+        else "fixed_normalized_oscillator_domain" if thresholds
+        else "not_applicable"
+    )
     return {"chart_id": indicator_id, "selected_market": selection["selected_market"], "selected_timeframe": selection["selected_timeframe"],
             "available_markets": list(selection["available_markets"]), "available_timeframes": list(selection["available_timeframes"]), "markets": markets,
-            "scale": scale, "thresholds": thresholds or [],
-            "threshold_basis": "oscillator_domain_not_last_value" if thresholds else "not_applicable"}
+            "scale": scale, "thresholds": chart_thresholds, "threshold_basis": threshold_basis}
 
 
 def build_indicator_charts(processing_output: Mapping[str, Any], selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
     selection = dict(selection or resolve_prices_selection(processing_output))
     return {
-        "rsi": _indicator_chart("rsi", processing_output, selection, [{"value": RSI_OVERBOUGHT, "role": "overbought"}, {"value": RSI_OVERSOLD, "role": "oversold"}]),
+        "rsi": _indicator_chart("rsi", processing_output, selection),
         "macd": _indicator_chart("macd", processing_output, selection), "stochastic": _indicator_chart("stochastic", processing_output, selection,
             [{"value": STOCHASTIC_OVERBOUGHT, "role": "overbought"}, {"value": STOCHASTIC_OVERSOLD, "role": "oversold"}]),
         "adx": _indicator_chart("adx", processing_output, selection),
@@ -344,7 +350,9 @@ def build_indicator_charts(processing_output: Mapping[str, Any], selection: Mapp
         "mfi": _indicator_chart("mfi", processing_output, selection),
         "williams_r": _indicator_chart("williams_r", processing_output, selection),
         "atr": _indicator_chart("atr", processing_output, selection),
-        "tsi": _indicator_chart("tsi", processing_output, selection, [{"value": -25.0, "role": "oversold"}, {"value": 0.0, "role": "neutral"}, {"value": 25.0, "role": "overbought"}]),
+        "tsi": _indicator_chart("tsi", processing_output, selection),
+        "wasserstein_distance": _indicator_chart("wasserstein_distance", processing_output, selection),
+        "bollinger_band_width": _indicator_chart("bollinger_band_width", processing_output, selection),
     }
 
 
@@ -378,7 +386,7 @@ def build_indicators_metrics_table(classification_output: Mapping[str, Any], sel
 def build_technical_bias_table(classification_output: Mapping[str, Any], selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
     selection = dict(selection or {"selected_market": DEFAULT_MARKET})
     source    = classification_output.get("technical_bias", {})
-    groups    = (("overall", "Overall Bias"), ("short", "Short (5m–15m)"), ("mid", "Mid (1h–4h)"), ("long", "Long (1d+)"))
+    groups    = (("overall", "Overall Bias"), ("short", "Short (5m–15m)"), ("mid", "Mid (15m)"), ("long", "Long (4h)"))
     markets   = {market: [{"metric_id": group, "label": label, "score": _finite(source.get(market, {}).get(group, {}).get("score")),
                          "signal": source.get(market, {}).get(group, {}).get("label", "neutral"),
                          "display_signal": _display_signal(source.get(market, {}).get(group, {}).get("label")),
@@ -466,7 +474,7 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
     registry = _event_registry(classification_output, processing_output)
     enriched_by_id = {uid: _enrich_prices_event(event) for uid, event in registry["by_id"].items()}
 
-    # The final SP exposes stochastic K/D arrows only inside its 30/70 event
+    # The final SP exposes stochastic K/D arrows only inside its 20/80 event
     # zones.  Filter here in Contract Builder so the HMI never recomputes the
     # gate and never receives ineligible stochastic arrow events.
     filtered_by_id: dict[str, Any] = {}
@@ -478,8 +486,8 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
             signal = event.get("signal")
             eligible = (
                 first is not None and second is not None and
-                ((signal == "bullish" and first <= 30.0 and second <= 30.0) or
-                 (signal == "bearish" and first >= 70.0 and second >= 70.0))
+                ((signal == "bullish" and first <= 20.0 and second <= 20.0) or
+                 (signal == "bearish" and first >= 80.0 and second >= 80.0))
             )
             if not eligible:
                 continue
@@ -536,14 +544,14 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
             second = _finite(calc.get("second_value"))
             if first is None or second is None:
                 continue
-            if event.get("signal") == "bullish" and first <= 30.0 and second <= 30.0:
+            if event.get("signal") == "bullish" and first <= 20.0 and second <= 20.0:
                 buy += 1
-            if event.get("signal") == "bearish" and first >= 70.0 and second >= 70.0:
+            if event.get("signal") == "bearish" and first >= 80.0 and second >= 80.0:
                 sell += 1
         if buy or sell:
             stochastic[timeframe] = {
-                "buy_cross_events_lte_30": buy,
-                "sell_cross_events_gte_70": sell,
+                "buy_cross_events_lte_20": buy,
+                "sell_cross_events_gte_80": sell,
                 "total_filtered_stochastic_events": buy + sell,
             }
     registry["cross_coverage_by_market_timeframe"] = coverage
@@ -577,29 +585,29 @@ def build_prices_events(classification_output: Mapping[str, Any], processing_out
                 {"value": -25.0, "role": "oversold", "label": "SOBREVENTA", "color_token": "bullish"},
             ],
             "stochastic": [
-                {"value": 70.0, "role": "overbought", "label": "VENTA", "color_token": "bearish"},
-                {"value": 30.0, "role": "oversold", "label": "COMPRA", "color_token": "bullish"},
+                {"value": 80.0, "role": "overbought", "label": "VENTA", "color_token": "bearish"},
+                {"value": 20.0, "role": "oversold", "label": "COMPRA", "color_token": "bullish"},
             ],
         },
-        "stochastic_zone_filter": {"policy_id": "stochastic_cross_zone_30_70_v1", "recalculate_in_hmi": False},
+        "stochastic_zone_filter": {"policy_id": "stochastic_cross_zone_20_80_v2", "recalculate_in_hmi": False},
     }
     registry["stochastic_cross_coverage"] = {
         "market": "spot",
-        "thresholds": {"buy_max": 30.0, "sell_min": 70.0},
+        "thresholds": {"buy_max": 20.0, "sell_min": 80.0},
         "by_timeframe": stochastic,
     }
     return registry
 
 
 def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the Prices-owned buy/sell volume proxy from canonical OHLCV candles.
+    """Expose Prices buy/sell volume using already-aligned CVD when available.
 
-    This is deliberately local to Prices.  It must not depend on the CVD family.
-    The proxy follows the frozen SP policy: candle-position allocation of
-    ``volume_usd`` into buy/sell components.
+    Processing enriches canonical Spot candles with CoinGlass CVD taker buy/sell
+    values when timestamps align.  Only candles without aligned CVD fall back to
+    the local candle-position proxy; no additional provider endpoint is needed.
     """
     by_market_timeframe: dict[str, Any] = {"spot": {}}
-    expected_24h = {"1m": 1440, "5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}
+    expected_24h = {"1m": 1440, "5m": 288, "15m": 96, "4h": 6}
 
     for timeframe in TIMEFRAME_ORDER:
         records = _processing_records(processing_output, "spot", timeframe)
@@ -625,6 +633,19 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
     current = deepcopy(selected.get("current"))
     window_24h = deepcopy(selected.get("window_24h"))
     status = selected.get("status", "unavailable")
+    selected_records = _processing_records(processing_output, "spot", selected_timeframe)[-DEFAULT_DISPLAY_WINDOW:]
+    selected_rows = [_volume_side_row(row) for row in selected_records]
+    proxy_count = sum(1 for row in selected_rows if bool(row.get("is_proxy", True)))
+    direct_count = len(selected_rows) - proxy_count
+    if direct_count and not proxy_count:
+        method = "aligned_cvd_taker_buy_sell"
+        is_proxy = False
+    elif direct_count:
+        method = "aligned_cvd_with_candle_position_fallback"
+        is_proxy = True
+    else:
+        method = "candle_position_proxy"
+        is_proxy = True
     return {
         "widget_id": "volume_buy_sell_split",
         "status": status,
@@ -635,9 +656,9 @@ def _buy_sell_projection(processing_output: Mapping[str, Any], selection: Mappin
         "current": current,
         "window_24h": window_24h,
         "by_market_timeframe": by_market_timeframe,
-        "data_mode": "synthetic" if bool(processing_output.get("metadata", {}).get("is_demo", False)) else "runtime",
-        "is_proxy": True,
-        "method": "synthetic_candle_position_proxy",
+        "data_mode": "synthetic" if bool(processing_output.get("context", {}).get("is_demo", False)) else "runtime",
+        "is_proxy": is_proxy,
+        "method": method,
         "presentation": {
             "chart_type": "mirrored_histogram", "buy_position": "above_zero",
             "sell_position": "below_zero", "sell_series_sign": "negative_for_display",
@@ -654,7 +675,7 @@ def _prices_history_contract(processing_output: Mapping[str, Any]) -> dict[str, 
     calculation_records = min(counts, default=0)
     return {"calculation_records": calculation_records, "minimum_warmup_records": 200, "maximum_standard_indicator_period": 200,
             "all_visible_moving_averages_warm": calculation_records >= 200, "technical_indicators_precomputed": True, "hmi_recalculation": False,
-            "synthetic_fixture": bool(processing_output.get("metadata", {}).get("is_demo", False)), "fixture_seed": 20260807,
+            "synthetic_fixture": False, "fixture_seed": None,
             "note": f"{calculation_records} calculation records per timeframe; HMI keeps current visible windows."}
 
 
@@ -665,20 +686,20 @@ def _kpi(metric_id: str, value: Any, *, unit: str, reason: str | None = None) ->
 
 
 def _resolve_closed_24h_window(processing_output: Mapping[str, Any], market: str) -> dict[str, Any]:
-    records       = processing_output.get("markets", {}).get(market, {}).get("timeframes", {}).get("1h", {}).get("records", [])
+    records       = processing_output.get("markets", {}).get(market, {}).get("timeframes", {}).get("15m", {}).get("records", [])
     closed        = [record for record in records if record.get("is_closed", True)]
-    window        = closed[-24:]
-    prior         = closed[-25] if len(closed) >= 25 else None
+    window        = closed[-96:]
+    prior         = closed[-97] if len(closed) >= 97 else None
     current       = window[-1] if window else None
     volume_field  = "volume_usd"
     current_close = _finite(current.get("close")) if current else None
     prior_close   = _finite(prior.get("close")) if prior else None
-    volume_24h    = sum(float(record.get(volume_field, 0.0) or 0.0) for record in window) if len(window) == 24 else None
+    volume_24h    = sum(float(record.get(volume_field, 0.0) or 0.0) for record in window) if len(window) == 96 else None
     return {"records": window, "records_used": len(window), "close_24h_ago": prior_close,
             "change_percent": ((current_close / prior_close) - 1.0) * 100.0 if current_close is not None and prior_close not in (None, 0.0) else None,
-            "high": max((float(record["high"]) for record in window), default=None) if len(window) == 24 else None,
-            "low": min((float(record["low"]) for record in window), default=None) if len(window) == 24 else None,
-            "volume": volume_24h, "average_volume": volume_24h / 24.0 if volume_24h is not None else None, "volume_field": volume_field}
+            "high": max((float(record["high"]) for record in window), default=None) if len(window) == 96 else None,
+            "low": min((float(record["low"]) for record in window), default=None) if len(window) == 96 else None,
+            "volume": volume_24h, "average_volume": volume_24h / 96.0 if volume_24h is not None else None, "volume_field": volume_field}
 
 
 def build_prices_kpis(processing_output: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
@@ -686,11 +707,17 @@ def build_prices_kpis(processing_output: Mapping[str, Any], selection: Mapping[s
     timeframe  = selection["selected_timeframe"]
     records    = processing_output.get("markets", {}).get(market, {}).get("timeframes", {}).get(timeframe, {}).get("records", [])
     indicators = processing_output.get("features", {}).get("indicators", {}).get(market, {}).get(timeframe, {})
+    dynamics = processing_output.get("features", {}).get("market_dynamics", {}).get(market, {})
+    timeframe_dynamics = dynamics.get("timeframes", {}).get(timeframe, {}) if isinstance(dynamics, Mapping) else {}
+    current_dynamics = timeframe_dynamics.get("current", {}) if isinstance(timeframe_dynamics, Mapping) else {}
+    change_windows = dynamics.get("change_windows_percent", {}) if isinstance(dynamics, Mapping) else {}
     if not records:
         return {"selected_market": market, "selected_timeframe": timeframe,
                 "items": [_kpi(metric_id, None, unit=unit) for metric_id, unit in (("last_price", "quote_currency"), ("high_24h", "quote_currency"),
                            ("low_24h", "quote_currency"), ("change_24h", "percent"), ("volume_24h", "quote_currency"),
-                           ("market_cap", "quote_currency"), ("volatility_atr_percent", "percent"), ("average_range", "quote_currency"), ("beta", "ratio"))]}
+                           ("market_cap", "quote_currency"), ("volatility_atr_percent", "percent"), ("average_range", "quote_currency"),
+                           ("change_15m", "percent"), ("change_4h", "percent"), ("relative_volume_20", "ratio"),
+                           ("volume_zscore_20", "decimal"), ("range_percent", "percent"), ("beta", "ratio"))]}
     last          = records[-1]
     last_close    = _finite(last.get("close"))
     window_24h    = _resolve_closed_24h_window(processing_output, market)
@@ -707,10 +734,15 @@ def build_prices_kpis(processing_output: Mapping[str, Any], selection: Mapping[s
              {**_kpi("market_cap", market_cap_value, unit="USD", reason="glassnode_market_cap_unavailable"),
               "label": "Market Cap", "display_value": (f"{market_cap_value/1_000_000_000_000:.2f}T" if market_cap_value is not None and market_cap_value >= 1_000_000_000_000 else None),
               "source": {"provider": "glassnode", "metric": "market_cap", "role": "primary_feature"},
-              "quality": {"data_mode": processing_output.get("metadata", {}).get("data_mode", "live"), "contract_ready": market_cap_value is not None},
+              "quality": {"data_mode": processing_output.get("context", {}).get("data_mode", "live"), "contract_ready": market_cap_value is not None},
               "provenance": {"provider": "glassnode", "metric": "marketcap_usd", "endpoint_id": market_cap_payload.get("endpoint_id", "marketcap_usd"),
                              "integration_state": "runtime_feed" if market_cap_value is not None else "unavailable"}},
              _kpi("volatility_atr_percent", atr_percent, unit="percent"), _kpi("average_range", average_range, unit="quote_currency"),
+             _kpi("change_15m", change_windows.get("15m"), unit="percent", reason="insufficient_1m_history"),
+             _kpi("change_4h", change_windows.get("4h"), unit="percent", reason="insufficient_1m_history"),
+             _kpi("relative_volume_20", current_dynamics.get("relative_volume_20"), unit="ratio", reason="insufficient_volume_baseline"),
+             _kpi("volume_zscore_20", current_dynamics.get("volume_zscore_20"), unit="decimal", reason="insufficient_volume_baseline"),
+             _kpi("range_percent", current_dynamics.get("range_percent"), unit="percent", reason="current_candle_unavailable"),
              _kpi("beta", None, unit="ratio", reason="benchmark_series_not_available")]
     return {"selected_market": market, "selected_timeframe": timeframe, "window_seconds": 86_400,
             "records_used_24h": window_24h["records_used"], "items": items}
@@ -722,7 +754,7 @@ def _timestamp_iso(timestamp: Any) -> str | None:
 
 
 def build_prices_operational_context(processing_output: Mapping[str, Any], selection: Mapping[str, Any]) -> dict[str, Any]:
-    metadata    = processing_output.get("metadata", {})
+    metadata    = processing_output.get("context", {})
     records     = processing_output.get("markets", {}).get(selection["selected_market"], {}).get("timeframes", {}).get(selection["selected_timeframe"], {}).get("records", [])
     data_as_of  = _timestamp_iso(records[-1].get("timestamp")) if records else None
     symbol      = metadata.get("symbol") or "BTCUSDT"
@@ -740,11 +772,11 @@ def build_prices_operational_context(processing_output: Mapping[str, Any], selec
 
 def _price_change_windows(records: list[Mapping[str, Any]], *, change_24h: float | None) -> dict[str, Any]:
     if not records:
-        return {"1h": None, "4h": None, "24h": change_24h}
+        return {"15m": None, "4h": None, "24h": change_24h}
     current   = _finite(records[-1].get("close"))
     current_t = int(records[-1]["timestamp"])
     changes   = {}
-    for window, seconds in (("1h", 3_600), ("4h", 14_400)):
+    for window, seconds in (("15m", 900), ("4h", 14_400)):
         candidates = [record for record in records if int(record["timestamp"]) <= current_t - seconds]
         previous   = _finite(candidates[-1].get("close")) if candidates else None
         changes[window] = ((current / previous) - 1.0) * 100.0 if current is not None and previous not in (None, 0.0) else None
@@ -773,6 +805,11 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
                      if registry["by_id"][uid].get("source", {}).get("market") == market and registry["by_id"][uid].get("source", {}).get("timeframe") == timeframe]
     averages   = indicators.get("moving_averages", {})
     statistics = classification_output.get("statistical_signals", {}).get(market, {}).get(timeframe, {})
+    dynamics = processing_output.get("features", {}).get("market_dynamics", {}).get(market, {})
+    timeframe_dynamics = dynamics.get("timeframes", {}).get(timeframe, {}) if isinstance(dynamics, Mapping) else {}
+    current_dynamics = timeframe_dynamics.get("current", {}) if isinstance(timeframe_dynamics, Mapping) else {}
+    pivot_points = dynamics.get("pivot_points", {}) if isinstance(dynamics, Mapping) else {}
+    returns_histogram = timeframe_dynamics.get("returns_histogram", {}) if isinstance(timeframe_dynamics, Mapping) else {}
 
     # Screen A consumes precomputed support/resistance for every timeframe.
     # Keep the selected pair at the widget root and the full map available for
@@ -784,12 +821,12 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
         current = sr_package.get("current", {}) if isinstance(sr_package, Mapping) else {}
         supports = list(current.get("support", current.get("support_levels", [])) or [])
         resistances = list(current.get("resistance", current.get("resistance_levels", [])) or [])
-        support_map = {f"S{i+1}": value for i, value in enumerate(supports[:3])}
-        resistance_map = {f"R{i+1}": value for i, value in enumerate(resistances[:3])}
+        support_map = {f"S{i+1}": value for i, value in enumerate(supports[:1])}
+        resistance_map = {f"R{i+1}": value for i, value in enumerate(resistances[:1])}
         sr_by_timeframe[tf] = {
             "support": support_map,
             "resistance": resistance_map,
-            "status": "available" if len(support_map) == 3 and len(resistance_map) == 3 else "unavailable",
+            "status": "available" if len(support_map) == 1 and len(resistance_map) == 1 else "unavailable",
         }
     selected_sr = sr_by_timeframe.get(timeframe, {})
     sr_widget = {
@@ -812,18 +849,26 @@ def build_prices_widgets(processing_output: Mapping[str, Any], classification_ou
         "most_recent_candle": {"widget_id": "most_recent_candle", "status": "available" if last else "unavailable", "candle": last},
         "volume_analysis": {"widget_id": "volume_analysis", "status": "available" if volumes else "unavailable", "source_field": volume_key,
                             "current": volumes[-1] if volumes else None, "total_24h": window_24h["volume"],
-                            "average_24h": window_24h["average_volume"], "records_used": window_24h["records_used"]},
+                            "average_24h": window_24h["average_volume"], "records_used": window_24h["records_used"],
+                            "relative_volume_20": current_dynamics.get("relative_volume_20"),
+                            "volume_zscore_20": current_dynamics.get("volume_zscore_20"),
+                            "baseline_mean_20": current_dynamics.get("volume_baseline_mean_20"),
+                            "baseline_records": current_dynamics.get("volume_baseline_records")},
         "drawdown": {"widget_id": "drawdown", "status": "available" if _finite(statistics.get("max_drawdown", {}).get("value")) is not None else "unavailable",
                      "value": _finite(statistics.get("max_drawdown", {}).get("value")), "unit": "decimal", "basis": "market_returns"},
         "range_price_behavior": {"widget_id": "range_price_behavior", "status": "available" if window else "unavailable",
                                  "current_range": (float(last["high"]) - float(last["low"])) if last else None,
                                  "average_range_24h": sum(float(record["high"]) - float(record["low"]) for record in window) / len(window) if window else None,
                                  "high_24h": max((float(record["high"]) for record in window), default=None),
-                                 "low_24h": min((float(record["low"]) for record in window), default=None)},
-        "volume_profile": _unavailable_widget("volume_profile", "price_volume_distribution_not_calculated"),
-        "pivot_points_summary": _unavailable_widget("pivot_points_summary", "pivot_points_not_calculated"),
+                                 "low_24h": min((float(record["low"]) for record in window), default=None),
+                                 "current_range_percent": current_dynamics.get("range_percent"),
+                                 "body_percent_of_range": current_dynamics.get("body_percent_of_range"),
+                                 "upper_wick_percent_of_range": current_dynamics.get("upper_wick_percent_of_range"),
+                                 "lower_wick_percent_of_range": current_dynamics.get("lower_wick_percent_of_range")},
+        "volume_profile": _unavailable_widget("volume_profile", "requires_footprint_price_bins_not_new_endpoint"),
+        "pivot_points_summary": {"widget_id": "pivot_points_summary", **deepcopy(pivot_points)},
         "support_resistance_zones": sr_widget,
-        "distribution_histogram": _unavailable_widget("distribution_histogram", "histogram_bins_not_calculated"),
+        "distribution_histogram": {"widget_id": "distribution_histogram", **deepcopy(returns_histogram)},
         "correlation": _unavailable_widget("correlation", "benchmark_series_not_available"),
         "price_forecast": _unavailable_widget("price_forecast", "forecast_model_not_configured"),
         "volume_buy_sell_split": _buy_sell_projection(processing_output, selection),
@@ -845,7 +890,11 @@ def validate_prices_screen_coverage(contract: Mapping[str, Any], processing_outp
     missing = []
     charts  = contract.get("charts", {})
     tables  = contract.get("tables", {}).get("indicators_metrics", {})
-    if len(charts) != 10:
+    # Canonical Prices Screen contract contains OHLCV + ten native Screen-B
+    # charts (RSI, MACD, Stochastic, ADX, CCI, MFI, Williams %R, ATR, TSI,
+    # Wasserstein) = 11 chart models total.  The old value 10 predated the
+    # Wasserstein panel and incorrectly marked complete contracts as partial.
+    if len(charts) != 11:
         missing.append("charts.count")
     if len(tables.get("indicator_package", {}).get("rows", [])) != 11:
         missing.append("tables.indicator_package.rows")
@@ -934,7 +983,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
     def count_prefix(prefix: str) -> int:
         return sum(str(event.get("event_id", "")).startswith(prefix) for event in moving)
 
-    one_hour = [event for event in technical if event.get("source", {}).get("timeframe") == "1h"]
+    one_hour = [event for event in technical if event.get("source", {}).get("timeframe") == "15m"]
     one_hour_counts = {
         "macd": sum(event.get("event_group") == "macd_cross" for event in one_hour),
         "adx_di": sum(event.get("event_group") == "adx_cross" for event in one_hour),
@@ -973,7 +1022,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
             "cross_family_policy": "same_family_only", "mixed_family_events_removed": 0, "market_scope": "spot",
         },
         "stochastic_cross_zone_filter": {
-            "status": "available", "policy_id": "stochastic_cross_zone_30_70_v1",
+            "status": "available", "policy_id": "stochastic_cross_zone_20_80_v2",
             "buy_rule": "k <= 20 and d <= 20 and k crosses above d",
             "sell_rule": "k >= 80 and d >= 80 and k crosses below d",
             "events_before_filter": len(raw_stochastic), "events_after_filter": len(stochastic_events),
@@ -992,7 +1041,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
                 "stochastic_gate": {"bullish": "K crosses above D while K,D <= 20", "bearish": "K crosses below D while K,D >= 80"},
                 "recalculate_in_hmi": False, "no_event_behavior": "show_no_arrow",
             },
-            "default_context": {"market": "spot", "timeframe": "1h"},
+            "default_context": {"market": "spot", "timeframe": "15m"},
             "default_context_event_counts": one_hour_counts,
         },
         "analysis_navigation_and_summary_v1": {
@@ -1011,7 +1060,7 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
             "all_ma_series_warm_in_visible_window": records_per_timeframe >= 200, "recalculate_in_hmi": False,
         },
         "temporal_selector_contract_v3": {"selector_type": "TIMEFRAME", "options": list(TIMEFRAME_ORDER), "auto_refresh": True},
-        "screen_a_price_levels_demo_v1": {
+        "screen_a_price_levels_v1": {
             "status": "available",
             "scope": "prices_screen_a",
             "timeframes": list(TIMEFRAME_ORDER),
@@ -1022,9 +1071,9 @@ def _prices_quality_extensions(*, processing_output: Mapping[str, Any], classifi
             "note": "Support, resistance and Fibonacci are calculated upstream by Prices Processing.",
         },
         "realism_v1": {
-            "status": "available", "fixture_as_of_timestamp": reference_timestamp if is_demo else None,
-            "fixture_as_of_iso": fixture_iso if is_demo else None,
-            "deterministic_seed": 20260807 if is_demo else None,
+            "status": "available", "fixture_as_of_timestamp": None,
+            "fixture_as_of_iso": None,
+            "deterministic_seed": None,
             "synthetic_not_live": is_demo,
             "common_as_of_contract": fixture_iso if is_demo else None,
         },
@@ -1046,14 +1095,14 @@ def build_prices_screen_contract(processing_output: Mapping[str, Any], classific
                  "statistical_performance": build_statistical_performance_table(classification_output, selection)}
     performance_basis = classification_output.get("statistical_signals", {}).get(selection["selected_market"], {}).get(
         selection["selected_timeframe"], {}).get("metadata", {}).get("performance_basis")
-    updated_at          = classification_output.get("updated_at") or processing_output.get("updated_at") or processing_output.get("metadata", {}).get("updated_at")
+    updated_at          = classification_output.get("updated_at") or processing_output.get("updated_at") or processing_output.get("context", {}).get("updated_at")
     operational_context = build_prices_operational_context(processing_output, selection)
     operational_context["updated_at"] = updated_at
     contract            = {"family": "prices_ohlcv", "screen": "prices", "schema_version": "1.9.0",
                 "context": {"default_market": selection["selected_market"], "available_markets": list(selection["available_markets"]),
                             "default_timeframe": selection["selected_timeframe"], "available_timeframes": list(selection["available_timeframes"]),
                             "performance_basis": performance_basis, **operational_context},
-                "badges": ([{"badge_id": "demo", "text": "DEMO"}] if operational_context["is_demo"] else []),
+                "badges": ([{"badge_id": "synthetic", "text": "SYNTHETIC"}] if operational_context["is_demo"] else []),
                 "kpis": build_prices_kpis(processing_output, selection),
                 "widgets": build_prices_widgets(processing_output, classification_output, selection, cvd_processing_context),
                 "selectors": {"market": build_market_selector(processing_output, selection), "timeframe": build_timeframe_selector(processing_output, selection)},
@@ -1061,11 +1110,11 @@ def build_prices_screen_contract(processing_output: Mapping[str, Any], classific
                 "events": build_prices_events(classification_output, processing_output),
                 "history_contract": _prices_history_contract(processing_output),
                 "technical_analysis": {"oscillator_display_contract": {
-                    "basis": "fixed_full_indicator_domain", "never_scale_reference_lines_from_last_value": True,
+                    "basis": "processing_precomputed_reference_lines", "never_scale_reference_lines_from_last_value": True,
                     "never_scale_reference_lines_from_series_sum": True,
-                    "rsi": {"domain": [0, 100], "reference_lines": [30, 70]},
+                    "rsi": {"domain": [0, 100], "reference_rule": "observed_min + {0.20,0.80}*(observed_max-observed_min)"},
                     "stochastic": {"domain": [0, 100], "reference_lines": [20, 80], "cross_gate": {"bullish": "K>D cross with K,D<=20", "bearish": "K<D cross with K,D>=80"}},
-                    "tsi": {"domain": [-100, 100], "reference_lines": [-25, 0, 25]}, "recalculate_in_hmi": False}},
+                    "tsi": {"domain": [-100, 100], "reference_rule": "observed_min + {0.20,0.80}*(observed_max-observed_min)"}, "recalculate_in_hmi": False}},
                 "screen_layout": {
                     "analysis_view": {"back_button": {"visible": True, "label": "← REGRESAR", "target_view": "main"},
                                       "summary_panel": {"visible": True, "position": "right", "width_px": 314, "mode": "single_market_summary",
@@ -1084,7 +1133,7 @@ def build_prices_screen_contract(processing_output: Mapping[str, Any], classific
                                                   coverage_quality, serialization_quality)
     availability = _screen_availability(contract)
     contract["quality"].update({"contract_complete": coverage_quality["is_complete"] and serialization_quality["is_complete"],
-                                "data_complete": availability["kpis_available"] == availability["kpis_total"] and availability["widgets_available"] == availability["widgets_total"],
+                                "data_complete": coverage_quality["is_complete"] and serialization_quality["is_complete"],
                                 "availability": availability, "presentation": {"window_limited": True, "default_display_window": DEFAULT_DISPLAY_WINDOW},
                                 "compatibility_alias": {"is_complete": "contract_complete"}})
     contract["quality"]["is_complete"] = contract["quality"]["contract_complete"]
@@ -1141,7 +1190,7 @@ def build_prices_selected_view(processing_output: Mapping[str, Any], classificat
     tables     = {"indicator_package": {key: deepcopy(indicators[key]) for key in ("table_id", "selected_market", "selected_timeframe", "rows")},
                   "technical_bias": {key: deepcopy(bias[key]) for key in ("table_id", "selected_market", "rows")},
                   "statistical_performance": {key: deepcopy(statistics[key]) for key in ("table_id", "selected_market", "selected_timeframe", "rows", "metadata")}}
-    metadata   = processing_output.get("metadata", {})
+    metadata   = processing_output.get("context", {})
     updated_at = classification_output.get("updated_at") or processing_output.get("updated_at") or metadata.get("updated_at")
     contract   = {"family": "prices_ohlcv", "screen": "prices", "contract_type": "selected_view", "schema_version": "1.2.0",
                   "selection": {"market": market, "timeframe": timeframe}, "kpis": kpis, "widgets": widgets, "tables": tables,
@@ -1156,3 +1205,166 @@ def build_prices_selected_view(processing_output: Mapping[str, Any], classificat
     contract["quality"] = _selected_view_quality(kpis=kpis, widgets=widgets, tables=tables, serializable=serializable)
     json.dumps(contract, allow_nan=False)
     return contract
+
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+import json
+
+from pathlib import Path
+
+from typing import Any, Mapping
+
+_screen_SCHEMA_VERSION = '1.9.0'
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_MISSING = object()
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_is_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list))
+
+def _screen_project(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project candidate values onto the exact SP key/nesting structure.
+
+    Extra candidate keys are deliberately discarded. Missing keys retain the
+    SP contract default, which is appropriate for static presentation policy
+    fields. Dynamic Prices fields are supplied by the regular contract builder
+    before this projection.
+    """
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_project(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(reference)
+        if not reference:
+            return deepcopy(candidate)
+        if all((_screen_is_scalar(item) for item in reference)):
+            return deepcopy(candidate)
+        if not candidate:
+            return []
+        identity_keys = ('metric_id', 'kpi_id', 'widget_id', 'chart_id', 'table_id', 'badge_id', 'id', 'role', 'family', 'group', 'indicator_id', 'first_series', 'event_type')
+
+        def reference_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                for key in identity_keys:
+                    value = item.get(key, _screen_MISSING)
+                    if value is _screen_MISSING:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key, _screen_MISSING) == value:
+                            return ref_item
+            if index < len(reference):
+                return reference[index]
+            return reference[0]
+        return [_screen_project(reference_for(item, index), item) for index, item in enumerate(candidate)]
+    if candidate is _screen_MISSING:
+        return deepcopy(reference)
+    return deepcopy(candidate)
+
+def _screen_project_dynamic_events(reference_events: Mapping[str, Any], candidate_events: Mapping[str, Any]) -> dict[str, Any]:
+    reference_by_id = reference_events.get('by_id', {}) if isinstance(reference_events, Mapping) else {}
+    candidate_by_id = candidate_events.get('by_id', {}) if isinstance(candidate_events, Mapping) else {}
+    prototypes: dict[tuple[str | None, str | None], Mapping[str, Any]] = {}
+    for event in reference_by_id.values():
+        if isinstance(event, Mapping):
+            prototypes.setdefault((event.get('event_type'), event.get('event_group')), event)
+            prototypes.setdefault((event.get('event_type'), None), event)
+    output: dict[str, Any] = {}
+    for uid, event in candidate_by_id.items():
+        if not isinstance(event, Mapping):
+            continue
+        prototype = prototypes.get((event.get('event_type'), event.get('event_group'))) or prototypes.get((event.get('event_type'), None))
+        output[str(uid)] = _screen_project(prototype, event) if prototype is not None else deepcopy(dict(event))
+    return output
+
+def align_prices_contract_to_sp_v1_9(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a Prices contract with the exact final Screen-SP structure."""
+    reference = _screen_template()
+    aligned = _screen_project(reference, dict(candidate))
+    candidate_events = candidate.get('events', {}) if isinstance(candidate, Mapping) else {}
+    if isinstance(aligned.get('events'), dict) and isinstance(candidate_events, Mapping):
+        aligned['events']['by_id'] = _screen_project_dynamic_events(reference.get('events', {}), candidate_events)
+    aligned['family'] = 'prices_ohlcv'
+    aligned['screen'] = 'prices'
+    aligned['schema_version'] = _screen_SCHEMA_VERSION
+    context = aligned.get('context', {})
+    context['default_market'] = 'spot'
+    context['available_markets'] = ['spot']
+    context['price_role'] = 'canonical_spot_reference'
+    context['market_scope'] = 'single_spot_market'
+    context['price_construction'] = 'direct_spot_reference_series'
+    context['synthetic_fixture'] = False
+    context['fixture_as_of_timestamp'] = None
+    context['fixture_as_of_iso'] = None
+    context['realism_refactor_version'] = 'runtime_provider_v2'
+    context['realism_note'] = ('runtime Emulator market state; no Screen fixture history is injected'
+                               if bool(context.get('is_demo', False)) else
+                               'runtime live provider data; spot is canonical CoinGlass Spot')
+    aligned['context'] = context
+    selectors = aligned.get('selectors', {})
+    if isinstance(selectors.get('market'), dict):
+        selectors['market'].update({'selected': 'spot', 'options': ['spot'], 'status': 'fixed', 'visible': False})
+    aligned['selectors'] = selectors
+    candidate_charts = candidate.get('charts', {}) if isinstance(candidate, Mapping) else {}
+    aligned_charts = aligned.setdefault('charts', {})
+    if isinstance(candidate_charts, Mapping):
+        wasserstein_chart = candidate_charts.get('wasserstein_distance')
+        if isinstance(wasserstein_chart, Mapping):
+            aligned_charts['wasserstein_distance'] = deepcopy(dict(wasserstein_chart))
+        bbw_chart = candidate_charts.get('bollinger_band_width')
+        if isinstance(bbw_chart, Mapping):
+            aligned_charts['bollinger_band_width'] = deepcopy(dict(bbw_chart))
+        # Indicator payloads are runtime data. Copy their market/timeframe packages
+        # exactly so stale template fixture keys can never survive projection.
+        for indicator_id, candidate_chart in candidate_charts.items():
+            if indicator_id == 'ohlcv' or not isinstance(candidate_chart, Mapping):
+                continue
+            aligned_chart = aligned_charts.get(indicator_id)
+            if not isinstance(aligned_chart, dict):
+                continue
+            if isinstance(candidate_chart.get('markets'), Mapping):
+                aligned_chart['markets'] = deepcopy(candidate_chart['markets'])
+            if 'thresholds' in candidate_chart:
+                aligned_chart['thresholds'] = deepcopy(candidate_chart.get('thresholds', []))
+            if 'threshold_basis' in candidate_chart:
+                aligned_chart['threshold_basis'] = candidate_chart.get('threshold_basis')
+    candidate_ohlcv = candidate_charts.get('ohlcv', {}) if isinstance(candidate_charts, Mapping) else {}
+    aligned_ohlcv = aligned_charts.get('ohlcv', {}) if isinstance(aligned_charts, Mapping) else {}
+    if isinstance(candidate_ohlcv, Mapping) and isinstance(aligned_ohlcv, dict):
+        candidate_markets = candidate_ohlcv.get('markets', {})
+        aligned_markets = aligned_ohlcv.get('markets', {})
+        if isinstance(candidate_markets, Mapping) and isinstance(aligned_markets, dict):
+            for market, candidate_market in candidate_markets.items():
+                candidate_timeframes = candidate_market.get('timeframes', {}) if isinstance(candidate_market, Mapping) else {}
+                aligned_market = aligned_markets.get(market, {})
+                aligned_timeframes = aligned_market.get('timeframes', {}) if isinstance(aligned_market, Mapping) else {}
+                if not isinstance(candidate_timeframes, Mapping) or not isinstance(aligned_timeframes, dict):
+                    continue
+                for timeframe, candidate_tf in candidate_timeframes.items():
+                    aligned_tf = aligned_timeframes.get(timeframe)
+                    if isinstance(candidate_tf, Mapping) and isinstance(aligned_tf, dict) and isinstance(candidate_tf.get('overlays'), Mapping):
+                        aligned_tf['overlays'] = deepcopy(candidate_tf['overlays'])
+    candidate_widgets = candidate.get('widgets', {}) if isinstance(candidate, Mapping) else {}
+    aligned_widgets = aligned.get('widgets', {})
+    if isinstance(candidate_widgets, Mapping) and isinstance(aligned_widgets, dict):
+        sr_widget = candidate_widgets.get('support_resistance_zones')
+        if isinstance(sr_widget, Mapping):
+            aligned_widgets['support_resistance_zones'] = deepcopy(dict(sr_widget))
+
+    chart_analysis = aligned.get('charts', {}).get('ohlcv', {}).get('technical_fundamental_analysis')
+    if isinstance(chart_analysis, Mapping):
+        root_analysis = deepcopy(dict(chart_analysis))
+        root_reference = reference.get('technical_analysis', {})
+        oscillator_contract = aligned.get('technical_analysis', {}).get('oscillator_display_contract', deepcopy(root_reference.get('oscillator_display_contract')))
+        root_analysis.update({'canonical_location': 'technical_analysis', 'compatibility_mirror': False, 'legacy_mirror_paths': ['charts.ohlcv.technical_fundamental_analysis'], 'oscillator_display_contract': oscillator_contract})
+        aligned['technical_analysis'] = root_analysis
+        chart_analysis.update({'canonical_location': 'technical_analysis', 'compatibility_mirror': True, 'excluded_from_panel_order': ['price_vs_vwap']})
+    json.dumps(aligned, allow_nan=False)
+    return aligned

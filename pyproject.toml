@@ -3,29 +3,17 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "signal_analysis"
-version = "0.1.0"
-description = "Reusable signal processing library for Fourier, Wavelet, TDA and Micro-Doppler."
-readme = "README.md"
+name = "tradelatin-vr1-processing"
+version = "4.2.2"
+description = "TradELATIN VR1 processing runtime."
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "pandas>=2.0", "requests>=2.31", "websocket-client>=1.8"]
-
-[project.optional-dependencies]
-tda = ["ripser>=0.6", "persim>=0.3"]
+dependencies = ["numpy>=1.24", "pandas>=2.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.ruff]
-line-length    = 160
-target-version = "py310"
-preview        = true
-
-[tool.ruff.lint]
-ignore = ["E221", "E241", "E272"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

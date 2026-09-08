@@ -1,0 +1,373 @@
+{
+  "family": "volatility_market_regimes",
+  "screen": "volatility_market_regimes",
+  "schema_version": "2.0.0-native-volatility-screen-b-runtime",
+  "context": {
+    "symbol": "BTC",
+    "asset": "BTC",
+    "default_display_range": "30d",
+    "selected_display_range": "30d",
+    "available_display_ranges": [
+      "7d",
+      "30d"
+    ],
+    "data_mode": "synthetic_calibrated",
+    "is_demo": false,
+    "generated_at": null,
+    "data_as_of": null,
+    "units": {
+      "volatility": "percent",
+      "volatility_points": "vol_points",
+      "skew": "vol_points",
+      "probability": "percent"
+    },
+    "screen_a_policy": "native_volatility_structure_no_classical_ta",
+    "screen_b_policy": "processing_precomputed_native_volatility_analytics",
+    "hmi_recalculate": false,
+    "raw_provider_targets": {
+      "realized_volatility": "derived_from_prices",
+      "dvol": "glassnode.dvol_ohlc",
+      "implied_volatility": "derived_from_dvol",
+      "term_structure": "derived_from_dvol",
+      "skew": "derived_from_dvol"
+    }
+  },
+  "badges": [
+    {
+      "badge_id": "ok",
+      "text": "OK"
+    }
+  ],
+  "selectors": {
+    "range": {
+      "options": [
+        {
+          "label": "7D",
+          "value": "7d"
+        },
+        {
+          "label": "30D",
+          "value": "30d"
+        }
+      ],
+      "selected": "30d"
+    }
+  },
+  "kpis": {
+    "items": [
+      {
+        "metric_id": "current_regime",
+        "label": "CURRENT REGIME",
+        "value": "—",
+        "display_value": "—",
+        "unit": "state",
+        "status": "unavailable"
+      },
+      {
+        "metric_id": "realized_vol_7d",
+        "label": "REALIZED VOL 7D",
+        "value": null,
+        "display_value": "—",
+        "unit": "percent",
+        "status": "unavailable"
+      },
+      {
+        "metric_id": "implied_vol_dvol",
+        "label": "IMPLIED VOL / DVOL",
+        "value": null,
+        "display_value": "—",
+        "unit": "percent",
+        "status": "unavailable"
+      },
+      {
+        "metric_id": "vol_risk_premium",
+        "label": "VOL RISK PREMIUM",
+        "value": null,
+        "display_value": "—",
+        "unit": "volatility_points",
+        "status": "unavailable"
+      },
+      {
+        "metric_id": "skew_25d",
+        "label": "25Δ SKEW",
+        "value": null,
+        "display_value": "—",
+        "unit": "volatility_points",
+        "status": "unavailable"
+      },
+      {
+        "metric_id": "regime_confidence",
+        "label": "REGIME CONFIDENCE",
+        "value": null,
+        "display_value": "—",
+        "unit": "decimal",
+        "status": "unavailable"
+      }
+    ]
+  },
+  "charts": {
+    "realized_volatility": {
+      "chart_id": "realized_volatility",
+      "title": "REALIZED VOLATILITY",
+      "status": "unavailable",
+      "unit": "percent",
+      "chart_type": "line",
+      "records": [],
+      "technical_analysis_allowed": false
+    },
+    "implied_volatility": {
+      "chart_id": "implied_volatility",
+      "title": "IMPLIED VOLATILITY / DVOL",
+      "status": "unavailable",
+      "unit": "percent",
+      "chart_type": "line",
+      "records": [],
+      "technical_analysis_allowed": false
+    },
+    "implied_vs_realized": {
+      "chart_id": "implied_vs_realized",
+      "title": "IMPLIED vs REALIZED / VRP",
+      "status": "unavailable",
+      "unit": "percent",
+      "chart_type": "multi_axis",
+      "records": [],
+      "technical_analysis_allowed": false
+    },
+    "term_structure": {
+      "chart_id": "term_structure",
+      "title": "IMPLIED VOLATILITY TERM STRUCTURE",
+      "status": "unavailable",
+      "unit": "percent",
+      "chart_type": "term_structure",
+      "records": [],
+      "technical_analysis_allowed": false
+    }
+  },
+  "volatility_analysis": {
+    "analysis_id": "volatility_native_screen_b",
+    "status": "available",
+    "recalculate_in_hmi": false,
+    "selector_contract": {
+      "volatility_level": [
+        {
+          "label": "Volatility Z-Score / Percentile",
+          "value": "volatility_zscore_percentile"
+        }
+      ],
+      "volatility_pricing": [
+        {
+          "label": "Volatility Risk Premium",
+          "value": "volatility_risk_premium"
+        }
+      ],
+      "options_structure": [
+        {
+          "label": "IV Term Structure / Slope",
+          "value": "term_structure_slope"
+        },
+        {
+          "label": "Volatility Skew / Tail Risk",
+          "value": "volatility_skew_tail_risk"
+        }
+      ],
+      "volatility_dynamics": [
+        {
+          "label": "Vol-of-Vol / Acceleration",
+          "value": "vol_of_vol_acceleration"
+        }
+      ],
+      "regime": [
+        {
+          "label": "Regime Shift / Wasserstein",
+          "value": "regime_shift_wasserstein"
+        }
+      ],
+      "excluded_classical_ta": [
+        "MACD",
+        "RSI",
+        "TSI",
+        "ADX",
+        "Stochastic",
+        "Williams %R",
+        "CCI",
+        "ATR",
+        "Bollinger Band Width",
+        "moving averages",
+        "Fibonacci",
+        "support/resistance"
+      ]
+    },
+    "indicators": {
+      "volatility_zscore_percentile": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "VOLATILITY LEVEL",
+        "label": "Volatility Z-Score / Percentile",
+        "timestamps": [],
+        "series": {
+          "rv_zscore": [],
+          "rv_percentile": []
+        },
+        "summary": {
+          "label": "Volatility Z-Score / Percentile",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      },
+      "volatility_risk_premium": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "VOLATILITY PRICING",
+        "label": "Volatility Risk Premium",
+        "timestamps": [],
+        "series": {
+          "vrp": [],
+          "vrp_zscore": []
+        },
+        "summary": {
+          "label": "Volatility Risk Premium",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      },
+      "term_structure_slope": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "OPTIONS STRUCTURE",
+        "label": "IV Term Structure / Slope",
+        "timestamps": [],
+        "series": {
+          "term_slope": [],
+          "term_curvature": []
+        },
+        "summary": {
+          "label": "IV Term Structure / Slope",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      },
+      "volatility_skew_tail_risk": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "OPTIONS STRUCTURE",
+        "label": "Volatility Skew / Tail Risk",
+        "timestamps": [],
+        "series": {
+          "skew_25d": [],
+          "upside_iv": [],
+          "downside_iv": []
+        },
+        "summary": {
+          "label": "Volatility Skew / Tail Risk",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      },
+      "vol_of_vol_acceleration": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "VOLATILITY DYNAMICS",
+        "label": "Vol-of-Vol / Acceleration",
+        "timestamps": [],
+        "series": {
+          "vol_of_vol": [],
+          "rv_acceleration": []
+        },
+        "summary": {
+          "label": "Vol-of-Vol / Acceleration",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      },
+      "regime_shift_wasserstein": {
+        "status": "unavailable",
+        "data_mode": null,
+        "processing_contract_target": true,
+        "real_market_calculation": false,
+        "hmi_recalculate": false,
+        "section": "REGIME",
+        "label": "Regime Shift / Wasserstein",
+        "timestamps": [],
+        "series": {
+          "wasserstein_distance": [],
+          "transition_probability": []
+        },
+        "summary": {
+          "label": "Regime Shift / Wasserstein",
+          "display_value": "UNAVAILABLE",
+          "signal": "UNAVAILABLE",
+          "strength": 0.0,
+          "value": null
+        },
+        "provenance": {
+          "producer": "Processing (target contract fixture)",
+          "source_inputs": "native volatility primitive series"
+        }
+      }
+    }
+  },
+  "quality": {
+    "data_mode": "processing_runtime",
+    "processing_contract_target": true,
+    "real_market_calculation": true,
+    "hmi_recalculate": false,
+    "records": 0,
+    "note": "DVOL is the only external volatility primitive; RV and displayed maturity analytics are computed in Processing. HMI does not recalculate."
+  },
+  "provenance": {
+    "screen_a": [
+      "realized_volatility",
+      "dvol",
+      "implied_volatility",
+      "options_term_structure"
+    ],
+    "screen_b": [
+      "processing.volatility_native_analytics"
+    ]
+  }
+}

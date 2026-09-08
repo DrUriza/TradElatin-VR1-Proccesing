@@ -12,14 +12,14 @@ CVD_VOLUME_ORDERFLOW_FAMILY = "cvd_volume_orderflow"
 PROCESSING_STAGE             = "processing"
 PROCESSING_VERSION           = "0.1.0"
 MARKETS                      = ("spot", "futures")
-BASE_TIMEFRAMES              = ("1m", "15m")
-TARGET_TIMEFRAMES            = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
-TIMEFRAME_SECONDS            = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
-SOURCE_TIMEFRAME             = {"1m": "1m", "5m": "1m", "15m": "15m", "30m": "15m", "1h": "15m", "4h": "15m", "1d": "15m"}
-SOURCE_FACTOR                = {"1m": 1, "5m": 5, "15m": 1, "30m": 2, "1h": 4, "4h": 16, "1d": 96}
+BASE_TIMEFRAMES              = ("5m", "15m")
+TARGET_TIMEFRAMES            = ("5m", "15m", "4h")
+TIMEFRAME_SECONDS            = {"5m": 300, "15m": 900, "4h": 14400}
+SOURCE_TIMEFRAME             = {"5m": "5m", "15m": "15m", "4h": "15m"}
+SOURCE_FACTOR                = {"5m": 1, "15m": 1, "4h": 16}
 DELTA_MA_PERIOD              = 21
 FLOW_EFFICIENCY_PERIOD       = 21
-FIXED_WINDOWS_SECONDS        = {"1h": 3600, "24h": 86400}
+FIXED_WINDOWS_SECONDS        = {"4h": 14400, "24h": 86400}
 
 
 def _sequence(value: Any) -> bool:
@@ -99,8 +99,10 @@ def resample_records(records: Sequence[Mapping[str, Any]], source_timeframe: str
     if any(not row["is_partial"] for row in output):
         while output and output[0]["is_partial"]:
             output.pop(0)
-        while output and output[-1]["is_partial"]:
-            output.pop()
+        # Keep the right-edge partial bucket: it is the live CVD bucket and
+        # must be replaced on each 15 s refresh.  Only the incomplete left
+        # bootstrap edge is discarded; interior partial buckets still break
+        # continuity.
     return output
 
 
@@ -199,6 +201,22 @@ def apply_rolling_features(records: Sequence[Mapping[str, Any]], period: int = D
     return output
 
 
+def directional_persistence(deltas: Sequence[float]) -> dict[str, Any]:
+    """Directional consistency of aggressive flow in [0, 1].
+
+    1.0 means every non-zero interval points the same way; values near zero
+    mean alternating/balanced flow.  This is derived only from contracted CVD
+    deltas and requires no additional provider data.
+    """
+    signs = [1 if value > 0 else -1 if value < 0 else 0 for value in deltas]
+    nonzero = [value for value in signs if value]
+    if not nonzero:
+        return {"value": None, "direction": "neutral", "status": "unavailable", "reason": "no_directional_delta"}
+    score = abs(sum(nonzero)) / len(nonzero)
+    net = sum(nonzero)
+    return {"value": score, "direction": "buy" if net > 0 else "sell" if net < 0 else "neutral", "status": "available", "reason": None}
+
+
 def build_fixed_window_summary(records_15m: Sequence[Mapping[str, Any]], window_name: str) -> dict[str, Any]:
     expected = FIXED_WINDOWS_SECONDS[window_name] // TIMEFRAME_SECONDS["15m"]
     selected = list(records_15m[-expected:])
@@ -211,6 +229,7 @@ def build_fixed_window_summary(records_15m: Sequence[Mapping[str, Any]], window_
         consecutive = consecutive and selected[-1]["timestamp"] - selected[0]["timestamp"] == (expected - 1) * TIMEFRAME_SECONDS["15m"]
     status, reason = ("available", None) if consecutive else (("partial", "incomplete_fixed_window") if selected else ("unavailable", "no_records"))
     return {**features, "flow_efficiency": _metric(abs(sum(deltas)) / denominator) if denominator else _metric(None, "zero_absolute_delta_path"),
+        "directional_persistence": directional_persistence(deltas),
         "records_expected": expected, "records_used": len(selected), "coverage_complete": consecutive,
         "first_timestamp": selected[0]["timestamp"] if selected else None, "last_timestamp": selected[-1]["timestamp"] if selected else None,
         "status": status, "reason": reason}
@@ -264,6 +283,7 @@ class CvdVolumeOrderflowFeatureBuilder:
     build_cvd_bars              = staticmethod(build_cvd_bars)
     apply_rolling_features      = staticmethod(apply_rolling_features)
     build_fixed_window_summary  = staticmethod(build_fixed_window_summary)
+    directional_persistence     = staticmethod(directional_persistence)
     build_footprint_vwap        = staticmethod(build_footprint_vwap)
     build_price_vs_vwap         = staticmethod(build_price_vs_vwap)
 

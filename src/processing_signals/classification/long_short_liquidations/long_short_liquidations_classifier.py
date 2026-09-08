@@ -19,12 +19,12 @@ CANONICAL_REASONS = {
     "conflicting_realized_and_estimated_sides", "no_clusters_detected", "classification_not_applicable",
     "missing_processing_feature",
 }
-REQUIRED = ["realized_side_regime_1h", "realized_side_regime_24h",
+REQUIRED = ["realized_side_regime_4h", "realized_side_regime_24h",
             "exchange_concentration_regime", "event_activity_regime_15m"]
 OPTIONAL = ["pressure_regime", "realized_side_regime_4h", "realized_side_regime_12h", "estimated_side_regime",
             "aggregate_map_concentration_regime", "estimated_long_concentration_regime",
             "estimated_short_concentration_regime", "cluster_regime", "provider_confirmation_regime",
-            "max_pain_proximity_regime", "event_activity_regime_1h", "composite_regime"]
+            "max_pain_proximity_regime", "event_activity_regime_4h", "composite_regime"]
 
 
 def _invalid(path: str) -> ValueError:
@@ -177,7 +177,7 @@ def _imbalance(feature: Mapping[str, Any], path: str, estimated: bool) -> dict[s
                  classify=classify, evidence=evidence)
 
 
-def classify_realized_side_regime(feature: Mapping[str, Any], *, source_path: str = "realized.windows.1h.imbalance") -> dict[str, Any]:
+def classify_realized_side_regime(feature: Mapping[str, Any], *, source_path: str = "realized.windows.4h.imbalance") -> dict[str, Any]:
     return _imbalance(feature, source_path, False)
 
 
@@ -416,10 +416,10 @@ def _blocked_result(timestamp: int, configuration: Mapping[str, Any], quality: M
     def atom(path=None):
         return _not_applicable(path, reason)
     classifications = {"pressure": atom("pressure.score"),
-        "realized_side": {window: atom(f"realized.windows.{window}.imbalance.value") for window in ("1h", "4h", "12h", "24h")},
+        "realized_side": {window: atom(f"realized.windows.{window}.imbalance.value") for window in ("4h", "12h", "24h")},
         "estimated_side": atom("maps.aggregated.estimated_side_imbalance.value"),
         "events": {"15m": atom("pressure.components.event_intensity.value"),
-                   "1h": _not_applicable("events.aggregate.1h.event_usd_total", "missing_processing_feature")},
+                   "4h": _not_applicable("events.aggregate.4h.event_usd_total", "missing_processing_feature")},
         "concentration": {"exchanges": atom("exchange_distribution.concentration.top3_share"),
             "aggregate_map": atom("maps.aggregated.concentration.complete_map.top3_share"),
             "estimated_long": atom("maps.aggregated.concentration.estimated_long.top3_share"),
@@ -457,7 +457,7 @@ def classify_long_short_liquidations(processing_contract: Mapping[str, Any], *,
     pressure = _mapping(_at(contract, "pressure"), "pressure")
     pressure_feature = {"value": pressure.get("score"), "status": pressure.get("status"), "reason": pressure.get("reason"), "provenance": pressure.get("provenance", {})}
     realized = {}
-    for window in ("1h", "4h", "12h", "24h"):
+    for window in ("4h", "12h", "24h"):
         feature = _mapping(_at(contract, f"realized.windows.{window}.imbalance"), f"realized.windows.{window}.imbalance")
         atom = classify_realized_side_regime(feature, source_path=f"realized.windows.{window}.imbalance.value")
         coverage = _number(_at(contract, f"realized.windows.{window}.coverage_ratio"), f"realized.windows.{window}.coverage_ratio")
@@ -469,9 +469,9 @@ def classify_long_short_liquidations(processing_contract: Mapping[str, Any], *,
     estimated = classify_estimated_side_regime(estimated_feature)
     event_feature = _mapping(_at(contract, "pressure.components.event_intensity"), "pressure.components.event_intensity")
     event15 = classify_event_activity_regime(event_feature)
-    event1_source = _at(contract, "events.aggregate.1h", required=False)
-    event1_value = event1_source.get("event_usd_total") if isinstance(event1_source, Mapping) else None
-    event1 = _not_applicable("events.aggregate.1h.event_usd_total", "missing_processing_feature", value=event1_value)
+    event4_source = _at(contract, "events.aggregate.4h", required=False)
+    event4_value = event4_source.get("event_usd_total") if isinstance(event4_source, Mapping) else None
+    event4 = _not_applicable("events.aggregate.4h.event_usd_total", "missing_processing_feature", value=event4_value)
     exchange_conc = classify_concentration_regime(_mapping(_at(contract, "exchange_distribution.concentration"), "exchange_distribution.concentration"), source_path="exchange_distribution.concentration")
     map_conc = _mapping(_at(contract, "maps.aggregated.concentration"), "maps.aggregated.concentration")
     def optional_map_concentration(name: str) -> dict[str, Any]:
@@ -495,11 +495,11 @@ def classify_long_short_liquidations(processing_contract: Mapping[str, Any], *,
     max_pain["evidence"].update({key: deepcopy(max_source.get(key)) for key in ("long_distance_bps", "short_distance_bps", "provider_price", "long_max_pain_price", "short_max_pain_price")})
     composite = _not_applicable(None, "classification_not_applicable", evidence={"implementation_version": None, "approved": False})
     classifications = {"pressure": classify_pressure_regime(pressure_feature), "realized_side": realized,
-                       "estimated_side": estimated, "events": {"15m": event15, "1h": event1},
+                       "estimated_side": estimated, "events": {"15m": event15, "4h": event4},
                        "concentration": concentrations, "clusters": clusters, "confirmations": confirmations,
                        "max_pain": max_pain, "composite_regime": composite}
     atoms = {"pressure_regime": classifications["pressure"], **{f"realized_side_regime_{key}": value for key, value in realized.items()},
-             "estimated_side_regime": estimated, "event_activity_regime_15m": event15, "event_activity_regime_1h": event1,
+             "estimated_side_regime": estimated, "event_activity_regime_15m": event15, "event_activity_regime_4h": event4,
              "exchange_concentration_regime": concentrations["exchanges"], "aggregate_map_concentration_regime": concentrations["aggregate_map"],
              "estimated_long_concentration_regime": concentrations["estimated_long"], "estimated_short_concentration_regime": concentrations["estimated_short"],
              "cluster_regime": clusters, "provider_confirmation_regime": _not_applicable(None, "classification_not_applicable") if not confirmations else

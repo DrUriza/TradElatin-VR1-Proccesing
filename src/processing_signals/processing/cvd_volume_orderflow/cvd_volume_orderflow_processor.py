@@ -10,9 +10,16 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
-from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
-from processing_signals.processing.math.native_analysis import (difference, rolling_zscore, rolling_wasserstein, interpolated_cross, latest, finite)
-from processing_signals.processing.math.indicators.trend.moving_averages import ema, sma, wma
+from .cvd_volume_orderflow_math import detect_cross_pairs
+from .cvd_volume_orderflow_math import (
+    difference,
+    rolling_zscore,
+    rolling_wasserstein,
+    interpolated_cross,
+    latest,
+    finite,
+)
+from .cvd_volume_orderflow_math import ema, sma, wma
 
 
 from .cvd_volume_orderflow_feature_builder import (
@@ -35,6 +42,59 @@ def _clock_timestamp(clock: Callable[[], Any] | None) -> int:
 
 def _iso_utc(value: int) -> str:
     return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _aligned_difference(
+    own_timestamps: Sequence[int], own_values: Sequence[float | None],
+    peer_timestamps: Sequence[int], peer_values: Sequence[float | None],
+) -> list[float | None]:
+    """Subtract peer values only where both market timestamps overlap."""
+    peer_by_timestamp = dict(zip(peer_timestamps, peer_values, strict=True))
+    return [
+        None if own is None or peer_by_timestamp.get(timestamp) is None
+        else float(own) - float(peer_by_timestamp[timestamp])
+        for timestamp, own in zip(own_timestamps, own_values, strict=True)
+    ]
+
+
+def _price_records_with_spot_fallback(
+    price_history: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+    market: str,
+    timeframe: str,
+) -> Sequence[Mapping[str, Any]]:
+    """Return a usable market price series, falling back to canonical Spot.
+
+    The frozen Prices family exposes Spot OHLC as its canonical BTC price and
+    keeps a Futures branch in the input contract for schema compatibility.  In
+    emulator mode that Futures branch is intentionally empty.  CVD Futures is
+    still a real, independent flow series, so its Price/CVD divergence must use
+    the canonical Spot price rather than turning the whole indicator into
+    ``null`` values.
+
+    A future provider can supply native Futures OHLC: when it contains at least
+    one timestamped close it remains preferred and no fallback occurs.
+    """
+
+    def records_for(candidate_market: str) -> Sequence[Mapping[str, Any]]:
+        market_history = price_history.get(candidate_market, {})
+        if not isinstance(market_history, Mapping):
+            return ()
+        records = market_history.get(timeframe, ())
+        if not _sequence(records):
+            return ()
+        return records
+
+    preferred = records_for(market)
+    if any(
+        isinstance(row, Mapping)
+        and row.get("timestamp") is not None
+        and isinstance(row.get("close"), (int, float))
+        and not isinstance(row.get("close"), bool)
+        and math.isfinite(float(row["close"]))
+        for row in preferred
+    ):
+        return preferred
+    return records_for("spot")
 
 
 class CvdVolumeOrderflowProcessor:
@@ -241,7 +301,9 @@ class CvdVolumeOrderflowProcessor:
             "thresholds": [{"value": 0.0, "role": "neutral"}],
             "current": current,
             "summary": {"section": section, "label": label, "display_value": None if primary is None else f"{primary:.3f}",
-                        "signal": signal, "signal_color": signal, "strength": strength},
+                        "signal": signal,
+                        "signal_color": {"positive": "#20d05c", "negative": "#ff3d55", "neutral": "#ffab00", "unavailable": "#59636b"}.get(signal, "#22c7e8"),
+                        "strength": strength},
             "calculation_owner": "Processing", "recalculate_in_hmi": False, "unit": unit,
         }
 
@@ -255,11 +317,13 @@ class CvdVolumeOrderflowProcessor:
 
         # Precompute normalized Spot/Futures CVD changes used by divergence.
         cvd_change_z: dict[str, dict[str, list[float | None]]] = {market: {} for market in MARKETS}
+        cvd_timestamps: dict[str, dict[str, list[int]]] = {market: {} for market in MARKETS}
         for market in MARKETS:
             for timeframe in TARGET_TIMEFRAMES:
                 records = markets[market]["timeframes"][timeframe]["records"][-730:]
                 closes = [row.get("cvd_ohlc_usd", {}).get("close") for row in records]
                 cvd_change_z[market][timeframe] = rolling_zscore(difference(closes), 30, 10)
+                cvd_timestamps[market][timeframe] = [int(row["timestamp"]) for row in records]
 
         for market in MARKETS:
             for timeframe in TARGET_TIMEFRAMES:
@@ -331,11 +395,14 @@ class CvdVolumeOrderflowProcessor:
                 delta_z = rolling_zscore(deltas, 30, 10)
                 own_cvd_z = cvd_change_z[market][timeframe]
                 other = "futures" if market == "spot" else "spot"
-                cross_div = []
-                for own, peer in zip(cvd_change_z["spot"][timeframe], cvd_change_z["futures"][timeframe], strict=True):
-                    cross_div.append(None if own is None or peer is None else float(own) - float(peer))
+                cross_div = _aligned_difference(
+                    timestamps, own_cvd_z,
+                    cvd_timestamps[other][timeframe], cvd_change_z[other][timeframe],
+                )
 
-                price_records = price_history.get(market, {}).get(timeframe, [])
+                price_records = _price_records_with_spot_fallback(
+                    price_history, market, timeframe
+                )
                 price_by_ts = {int(row["timestamp"]): row.get("close") for row in price_records if isinstance(row, Mapping) and row.get("timestamp") is not None}
                 price_closes = [price_by_ts.get(ts) for ts in timestamps]
                 price_z = rolling_zscore(difference(price_closes), 30, 10)
@@ -374,14 +441,14 @@ class CvdVolumeOrderflowProcessor:
     def build_cross_market(self, markets: Mapping[str, Any]) -> dict[str, Any]:
         """Build KPI-level cross-market flow without collapsing Spot/Futures charts."""
         windows: dict[str, Any] = {}
-        for window in ("1h", "24h"):
+        for window in ("4h", "24h"):
             spot = markets["spot"]["window_summaries"][window]
             futures = markets["futures"]["window_summaries"][window]
             buy = float(spot.get("taker_buy_volume_usd", 0.0) or 0.0) + float(futures.get("taker_buy_volume_usd", 0.0) or 0.0)
             sell = float(spot.get("taker_sell_volume_usd", 0.0) or 0.0) + float(futures.get("taker_sell_volume_usd", 0.0) or 0.0)
             features = volume_features(buy, sell)
 
-            expected = 4 if window == "1h" else 96
+            expected = 4 if window == "4h" else 96
             spot_rows = markets["spot"]["timeframes"]["15m"]["records"][-expected:]
             futures_rows = markets["futures"]["timeframes"]["15m"]["records"][-expected:]
             spot_by_ts = {row["timestamp"]: row for row in spot_rows}
@@ -397,20 +464,21 @@ class CvdVolumeOrderflowProcessor:
                 **features,
                 "flow_efficiency": {"value": efficiency, "status": "available" if efficiency is not None else "unavailable",
                     "reason": None if efficiency is not None else "zero_absolute_delta_path"},
+                "directional_persistence": self.feature_builder.directional_persistence(combined_deltas),
                 "records_expected": expected, "records_used": len(timestamps), "coverage_complete": complete,
                 "first_timestamp": timestamps[0] if timestamps else None, "last_timestamp": timestamps[-1] if timestamps else None,
                 "status": status, "reason": None if status == "available" else "cross_market_window_incomplete",
             }
 
-        spot_1h = markets["spot"]["window_summaries"]["1h"]
-        futures_1h = markets["futures"]["window_summaries"]["1h"]
-        spot_volume = float(spot_1h.get("total_volume_usd", 0.0) or 0.0)
-        futures_volume = float(futures_1h.get("total_volume_usd", 0.0) or 0.0)
+        spot_4h = markets["spot"]["window_summaries"]["4h"]
+        futures_4h = markets["futures"]["window_summaries"]["4h"]
+        spot_volume = float(spot_4h.get("total_volume_usd", 0.0) or 0.0)
+        futures_volume = float(futures_4h.get("total_volume_usd", 0.0) or 0.0)
         ratio = None if spot_volume <= 0 else futures_volume / spot_volume
         ratio_status = "available" if ratio is not None else "unavailable"
 
-        spot_fp = markets["spot"]["footprint_summaries"]["1h"]
-        futures_fp = markets["futures"]["footprint_summaries"]["1h"]
+        spot_fp = markets["spot"]["footprint_summaries"]["4h"]
+        futures_fp = markets["futures"]["footprint_summaries"]["4h"]
         base = float(spot_fp.get("base_volume", 0.0) or 0.0) + float(futures_fp.get("base_volume", 0.0) or 0.0)
         quote = float(spot_fp.get("quote_volume", 0.0) or 0.0) + float(futures_fp.get("quote_volume", 0.0) or 0.0)
         vwap = None if base <= 0 else quote / base
@@ -425,51 +493,13 @@ class CvdVolumeOrderflowProcessor:
         }
         return {
             "window_summaries": windows,
-            "volume_ratios": {"futures_vs_spot": {"1h": {
+            "volume_ratios": {"futures_vs_spot": {"4h": {
                 "value": ratio, "status": ratio_status, "reason": None if ratio_status == "available" else "spot_volume_zero",
                 "futures_volume_usd": futures_volume, "spot_volume_usd": spot_volume,
-                "timestamp": max(spot_1h.get("last_timestamp") or 0, futures_1h.get("last_timestamp") or 0) or None,
+                "timestamp": max(spot_4h.get("last_timestamp") or 0, futures_4h.get("last_timestamp") or 0) or None,
             }}},
-            "footprint_summaries": {"1h": footprint},
+            "footprint_summaries": {"4h": footprint},
         }
-
-    @staticmethod
-    def build_provider_reconciliation(input_contract: Mapping[str, Any], markets: Mapping[str, Any]) -> dict[str, Any]:
-        """Keep provider roles explicit without changing Spot/Futures visual semantics."""
-        output: dict[str, Any] = {
-            "policy": {
-                "spot_cvd_semantic_primary": "glassnode",
-                "granular_candle_source": "coinglass",
-                "futures_flow_primary": "coinglass",
-                "futures_glassnode_mapping": "pending_schema_verification",
-                "hmi_ohlc_owner": "Processing",
-            },
-            "spot": {}, "futures": {},
-        }
-        confirmations = input_contract.get("markets", {}).get("spot", {}).get("confirmations", {}).get("glassnode", {})
-        derived_1h = markets.get("spot", {}).get("timeframes", {}).get("1h", {}).get("records", [])
-        derived_by_ts = {row.get("timestamp"): row for row in derived_1h if isinstance(row, Mapping)}
-        for metric in ("spot_cvd_sum", "spot_vd_sum", "spot_buying_volume_sum", "spot_selling_volume_sum"):
-            payload = confirmations.get(metric, {}) if isinstance(confirmations, Mapping) else {}
-            records = payload.get("records", []) if isinstance(payload, Mapping) else []
-            matched = 0
-            for row in records:
-                if isinstance(row, Mapping) and row.get("timestamp") in derived_by_ts:
-                    matched += 1
-            output["spot"][metric] = {
-                "status": payload.get("status", "unavailable") if isinstance(payload, Mapping) else "unavailable",
-                "reason": payload.get("reason") if isinstance(payload, Mapping) else "source_unavailable",
-                "records": len(records) if isinstance(records, list) else 0, "matched_1h_records": matched,
-                "provider": "glassnode",
-            }
-        cq = input_contract.get("markets", {}).get("futures", {}).get("confirmations", {}).get("cryptoquant", {})
-        output["futures"]["cryptoquant_taker_buy_sell"] = {
-            "status": cq.get("status", "unavailable") if isinstance(cq, Mapping) else "unavailable",
-            "reason": cq.get("reason") if isinstance(cq, Mapping) else "source_unavailable",
-            "records": len(cq.get("records", [])) if isinstance(cq, Mapping) and isinstance(cq.get("records"), list) else 0,
-            "provider": "cryptoquant",
-        }
-        return output
 
     def evaluate_availability(self, records: Sequence[Mapping[str, Any]], *, input_status: str = "available",
                               alignment_complete: bool = True) -> tuple[str, str | None]:
@@ -519,19 +549,19 @@ class CvdVolumeOrderflowProcessor:
             source = SOURCE_TIMEFRAME[target]
             input_status = input_market["cvd"]["timeframes"][source].get("status", "available")
             timeframes[target] = self._timeframe_contract(target, features[target], input_status=input_status)
-        summaries = {name: self.feature_builder.build_fixed_window_summary(timeframes["15m"]["records"], name) for name in ("1h", "24h")}
+        summaries = {name: self.feature_builder.build_fixed_window_summary(timeframes["15m"]["records"], name) for name in ("4h", "24h")}
         footprint = self.feature_builder.build_footprint_vwap(input_market.get("footprint"))
         availability = {"timeframes": {target: {"status": payload["status"], "reason": payload["reason"]} for target, payload in timeframes.items()},
             "window_summaries": {name: {"status": payload["status"], "reason": payload["reason"]} for name, payload in summaries.items()},
             "footprint_vwap": {"status": footprint["status"], "reason": footprint["reason"]}}
-        return {"timeframes": timeframes, "window_summaries": summaries, "footprint_summaries": {"1h": footprint},
+        return {"timeframes": timeframes, "window_summaries": summaries, "footprint_summaries": {"4h": footprint},
             "price_vs_vwap": {}, "availability": availability}
 
     def evaluate_quality(self, markets: Mapping[str, Any], input_quality: Mapping[str, Any]) -> dict[str, Any]:
         core = [markets[market]["timeframes"][timeframe]["status"] for market in MARKETS for timeframe in TARGET_TIMEFRAMES]
-        enrichments = [markets[market]["footprint_summaries"]["1h"]["status"] for market in MARKETS]
+        enrichments = [markets[market]["footprint_summaries"]["4h"]["status"] for market in MARKETS]
         enrichments.extend(markets[market]["price_vs_vwap"]["status"] for market in MARKETS)
-        summaries = [markets[market]["window_summaries"][window]["status"] for market in MARKETS for window in ("1h", "24h")]
+        summaries = [markets[market]["window_summaries"][window]["status"] for market in MARKETS for window in ("4h", "24h")]
         no_safe_base = all(markets[market]["timeframes"][timeframe]["status"] == "unavailable"
             for market in ("spot", "futures") for timeframe in BASE_TIMEFRAMES)
         core_status = "invalid" if no_safe_base or "invalid" in core or input_quality.get("status") == "invalid" else (
@@ -560,16 +590,14 @@ class CvdVolumeOrderflowProcessor:
             raise ValueError("invalid_price_reference_markets")
         for market in MARKETS:
             markets[market]["price_vs_vwap"] = self.feature_builder.build_price_vs_vwap(
-                markets[market]["footprint_summaries"]["1h"], references.get(market))
+                markets[market]["footprint_summaries"]["4h"], references.get(market))
             markets[market]["availability"]["price_vs_vwap"] = {"status": markets[market]["price_vs_vwap"]["status"],
                 "reason": markets[market]["price_vs_vwap"]["reason"]}
         cross_market = self.build_cross_market(markets)
-        provider_reconciliation = self.build_provider_reconciliation(input_contract, markets)
         quality = self.evaluate_quality(markets, input_contract.get("quality", {}))
         return {"family": CVD_VOLUME_ORDERFLOW_FAMILY, "stage": PROCESSING_STAGE, "version": PROCESSING_VERSION,
             "mode": input_contract["mode"], "context": self.build_context(input_contract, processing_timestamp),
             "parameters": self.build_parameters(), "markets": markets, "cross_market": cross_market,
-            "provider_reconciliation": provider_reconciliation,
             "technical_analysis": self.build_technical_analysis(markets, price_history_by_market_timeframe=price_history_by_market_timeframe), "quality": quality}
 
 

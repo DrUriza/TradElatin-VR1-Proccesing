@@ -23,14 +23,9 @@ from .long_short_liquidations_data_raw_extract import (
     DEFAULT_MAX_PAIN_RANGE,
     DEFAULT_MIN_EVENT_USD,
     ENDPOINT_MANIFEST,
-    GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID,
-    GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
-    GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
-    GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
-    COINGLASS_TOP_POSITION_ENDPOINT_ID,
-    COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
     COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID,
     POSITIONING_TIMEFRAMES,
+    PUBLIC_MAP_RANGES,
     LONG_SHORT_LIQUIDATIONS_FAMILY,
     VALID_MODES,
     LongShortLiquidationsRawExtractor,
@@ -40,7 +35,6 @@ from .long_short_liquidations_data_raw_extract import (
 
 DATASET_STATES = {"available", "partial", "unavailable", "invalid"}
 RAW_STATES = {"ok", "error", "skipped"}
-CRYPTOQUANT_WINDOWS = {"min": ("1m", 60), "hour": ("1h", 3600), "day": ("1d", 86400)}
 
 
 def copy_json_safe_value(value: Any, *, path: str = "value") -> Any:
@@ -133,29 +127,6 @@ def unwrap_coinglass_map_response(response: Any) -> Mapping[str, Any]:
     if not isinstance(outer, Mapping) or not isinstance(outer.get("data"), Mapping):
         raise ValueError("coinglass_map_data_must_be_mapping")
     return outer["data"]
-
-
-def unwrap_coinglass_supported_pairs(response: Any) -> Mapping[str, list[Any]]:
-    if not isinstance(response, Mapping) or response.get("code") not in (0, "0"):
-        raise ValueError("invalid_coinglass_supported_pairs_envelope")
-    data = response.get("data")
-    if not isinstance(data, Mapping) or any(not isinstance(value, list) for value in data.values()):
-        raise ValueError("coinglass_supported_pairs_data_must_be_mapping_of_lists")
-    return data
-
-
-def unwrap_cryptoquant_liquidations(response: Any) -> tuple[str, list[Any]]:
-    if not isinstance(response, Mapping) or not isinstance(response.get("status"), Mapping):
-        raise ValueError("cryptoquant_response_must_have_status")
-    if response["status"].get("code") != 200:
-        raise ValueError("cryptoquant_status_not_success")
-    result = response.get("result")
-    if not isinstance(result, Mapping) or not isinstance(result.get("data"), list):
-        raise ValueError("cryptoquant_result_invalid")
-    window = result.get("window")
-    if window not in CRYPTOQUANT_WINDOWS:
-        raise ValueError("unsupported_cryptoquant_window")
-    return window, result["data"]
 
 
 def unwrap_glassnode_metric(response: Any) -> list[Mapping[str, Any]]:
@@ -432,9 +403,10 @@ def _dataset(requests: Sequence[Mapping[str, Any]], raw: Mapping[str, Any], pars
     )
     if "response_window_mismatch" in errors:
         reason = "response_window_mismatch"
+    degrading_warnings = [warning for warning in warnings if warning != "event_snapshot_fixed_limit_no_recursive_pagination"]
     if gaps and status == "available":
         status, reason = "partial", "source_history_has_gaps"
-    elif warnings and status == "available":
+    elif degrading_warnings and status == "available":
         status, reason = "partial", "source_warnings"
     if status == "partial" and not incoming and has_existing:
         result = deepcopy(dict(existing))
@@ -605,31 +577,18 @@ def _request_dataset_path(request: Mapping[str, Any]) -> str:
     endpoint = request["endpoint_id"]
     exchange = request["dimensions"].get("exchange")
     direct = {
-        "supported_exchange_pairs": "coinglass.supported_exchange_pairs",
         "aggregated_liquidation_history": "coinglass.aggregated_history",
-        "liquidation_exchange_list": "coinglass.exchange_snapshot",
         "aggregated_liquidation_map": "coinglass.aggregated_map",
-        "liquidation_max_pain": "coinglass.max_pain",
-        COINGLASS_TOP_POSITION_ENDPOINT_ID: "coinglass.top_position_ratio",
-        COINGLASS_TOP_ACCOUNT_ENDPOINT_ID: "coinglass.top_account_ratio",
-        COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID: "coinglass.global_account_ratio",
-        GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID: "glassnode.long_liquidations",
-        GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID: "glassnode.short_liquidations",
-        GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID: "glassnode.total_liquidations",
-        GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID: "glassnode.long_liquidation_dominance",
+        COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID: "coinglass.long_short_ratio",
     }
     if endpoint in direct:
         return direct[endpoint]
-    keyed = {"pair_liquidation_history": "coinglass.pair_history",
-             "liquidation_order_events": "coinglass.events",
-             "pair_liquidation_map": "coinglass.pair_maps"}
+    keyed = {
+        "liquidation_order_events": "coinglass.events",
+        "pair_liquidation_map": "coinglass.pair_maps",
+    }
     if endpoint in keyed and isinstance(exchange, str):
         return f"{keyed[endpoint]}.{exchange}"
-    if endpoint == "cryptoquant_liquidations":
-        if exchange == "all_exchange":
-            return "cryptoquant.aggregate_history"
-        if isinstance(exchange, str) and exchange:
-            return f"cryptoquant.exchange_history.{exchange}"
     raise ValueError("unresolvable_dataset_target")
 
 
@@ -649,13 +608,12 @@ def determine_required_datasets(
     if mode == "bootstrap":
         required.update({"coinglass.aggregated_history", "coinglass.aggregated_map"})
     required_endpoints = {"aggregated_liquidation_history",
-                          "aggregated_liquidation_map", "pair_liquidation_history",
-                          "liquidation_order_events", "pair_liquidation_map",
-                          COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID,
+                          "aggregated_liquidation_map", "pair_liquidation_map",
+                          "liquidation_order_events",
                           COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID}
     for request in raw_requests:
         endpoint = request["endpoint_id"]
-        if endpoint in required_endpoints or (mode == "bootstrap" and endpoint == "supported_exchange_pairs"):
+        if endpoint in required_endpoints:
             required.add(_request_dataset_path(request))
     return required
 
@@ -684,51 +642,48 @@ class LongShortLiquidationsInputPreprocessor:
         def select(provider: str, endpoint: str) -> list[Mapping[str, Any]]:
             return grouped.get((provider, endpoint), [])
         coinglass_old = _old(self.existing_contract, "providers", "coinglass") or {}
-        cq_old = _old(self.existing_contract, "providers", "cryptoquant") or {}
-        gn_old = _old(self.existing_contract, "providers", "glassnode") or {}
         history = _dataset(select("coinglass", "aggregated_liquidation_history"), raw,
                            unwrap_coinglass_list_response, normalize_coinglass_aggregated_history_record,
-                           existing=coinglass_old.get("aggregated_history"), interval="1h")
-        def positioning_by_timeframe(endpoint_id: str, kind: str, legacy_key: str) -> dict[str, Any]:
-            previous = coinglass_old.get("positioning_by_timeframe", {}).get(legacy_key, {}) \
-                if isinstance(coinglass_old.get("positioning_by_timeframe"), Mapping) else {}
-            requests_by_tf: dict[str, list[Mapping[str, Any]]] = {}
+                           existing=coinglass_old.get("aggregated_history"), interval="15m", interval_seconds=900)
+        def positioning_by_exchange_timeframe(endpoint_id: str, kind: str, legacy_key: str) -> dict[str, Any]:
+            previous_all = coinglass_old.get("positioning_by_exchange_timeframe", {}) \
+                if isinstance(coinglass_old.get("positioning_by_exchange_timeframe"), Mapping) else {}
+            requests_by_exchange_tf: dict[str, dict[str, list[Mapping[str, Any]]]] = {}
             for request in select("coinglass", endpoint_id):
-                interval = request.get("params", {}).get("interval") if isinstance(request.get("params"), Mapping) else None
-                if isinstance(interval, str):
-                    requests_by_tf.setdefault(interval, []).append(request)
+                params = request.get("params", {}) if isinstance(request.get("params"), Mapping) else {}
+                dimensions = request.get("dimensions", {}) if isinstance(request.get("dimensions"), Mapping) else {}
+                exchange = dimensions.get("exchange") or params.get("exchange")
+                interval = params.get("interval")
+                if isinstance(exchange, str) and isinstance(interval, str):
+                    requests_by_exchange_tf.setdefault(exchange, {}).setdefault(interval, []).append(request)
             result: dict[str, Any] = {}
-            for timeframe in POSITIONING_TIMEFRAMES:
-                existing_tf = previous.get(timeframe) if isinstance(previous, Mapping) else None
-                # Backward compatibility: old contracts stored only the canonical 1h dataset.
-                if timeframe == "1h" and existing_tf is None:
-                    existing_tf = coinglass_old.get(legacy_key)
-                result[timeframe] = _dataset(
-                    requests_by_tf.get(timeframe, []), raw, unwrap_coinglass_list_response,
-                    lambda row, k=kind: normalize_coinglass_positioning_record(row, kind=k),
-                    existing=existing_tf, interval=timeframe)
+            for exchange in DEFAULT_EXCHANGES:
+                previous_exchange = previous_all.get(exchange, {}).get(legacy_key, {}) \
+                    if isinstance(previous_all.get(exchange), Mapping) else {}
+                result[exchange] = {}
+                for timeframe in POSITIONING_TIMEFRAMES:
+                    existing_tf = previous_exchange.get(timeframe) if isinstance(previous_exchange, Mapping) else None
+                    if exchange == "Binance" and timeframe == "4h" and existing_tf is None:
+                        legacy_tf = coinglass_old.get("positioning_by_timeframe", {}).get(legacy_key, {}) \
+                            if isinstance(coinglass_old.get("positioning_by_timeframe"), Mapping) else {}
+                        existing_tf = legacy_tf.get(timeframe) if isinstance(legacy_tf, Mapping) else coinglass_old.get(legacy_key)
+                    result[exchange][timeframe] = _dataset(
+                        requests_by_exchange_tf.get(exchange, {}).get(timeframe, []), raw, unwrap_coinglass_list_response,
+                        lambda row, k=kind: normalize_coinglass_positioning_record(row, kind=k),
+                        existing=existing_tf, interval=timeframe, interval_seconds={"1m":60,"5m":300,"15m":900,"4h":14400}[timeframe])
             return result
 
-        positioning_tf = {
-            "top_position_ratio": positioning_by_timeframe(COINGLASS_TOP_POSITION_ENDPOINT_ID, "top_position", "top_position_ratio"),
-            "top_account_ratio": positioning_by_timeframe(COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, "top_account", "top_account_ratio"),
-            "global_account_ratio": positioning_by_timeframe(COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID, "global_account", "global_account_ratio"),
+        positioning_exchange_tf = {
+            "long_short_ratio": positioning_by_exchange_timeframe(COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID, "global_account", "long_short_ratio"),
         }
-        top_position_ratio = positioning_tf["top_position_ratio"]["1h"]
-        top_account_ratio = positioning_tf["top_account_ratio"]["1h"]
-        global_account_ratio = positioning_tf["global_account_ratio"]["1h"]
-        exchange_requests = select("coinglass", "liquidation_exchange_list")
-        exchange_snapshot = _snapshot(exchange_requests, raw,
-                                      unwrap_coinglass_list_response, normalize_coinglass_exchange_snapshot_record,
-                                      existing=coinglass_old.get("exchange_snapshot"),
-                                      range_value=self._request_range(exchange_requests, "24h"))
-        if any(request["status"] == "ok" for request in exchange_requests):
-            exchange_snapshot["warnings"] = list(dict.fromkeys(
-                exchange_snapshot["warnings"] + ["provider_timestamp_not_supplied"],
-            ))
-        pair_history = deepcopy(coinglass_old.get("pair_history") or {})
+        positioning_tf = {metric: {tf: positioning_exchange_tf[metric]["Binance"][tf] for tf in POSITIONING_TIMEFRAMES}
+                          for metric in positioning_exchange_tf}
+        long_short_ratio = positioning_tf["long_short_ratio"]["4h"]
+        exchange_snapshot = {"status": "unavailable", "reason": "derived_from_event_stream_in_processing",
+                             "records": [], "warnings": [], "errors": [], "provenance": {}}
+        pair_history: dict[str, Any] = {}
         events = deepcopy(coinglass_old.get("events") or {})
-        pair_maps = deepcopy(coinglass_old.get("pair_maps") or {})
+
         def keyed_requests(endpoint: str) -> dict[str, list[Mapping[str, Any]]]:
             result: dict[str, list[Mapping[str, Any]]] = {}
             for request in select("coinglass", endpoint):
@@ -736,10 +691,11 @@ class LongShortLiquidationsInputPreprocessor:
                 if isinstance(exchange, str):
                     result.setdefault(exchange, []).append(request)
             return result
-        for exchange, target_requests in keyed_requests("pair_liquidation_history").items():
-            pair_history[exchange] = _dataset(target_requests, raw,
-                                               unwrap_coinglass_list_response, normalize_coinglass_pair_history_record,
-                                               existing=(coinglass_old.get("pair_history") or {}).get(exchange), interval="1h")
+
+        def range_requests(requests_in: Sequence[Mapping[str, Any]], range_value: str) -> list[Mapping[str, Any]]:
+            return [request for request in requests_in
+                    if isinstance(request.get("params"), Mapping) and request["params"].get("range") == range_value]
+
         for exchange, event_requests in keyed_requests("liquidation_order_events").items():
             expected_asset = event_requests[0]["dimensions"].get("asset") if event_requests else None
             events[exchange] = _dataset(event_requests, raw, unwrap_coinglass_list_response,
@@ -747,62 +703,53 @@ class LongShortLiquidationsInputPreprocessor:
                                             record, expected_asset=expected_asset,
                                         ),
                                         existing=(coinglass_old.get("events") or {}).get(exchange), events=True)
-        for exchange, map_requests in keyed_requests("pair_liquidation_map").items():
-            pair_maps[exchange] = _snapshot(map_requests, raw,
-                                            unwrap_coinglass_map_response, normalize_coinglass_pair_map_row,
-                                            existing=(coinglass_old.get("pair_maps") or {}).get(exchange),
-                                            key="levels", range_value=self._request_range(map_requests, "1d"),
-                                            map_rows=True)
-        supported = self._supported_pairs(select("coinglass", "supported_exchange_pairs"), raw,
-                                          coinglass_old.get("supported_exchange_pairs"))
-        aggregated_map_requests = select("coinglass", "aggregated_liquidation_map")
-        aggregated_map = _snapshot(aggregated_map_requests, raw,
-                                   unwrap_coinglass_map_response, normalize_coinglass_aggregated_map_row,
-                                   existing=coinglass_old.get("aggregated_map"), key="levels",
-                                   range_value=self._request_range(aggregated_map_requests, "1d"), map_rows=True)
-        max_pain_requests = select("coinglass", "liquidation_max_pain")
-        max_pain = _snapshot(max_pain_requests, raw,
-                             unwrap_coinglass_list_response, normalize_coinglass_max_pain_record,
-                             existing=coinglass_old.get("max_pain"),
-                             range_value=self._request_range(max_pain_requests, "24h"))
-        cq_requests = select("cryptoquant", "cryptoquant_liquidations")
-        aggregate_requests = [item for item in cq_requests if item.get("params", {}).get("exchange") == "all_exchange"]
-        cq_aggregate = _dataset(aggregate_requests, raw, unwrap_cryptoquant_liquidations,
-                                normalize_cryptoquant_liquidation_record,
-                                existing=cq_old.get("aggregate_history"), cryptoquant=True)
-        cq_exchange = deepcopy(cq_old.get("exchange_history") or {})
-        cq_targets: dict[str, list[Mapping[str, Any]]] = {}
-        for request in cq_requests:
-            exchange = request.get("params", {}).get("exchange")
-            if exchange == "all_exchange" or not isinstance(exchange, str):
-                continue
-            cq_targets.setdefault(exchange, []).append(request)
-        for exchange, target_requests in cq_targets.items():
-            cq_exchange[exchange] = _dataset(target_requests, raw, unwrap_cryptoquant_liquidations,
-                                             normalize_cryptoquant_liquidation_record,
-                                             existing=(cq_old.get("exchange_history") or {}).get(exchange),
-                                             cryptoquant=True)
-        glassnode = {}
-        for endpoint, output_key, unit in (
-            (GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID, "long_liquidations", "USD"),
-            (GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID, "short_liquidations", "USD"),
-            (GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID, "total_liquidations", "USD"),
-            (GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID, "long_liquidation_dominance", "percent"),
-        ):
-            dataset = _dataset(select("glassnode", endpoint), raw, unwrap_glassnode_metric,
-                               normalize_glassnode_metric_record, existing=gn_old.get(output_key), interval="1h")
-            dataset["unit"] = unit
-            glassnode[output_key] = dataset
-        providers = {"coinglass": {"supported_exchange_pairs": supported,
-                                     "aggregated_history": history, "exchange_snapshot": exchange_snapshot,
-                                     "top_position_ratio": top_position_ratio, "top_account_ratio": top_account_ratio,
-                                     "global_account_ratio": global_account_ratio,
+
+        previous_agg_ranges = coinglass_old.get("aggregated_maps_by_range", {}) \
+            if isinstance(coinglass_old.get("aggregated_maps_by_range"), Mapping) else {}
+        previous_pair_ranges = coinglass_old.get("pair_maps_by_range", {}) \
+            if isinstance(coinglass_old.get("pair_maps_by_range"), Mapping) else {}
+        if DEFAULT_MAP_RANGE not in previous_agg_ranges and isinstance(coinglass_old.get("aggregated_map"), Mapping):
+            previous_agg_ranges = {**previous_agg_ranges, DEFAULT_MAP_RANGE: coinglass_old.get("aggregated_map")}
+        if DEFAULT_MAP_RANGE not in previous_pair_ranges and isinstance(coinglass_old.get("pair_maps"), Mapping):
+            previous_pair_ranges = {**previous_pair_ranges, DEFAULT_MAP_RANGE: coinglass_old.get("pair_maps")}
+
+        pair_requests = keyed_requests("pair_liquidation_map")
+        pair_maps_by_range: dict[str, dict[str, Any]] = {}
+        for range_value in PUBLIC_MAP_RANGES:
+            pair_maps_by_range[range_value] = {}
+            previous_range = previous_pair_ranges.get(range_value, {}) \
+                if isinstance(previous_pair_ranges.get(range_value), Mapping) else {}
+            for exchange in (*DEFAULT_EXCHANGES, "Hyperliquid"):
+                requests_for_exchange = range_requests(pair_requests.get(exchange, []), range_value)
+                pair_maps_by_range[range_value][exchange] = _snapshot(
+                    requests_for_exchange, raw, unwrap_coinglass_map_response, normalize_coinglass_pair_map_row,
+                    existing=previous_range.get(exchange) if isinstance(previous_range, Mapping) else None,
+                    key="levels", range_value=range_value, map_rows=True)
+
+        aggregated_requests = select("coinglass", "aggregated_liquidation_map")
+        aggregated_maps_by_range: dict[str, Any] = {}
+        for range_value in PUBLIC_MAP_RANGES:
+            aggregated_maps_by_range[range_value] = _snapshot(
+                range_requests(aggregated_requests, range_value), raw,
+                unwrap_coinglass_map_response, normalize_coinglass_aggregated_map_row,
+                existing=previous_agg_ranges.get(range_value), key="levels",
+                range_value=range_value, map_rows=True)
+
+        # Backward-compatible aliases point at the public default (1d).
+        aggregated_map = deepcopy(aggregated_maps_by_range[DEFAULT_MAP_RANGE])
+        pair_maps = deepcopy(pair_maps_by_range[DEFAULT_MAP_RANGE])
+        max_pain = {"status": "unavailable", "reason": "endpoint_removed_final33",
+                    "records": [], "warnings": [], "errors": [], "provenance": {}}
+        providers = {"coinglass": {"aggregated_history": history, "exchange_snapshot": exchange_snapshot,
+                                     "long_short_ratio": long_short_ratio,
                                      "positioning_by_timeframe": positioning_tf,
+                                     "positioning_by_exchange_timeframe": positioning_exchange_tf,
                                      "pair_history": pair_history, "events": events,
                                      "aggregated_map": aggregated_map, "pair_maps": pair_maps,
-                                     "max_pain": max_pain},
-                     "cryptoquant": {"aggregate_history": cq_aggregate, "exchange_history": cq_exchange},
-                     "glassnode": glassnode}
+                                     "aggregated_maps_by_range": aggregated_maps_by_range,
+                                     "pair_maps_by_range": pair_maps_by_range,
+                                     "map_ranges": list(PUBLIC_MAP_RANGES),
+                                     "max_pain": max_pain}}
         required = determine_required_datasets(
             mode=raw["mode"], raw_requests=requests, existing_contract=self.existing_contract,
         )
@@ -827,58 +774,6 @@ class LongShortLiquidationsInputPreprocessor:
             if isinstance(value, str):
                 return value
         return default
-
-    @staticmethod
-    def _supported_pairs(requests: Sequence[Mapping[str, Any]], raw: Mapping[str, Any],
-                         existing: Mapping[str, Any] | None) -> dict[str, Any]:
-        if not requests:
-            if existing is not None:
-                return deepcopy(dict(existing))
-            return {"status": "unavailable", "reason": "not_requested_in_mode", "exchanges": {},
-                    "provenance": {}, "warnings": [], "errors": []}
-        warnings, errors, exchanges = [], [], {}
-        received_count = invalid_count = 0
-        request_failed = envelope_invalid = False
-        for request in requests:
-            if request.get("status") != "ok":
-                request_failed = True
-                errors.extend([request.get("error")] if request.get("error") else [])
-                continue
-            try:
-                payload = unwrap_coinglass_supported_pairs(request.get("response"))
-            except ValueError as exc:
-                envelope_invalid = True
-                errors.append(str(exc))
-                continue
-            received_count += len(payload)
-            for exchange, instruments in payload.items():
-                try:
-                    copied = copy_json_safe_value(
-                        {exchange: instruments}, path="supported_exchange_pairs",
-                    )
-                    exchanges.update(copied)
-                except ValueError as exc:
-                    invalid_count += 1
-                    warnings.append(f"invalid_record:{exchange}:{exc}")
-        has_existing = bool(existing and existing.get("exchanges"))
-        status, reason = determine_record_availability(
-            received_count=received_count, valid_count=len(exchanges), invalid_count=invalid_count,
-            request_failed=request_failed, envelope_invalid=envelope_invalid,
-            has_existing_data=has_existing, dataset_kind="snapshot",
-        )
-        if status == "partial" and not exchanges and has_existing:
-            result = deepcopy(dict(existing))
-            result["status"], result["reason"] = status, reason
-            result["warnings"] = list(dict.fromkeys(list(result.get("warnings", [])) + warnings))
-            result["errors"] = list(dict.fromkeys(list(result.get("errors", [])) + errors))
-            result["latest_attempt"] = _latest_attempt(
-                requests, raw, errors, invalid_record_count=invalid_count, warnings=warnings,
-            )
-            return result
-        return {"status": status, "reason": reason, "exchanges": exchanges,
-                "snapshot_observed_at": raw["execution_timestamp"] if exchanges else None,
-                "source_data_as_of": None, "provenance": _provenance(requests, raw),
-                "warnings": warnings, "errors": errors}
 
     @staticmethod
     def _quality(providers: Mapping[str, Any], required: set[str]) -> dict[str, Any]:

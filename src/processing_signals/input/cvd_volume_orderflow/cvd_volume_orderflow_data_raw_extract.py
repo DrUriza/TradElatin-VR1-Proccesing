@@ -1,4 +1,9 @@
-"""Injectable raw extraction for the CVD volume/order-flow Input family."""
+"""CoinGlass-only raw extraction for the CVD volume/order-flow Input family.
+
+VR1 deliberately uses only the four contracted CVD primitives: spot/futures
+aggregated CVD and spot/perpetual footprint.  No dormant confirmation endpoints
+are kept in this family.
+"""
 from __future__ import annotations
 
 import copy
@@ -10,31 +15,25 @@ from typing import Any
 
 CVD_VOLUME_ORDERFLOW_FAMILY = "cvd_volume_orderflow"
 COINGLASS_PROVIDER           = "coinglass"
-CRYPTOQUANT_PROVIDER         = "cryptoquant"
-GLASSNODE_PROVIDER           = "glassnode"
-BASE_TIMEFRAMES              = ("1m", "15m")
-FINAL_TIMEFRAMES             = ("1m", "5m", "15m", "30m", "1h", "4h", "1d")
+BASE_TIMEFRAMES              = ("5m", "15m")
+FINAL_TIMEFRAMES             = ("5m", "15m", "4h")
+# 5m and 15m are provider-native CVD bases. 4h is built from 15m (x16).
+# No 1-minute CVD source exists in VR1.
+BASE_REQUIRED_FACTORS        = {"5m": 1, "15m": 16}
+EMULATOR_PAGE_RECORDS        = 500
 VALID_MODES                  = {"bootstrap", "incremental", "recovery"}
 FINAL_DISPLAY_RECORDS        = 220
 FINAL_WARMUP_RECORDS         = 32
 COINGLASS_CVD_MAX_LIMIT      = 4500
 COINGLASS_FOOTPRINT_MAX_LIMIT = 1000
-CRYPTOQUANT_MAX_LIMIT        = 100000
-DEFAULT_INCREMENTAL_LIMITS   = {"1m": 30, "15m": 12}
+DEFAULT_INCREMENTAL_LIMITS   = {"5m": 12, "15m": 12}
 DEFAULT_FOOTPRINT_HISTORY_SECONDS = 172800
-TIMEFRAME_SECONDS            = {"1m": 60, "15m": 900, "1h": 3600}
+TIMEFRAME_SECONDS            = {"5m": 300, "15m": 900}
 
 COINGLASS_ENDPOINT_PATHS = {
     "spot_aggregated_cvd": "/api/spot/aggregated-cvd/history", "futures_aggregated_cvd": "/api/futures/aggregated-cvd/history",
     "spot_footprint": "/api/spot/volume/footprint-history", "futures_footprint": "/api/futures/volume/footprint-history",
 }
-GLASSNODE_ENDPOINT_PATHS = {
-    "spot_cvd_sum": "/v1/metrics/market/spot_cvd_sum", "spot_vd_sum": "/v1/metrics/market/spot_vd_sum",
-    "spot_buying_volume_sum": "/v1/metrics/market/spot_buying_volume_sum",
-    "spot_selling_volume_sum": "/v1/metrics/market/spot_selling_volume_sum",
-}
-CRYPTOQUANT_ENDPOINT_PATH = "/btc/market-data/taker-buy-sell-stats"
-
 CvdVolumeOrderflowFetcher = Callable[..., Mapping[str, Any] | Sequence[Any]]
 
 
@@ -71,7 +70,7 @@ def required_base_records(timeframe: str, display_records: int = FINAL_DISPLAY_R
         raise ValueError("warmup_records must be a non-negative integer")
     if timeframe not in BASE_TIMEFRAMES:
         raise ValueError("unsupported base timeframe")
-    return (display_records + warmup_records) * (5 if timeframe == "1m" else 96)
+    return (display_records + warmup_records) * BASE_REQUIRED_FACTORS[timeframe]
 
 
 def build_coinglass_aggregated_cvd_params(*, exchanges: Sequence[str], symbol: str, timeframe: str, limit: int,
@@ -92,7 +91,7 @@ def build_coinglass_aggregated_cvd_params(*, exchanges: Sequence[str], symbol: s
     return params
 
 
-def build_coinglass_footprint_params(*, exchange: str, symbol: str, timeframe: str = "1m", limit: int = COINGLASS_FOOTPRINT_MAX_LIMIT,
+def build_coinglass_footprint_params(*, exchange: str, symbol: str, timeframe: str = "5m", limit: int = COINGLASS_FOOTPRINT_MAX_LIMIT,
                                       start_timestamp: int | None = None, end_timestamp: int | None = None) -> dict[str, Any]:
     if not isinstance(exchange, str) or not exchange.strip() or not isinstance(symbol, str) or not symbol.strip() or timeframe not in BASE_TIMEFRAMES:
         raise ValueError("invalid CoinGlass footprint parameters")
@@ -106,32 +105,6 @@ def build_coinglass_footprint_params(*, exchange: str, symbol: str, timeframe: s
         params["end_time"] = _timestamp(end_timestamp, "end_timestamp") * 1000
     return params
 
-
-def build_cryptoquant_taker_params(*, window: str, limit: int, start_timestamp: int | None = None,
-                                    end_timestamp: int | None = None) -> dict[str, Any]:
-    if window not in {"min", "hour"}:
-        raise ValueError("unsupported CryptoQuant window")
-    limit = _positive_int(limit, "limit")
-    if limit > CRYPTOQUANT_MAX_LIMIT:
-        raise ValueError("CryptoQuant limit exceeds provider maximum")
-    params: dict[str, Any] = {"exchange": "all_exchange", "window": window, "limit": limit, "format": "json"}
-    if start_timestamp is not None:
-        params["from"] = _compact_utc(_timestamp(start_timestamp, "start_timestamp"))
-    if end_timestamp is not None:
-        params["to"] = _compact_utc(_timestamp(end_timestamp, "end_timestamp"))
-    return params
-
-
-def build_glassnode_metric_params(*, base_asset: str = "BTC", start_timestamp: int | None = None,
-                                   end_timestamp: int | None = None) -> dict[str, Any]:
-    if not isinstance(base_asset, str) or not base_asset.strip():
-        raise ValueError("invalid base_asset")
-    params: dict[str, Any] = {"a": base_asset.strip().upper(), "i": "1h", "c": "USD", "f": "json", "timestamp_format": "unix"}
-    if start_timestamp is not None:
-        params["s"] = _timestamp(start_timestamp, "start_timestamp")
-    if end_timestamp is not None:
-        params["u"] = _timestamp(end_timestamp, "end_timestamp")
-    return params
 
 
 def _existing_input(existing_input: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -168,18 +141,18 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
                                             exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"), existing_input: Mapping[str, Any] | None = None,
                                             recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_footprint: bool = True,
                                             footprint_exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"),
-                                            include_cryptoquant_confirmation: bool = True, include_glassnode_confirmation: bool = True,
                                             target_display_records: int = FINAL_DISPLAY_RECORDS, warmup_records: int = FINAL_WARMUP_RECORDS,
                                             incremental_limits: Mapping[str, int] | None = None,
                                             footprint_history_seconds: int = DEFAULT_FOOTPRINT_HISTORY_SECONDS,
-                                            refresh_secondary: bool = False) -> list[dict[str, Any]]:
+                                            refresh_secondary: bool = False,
+                                            emulator_fixed_records: bool = False) -> list[dict[str, Any]]:
     if mode not in VALID_MODES:
         raise ValueError("unsupported mode")
     reference = _timestamp(reference_timestamp, "reference_timestamp")
     existing = _existing_input(existing_input)
     limits = dict(DEFAULT_INCREMENTAL_LIMITS if incremental_limits is None else incremental_limits)
     if set(limits) != set(BASE_TIMEFRAMES):
-        raise ValueError("incremental_limits must define 1m and 15m")
+        raise ValueError("incremental_limits must define 5m and 15m")
     plan: list[dict[str, Any]] = []
     if mode == "recovery":
         if not isinstance(recovery_requests, Sequence) or isinstance(recovery_requests, (str, bytes)) or not recovery_requests:
@@ -200,14 +173,19 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
                 records_required=required, exchanges=list(exchanges), symbol=base_asset))
         return plan
     for market in ("spot", "futures"):
-        # Bootstrap keeps both 1m and 15m provider history: 1m gives recent
-        # resolution while 15m seeds a much deeper history efficiently. During
-        # normal incremental operation only 1m is paid for; complete 15m bars
-        # are rebuilt locally from the persisted 1m flow in Input.
-        requested_timeframes = BASE_TIMEFRAMES if mode == "bootstrap" else ("1m",)
+        # Both 5m and 15m are provider-native CVD bases. Incremental refreshes
+        # request both so their live right-edge buckets update independently;
+        # 4h is derived later from the 15m base.
+        requested_timeframes = BASE_TIMEFRAMES
         for timeframe in requested_timeframes:
             required = required_base_records(timeframe, target_display_records, warmup_records)
-            limit = min(COINGLASS_CVD_MAX_LIMIT, required) if mode == "bootstrap" else _positive_int(limits[timeframe], f"incremental_limits[{timeframe}]")
+            if emulator_fixed_records:
+                # Acquisition always sends limit=500 in Emulator mode. Keep the
+                # logical page size identical so pagination advances instead of
+                # misclassifying every 500-row response as a short provider page.
+                limit = min(EMULATOR_PAGE_RECORDS, required)
+            else:
+                limit = min(COINGLASS_CVD_MAX_LIMIT, required) if mode == "bootstrap" else _positive_int(limits[timeframe], f"incremental_limits[{timeframe}]")
             end = reference
             prior = _last_timestamp(existing, market, timeframe)
             start = max(0, (end - (required - 1) * TIMEFRAME_SECONDS[timeframe])) if mode == "bootstrap" else max(0, (prior if prior is not None else end) - limit * TIMEFRAME_SECONDS[timeframe])
@@ -220,19 +198,10 @@ def build_cvd_volume_orderflow_fetch_plan(*, mode: str, reference_timestamp: int
     if include_footprint and refresh_optional:
         for market in ("spot", "futures"):
             for exchange in footprint_exchanges:
-                endpoint = f"{market}_footprint"
+                endpoint = "spot_footprint" if market == "spot" else "futures_footprint"
                 plan.append(_logical(provider=COINGLASS_PROVIDER, dataset="footprint", market=market, endpoint_id=endpoint,
-                    path=COINGLASS_ENDPOINT_PATHS[endpoint], timeframe="1m", limit=COINGLASS_FOOTPRINT_MAX_LIMIT,
+                    path=COINGLASS_ENDPOINT_PATHS[endpoint], timeframe="5m", limit=COINGLASS_FOOTPRINT_MAX_LIMIT,
                     start=optional_start, end=reference, exchange=exchange, symbol=pair_symbol))
-    if include_cryptoquant_confirmation and refresh_optional:
-        plan.append(_logical(provider=CRYPTOQUANT_PROVIDER, dataset="taker_buy_sell_stats", market="futures", endpoint_id="taker_buy_sell_stats",
-            path=CRYPTOQUANT_ENDPOINT_PATH, timeframe="1h", limit=min(CRYPTOQUANT_MAX_LIMIT, max(1, footprint_history_seconds // 3600 + 1)),
-            start=optional_start, end=reference, provider_window="hour"))
-    if include_glassnode_confirmation and refresh_optional:
-        for endpoint, path in GLASSNODE_ENDPOINT_PATHS.items():
-            plan.append(_logical(provider=GLASSNODE_PROVIDER, dataset=endpoint, market="spot", endpoint_id=endpoint, path=path,
-                timeframe="1h", limit=max(1, footprint_history_seconds // 3600 + 1), start=optional_start, end=reference,
-                provider_window="1h"))
     return plan
 
 
@@ -267,9 +236,6 @@ class CvdVolumeOrderflowRawExtractor:
         if request["provider"] == COINGLASS_PROVIDER:
             return build_coinglass_footprint_params(exchange=request["exchange"], symbol=request["symbol"], timeframe=request["timeframe"], limit=request["limit"],
                 start_timestamp=request.get("start_timestamp"), end_timestamp=end)
-        if request["provider"] == CRYPTOQUANT_PROVIDER:
-            return build_cryptoquant_taker_params(window=request["provider_window"], limit=request["limit"], start_timestamp=request.get("start_timestamp"), end_timestamp=end)
-        return build_glassnode_metric_params(start_timestamp=request.get("start_timestamp"), end_timestamp=end)
 
     def execute_request(self, request: Mapping[str, Any], *, page_index: int = 1, end_timestamp: int | None = None,
                         requested_at: str | None = None) -> dict[str, Any]:
@@ -332,8 +298,7 @@ class CvdVolumeOrderflowRawExtractor:
     def run(self, *, mode: str, reference_timestamp: int, base_asset: str = "BTC", pair_symbol: str = "BTCUSDT",
             exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"), existing_input: Mapping[str, Any] | None = None,
             recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_footprint: bool = True,
-            footprint_exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"), include_cryptoquant_confirmation: bool = True,
-            include_glassnode_confirmation: bool = True, target_display_records: int = FINAL_DISPLAY_RECORDS,
+            footprint_exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"), target_display_records: int = FINAL_DISPLAY_RECORDS,
             warmup_records: int = FINAL_WARMUP_RECORDS, incremental_limits: Mapping[str, int] | None = None,
             footprint_history_seconds: int = DEFAULT_FOOTPRINT_HISTORY_SECONDS, max_pages: int | None = None,
             data_mode: str = "synthetic", is_demo: bool = True, refresh_secondary: bool = False) -> dict[str, Any]:
@@ -343,10 +308,9 @@ class CvdVolumeOrderflowRawExtractor:
         requested_at = _iso_utc(execution)
         plan = self.build_fetch_plan(mode=mode, reference_timestamp=reference_timestamp, base_asset=base_asset, pair_symbol=pair_symbol,
             exchanges=copy.deepcopy(tuple(exchanges)), existing_input=existing_input, recovery_requests=recovery_requests, include_footprint=include_footprint,
-            footprint_exchanges=copy.deepcopy(tuple(footprint_exchanges)), include_cryptoquant_confirmation=include_cryptoquant_confirmation,
-            include_glassnode_confirmation=include_glassnode_confirmation, target_display_records=target_display_records, warmup_records=warmup_records,
+            footprint_exchanges=copy.deepcopy(tuple(footprint_exchanges)), target_display_records=target_display_records, warmup_records=warmup_records,
             incremental_limits=incremental_limits, footprint_history_seconds=footprint_history_seconds,
-            refresh_secondary=refresh_secondary)
+            refresh_secondary=refresh_secondary, emulator_fixed_records=(data_mode == "synthetic"))
         physical, warnings, errors = [], [], []
         for request in plan:
             if request["provider"] == COINGLASS_PROVIDER and request["dataset"] == "aggregated_cvd":

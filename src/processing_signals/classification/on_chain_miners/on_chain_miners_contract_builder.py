@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .on_chain_miners_sp_v2_0_adapter import align_on_chain_miners_to_sp_v2_0
 
 import copy
 import json
@@ -15,9 +14,9 @@ ON_CHAIN_MINERS_TITLE            = "ON-CHAIN & MINERS METRICS"
 ON_CHAIN_MINERS_CONTRACT_SCHEMA  = "trad_elatin.on_chain_miners.screen.v1"
 ON_CHAIN_MINERS_CONTRACT_VERSION = "1.0.0"
 
-RANGE_OPTIONS = ("1D", "7D", "30D", "90D", "360D")
+RANGE_OPTIONS = ("7D", "30D")
 DEFAULT_RANGE = "30D"
-RANGE_DAYS    = {"1D": 1, "7D": 7, "30D": 30, "90D": 90, "360D": 360}
+RANGE_DAYS    = {"7D": 7, "30D": 30}
 SECONDS_PER_DAY = 86_400
 
 VALID_MODES            = {"bootstrap", "incremental", "recovery"}
@@ -27,8 +26,8 @@ VALID_COLOR_TOKENS     = {"positive", "negative", "warning", "neutral", "unavail
 STATUS_PRIORITY        = {"available": 0, "partial": 1, "unavailable": 2, "invalid": 3}
 CHART_IDS              = ("miner_reserve", "sopr_7d", "hashrate", "difficulty", "miner_net_position_change")
 WIDGET_IDS             = ("miner_pressure", "reserve_trend", "net_position", "sopr_regime")
-DRILLDOWN_IDS         = ("miner_outflow_distribution", "reserve_aging", "revenue_breakdown", "nupl_phases")
-OPTIONAL_UNAVAILABLE  = ()
+DRILLDOWN_IDS: tuple[str, ...] = ()
+OPTIONAL_UNAVAILABLE: tuple[str, ...] = ()
 
 SERIES_CONFIG = {
     "miner_reserve":             ("miner_reserve_btc", "Miner Reserve (BTC)", "Total miner-held BTC", "area", "BTC", "Glassnode"),
@@ -189,18 +188,6 @@ def _validate_upstreams(processing: Any, classification: Any) -> list[str]:
             errors.append(f"invalid_classification_status:{classification_id}")
         if payload.get("display_color_token") not in VALID_COLOR_TOKENS:
             errors.append(f"invalid_classification_color_token:{classification_id}")
-    for series_id in ("miner_outflow_total_btc", "miners_unspent_supply_btc", "miner_revenue_total_usd", "miner_block_reward_revenue_usd",
-                      "miner_fee_revenue_usd", "miner_fee_share_ratio", "nupl"):
-        if not isinstance(processing["series"].get(series_id), Mapping):
-            errors.append(f"missing_processing_series:{series_id}")
-    for feature_id in ("miner_outflow_distribution", "reserve_age_context", "miner_revenue_breakdown", "nupl_phase_basis"):
-        if not isinstance(processing["features"].get(feature_id), Mapping):
-            errors.append(f"missing_processing_feature:{feature_id}")
-    nupl_phase = classification["classifications"].get("nupl_phase")
-    if not isinstance(nupl_phase, Mapping):
-        errors.append("missing_classification:nupl_phase")
-    elif nupl_phase.get("classification_id") != "nupl_phase" or nupl_phase.get("status") not in VALID_STATUSES:
-        errors.append("invalid_classification:nupl_phase")
     for name, contract in (("processing", processing), ("classification", classification)):
         quality = contract["quality"]
         if quality.get("status") not in VALID_QUALITY_STATUSES:
@@ -315,9 +302,9 @@ def build_chart(chart_id: str, processing: Mapping[str, Any], *, data_as_of: int
         "first_timestamp": series.get("records", [{}])[0].get("timestamp") if available_records else None,
         "last_timestamp": series.get("records", [{}])[-1].get("timestamp") if available_records else None,
         "source_resolution": "1d", "fabricated_records": 0}
-    chart["history_contract"] = {"requested_days": 360, "available_days": available_records,
-        "status": "available" if available_records >= 360 else "blocked_upstream",
-        "reason": None if available_records >= 360 else "provider_history_beyond_available_daily_records_unproven"}
+    chart["history_contract"] = {"requested_days": 30, "available_days": available_records,
+        "status": "available" if available_records >= 30 else "blocked_upstream",
+        "reason": None if available_records >= 30 else "provider_history_beyond_available_daily_records_unproven"}
     if chart_id != "miner_net_position_change":
         chart["preferred_representation"] = chart_type
         chart["ohlc_contract"] = {"status": "blocked_upstream", "reason": "daily_scalar_source_has_no_intra_bucket_observations",
@@ -378,174 +365,12 @@ def _record_ranges(records: Any, *, data_as_of: int | None, item_key: str, point
     return output, []
 
 
-def _drilldown_status(source_status: Any, *, usable: bool, errors: Sequence[str]) -> tuple[str, bool]:
-    status = str(source_status) if source_status in VALID_STATUSES else "invalid"
-    if errors:
-        status = "invalid"
-    return status, status == "available" or (status == "partial" and usable)
-
-
-def _combined_status(*statuses: Any) -> str:
-    normalized = [str(status) if status in VALID_STATUSES else "invalid" for status in statuses]
-    return max(normalized, key=lambda status: STATUS_PRIORITY[status])
-
-
-def build_miner_outflow_drilldown(processing: Mapping[str, Any], *, data_as_of: int | None) -> tuple[dict[str, Any], list[str]]:
-    feature = processing["features"]["miner_outflow_distribution"]
-    aggregate_series = processing["series"]["miner_outflow_total_btc"]
-    warnings, warning_errors = _messages(feature.get("warnings"), "processing.features.miner_outflow_distribution.warnings")
-    errors, error_errors = _messages(feature.get("errors"), "processing.features.miner_outflow_distribution.errors")
-    build_errors = [*warning_errors, *error_errors]
-    records = feature.get("records", [])
-    ranges, range_errors = _record_ranges(records, data_as_of=data_as_of, item_key="points", point_builder=lambda record: copy.deepcopy(dict(record)))
-    build_errors.extend(range_errors)
-    feature_current = feature.get("current", {})
-    current_status = feature_current.get("status") if isinstance(feature_current, Mapping) else "invalid"
-    timestamp = feature_current.get("timestamp") if isinstance(feature_current, Mapping) else None
-    exact = next((record for record in records if isinstance(record, Mapping) and record.get("timestamp") == timestamp), None) if _timestamp(timestamp) else None
-    if current_status in {"available", "partial"} and exact:
-        current = {"status": current_status, "timestamp": timestamp, "value": exact.get("aggregate_outflow_total_btc"),
-                   "aggregate_outflow_total_btc": exact.get("aggregate_outflow_total_btc"),
-                   "display_value": format_net_position(exact.get("aggregate_outflow_total_btc")), "top_pool_symbol": exact.get("top_pool_symbol"),
-                   "top1_share_ratio": exact.get("top1_share_ratio"), "top3_share_ratio": exact.get("top3_share_ratio"),
-                   "expected_active_pools": exact.get("expected_active_pools"), "observed_active_pools": exact.get("observed_active_pools"),
-                   "missing_active_pools": copy.deepcopy(exact.get("missing_active_pools", [])), "pools": copy.deepcopy(exact.get("pools", []))}
-    else:
-        current = {"status": current_status if current_status in VALID_STATUSES else "invalid", "timestamp": None, "value": None,
-                   "aggregate_outflow_total_btc": None,
-                   "display_value": "--", "top_pool_symbol": None, "top1_share_ratio": None, "top3_share_ratio": None,
-                   "expected_active_pools": None, "observed_active_pools": None, "missing_active_pools": [], "pools": []}
-        if current_status in {"available", "partial"}:
-            build_errors.append("outflow_current_not_in_records")
-    status, enabled = _drilldown_status(_combined_status(feature.get("status"), aggregate_series.get("status")), usable=exact is not None, errors=build_errors)
-    return {"drilldown_id": "miner_outflow_distribution", "title": "Miner outflow distribution", "status": status, "enabled": enabled,
-            "unit": "BTC/day", "current": current, "active_symbols": copy.deepcopy(feature.get("active_symbols", [])),
-            "inactive_symbols": copy.deepcopy(feature.get("inactive_symbols", [])), "series_by_range": ranges,
-            "metadata": {"data_as_of": feature.get("metadata", {}).get("data_as_of")}, "warnings": warnings, "errors": errors}, build_errors
-
-
-def build_reserve_age_drilldown(processing: Mapping[str, Any], *, data_as_of: int | None) -> tuple[dict[str, Any], list[str]]:
-    feature = processing["features"]["reserve_age_context"]
-    miners = processing["series"]["miners_unspent_supply_btc"]
-    warnings, warning_errors = _messages(feature.get("warnings"), "processing.features.reserve_age_context.warnings")
-    errors, error_errors = _messages(feature.get("errors"), "processing.features.reserve_age_context.errors")
-    miner_ranges, miner_errors = _record_ranges(miners.get("records"), data_as_of=data_as_of, item_key="points",
-                                                point_builder=lambda record: {"timestamp": record.get("timestamp"), "value": record.get("value"), "unit": "BTC"})
-    network = feature.get("network_context", {})
-    snapshot_ranges, snapshot_errors = _record_ranges(network.get("records") if isinstance(network, Mapping) else None, data_as_of=data_as_of,
-                                                       item_key="snapshots", point_builder=lambda record: {"timestamp": record.get("timestamp"),
-                                                       "network_total_native_btc": record.get("network_total_native_btc"),
-                                                       "bands": copy.deepcopy(record.get("bands", {}))})
-    build_errors = [*warning_errors, *error_errors, *miner_errors, *snapshot_errors]
-    miner_current = copy.deepcopy(miners.get("current", {}))
-    network_current = copy.deepcopy(network.get("current", {})) if isinstance(network, Mapping) else {}
-    usable = miner_current.get("status") in {"available", "partial"} or network_current.get("status") in {"available", "partial"}
-    status, enabled = _drilldown_status(_combined_status(feature.get("status"), miners.get("status")), usable=usable, errors=build_errors)
-    return {"drilldown_id": "reserve_aging", "title": "Reserve Age Context", "status": status, "enabled": enabled,
-            "semantic_scope": {"miner_specific": "coinbase_outputs_never_moved", "network_context": "bitcoin_network_utxo_age_distribution",
-                               "network_context_is_miner_specific": False},
-            "miner_specific": {"title": "Miner Unspent Supply", "scope": "miner_specific", "unit": "BTC", "current": miner_current,
-                               "series_by_range": miner_ranges},
-            "network_context": {"title": "Bitcoin UTXO Age Distribution", "scope": "bitcoin_network", "is_miner_specific": False,
-                                "current": network_current, "snapshots_by_range": snapshot_ranges},
-            "metadata": {"data_as_of": feature.get("metadata", {}).get("data_as_of")}, "warnings": warnings, "errors": errors}, build_errors
-
-
-def build_revenue_drilldown(processing: Mapping[str, Any], *, data_as_of: int | None) -> tuple[dict[str, Any], list[str]]:
-    feature = processing["features"]["miner_revenue_breakdown"]
-    warnings, warning_errors = _messages(feature.get("warnings"), "processing.features.miner_revenue_breakdown.warnings")
-    errors, error_errors = _messages(feature.get("errors"), "processing.features.miner_revenue_breakdown.errors")
-    records = feature.get("records", [])
-    ranges, range_errors = _record_ranges(records, data_as_of=data_as_of, item_key="points", point_builder=lambda record: copy.deepcopy(dict(record)))
-    build_errors = [*warning_errors, *error_errors, *range_errors]
-    feature_current = feature.get("current", {})
-    timestamp = feature_current.get("timestamp") if isinstance(feature_current, Mapping) else None
-    exact = next((record for record in records if isinstance(record, Mapping) and record.get("timestamp") == timestamp), None) if _timestamp(timestamp) else None
-    if feature_current.get("status") in {"available", "partial"} and exact:
-        current = copy.deepcopy(dict(exact))
-        current["status"] = feature_current["status"]
-        current["display"] = {"total_revenue": format_currency(exact.get("total_revenue_usd")),
-                              "block_reward_revenue": format_currency(exact.get("block_reward_revenue_usd")),
-                              "fee_revenue": format_currency(exact.get("fee_revenue_usd")),
-                              "fee_share": format_percent(exact.get("derived_fee_share_ratio"))}
-    else:
-        current = {"status": feature_current.get("status", "invalid"), "timestamp": None, "total_revenue_usd": None,
-                   "block_reward_revenue_usd": None, "fee_revenue_usd": None, "derived_fee_share_ratio": None,
-                   "derived_fee_share_percent": None, "provider_fee_value": None, "provider_fee_scale": None,
-                   "provider_fee_ratio": None, "provider_fee_difference_ratio": None,
-                   "display": {"total_revenue": "--", "block_reward_revenue": "--", "fee_revenue": "--", "fee_share": "--"}}
-        if feature_current.get("status") in {"available", "partial"}:
-            build_errors.append("revenue_current_not_in_records")
-    source_status = _combined_status(feature.get("status"), *(processing["series"][series_id].get("status") for series_id in
-                                     ("miner_revenue_total_usd", "miner_block_reward_revenue_usd", "miner_fee_revenue_usd", "miner_fee_share_ratio")))
-    status, enabled = _drilldown_status(source_status, usable=exact is not None, errors=build_errors)
-    return {"drilldown_id": "revenue_breakdown", "title": "Miner revenue breakdown", "status": status, "enabled": enabled,
-            "unit": "USD/day", "current": current, "series_by_range": ranges, "metadata": copy.deepcopy(feature.get("metadata", {})),
-            "warnings": warnings, "errors": errors}, build_errors
-
-
-def _phase_bands(thresholds: Mapping[str, Any]) -> list[dict[str, Any]]:
-    return [{"state": "capitulation", "minimum": None, "maximum": thresholds.get("capitulation_max"),
-             "minimum_inclusive": False, "maximum_inclusive": False},
-            {"state": "hope_fear", "minimum": thresholds.get("capitulation_max"), "maximum": thresholds.get("hope_fear_max"),
-             "minimum_inclusive": True, "maximum_inclusive": False},
-            {"state": "optimism_anxiety", "minimum": thresholds.get("hope_fear_max"), "maximum": thresholds.get("optimism_anxiety_max"),
-             "minimum_inclusive": True, "maximum_inclusive": False},
-            {"state": "belief_denial", "minimum": thresholds.get("optimism_anxiety_max"), "maximum": thresholds.get("belief_denial_max"),
-             "minimum_inclusive": True, "maximum_inclusive": False},
-            {"state": "euphoria_greed", "minimum": thresholds.get("belief_denial_max"), "maximum": None,
-             "minimum_inclusive": True, "maximum_inclusive": False}]
-
-
-def build_nupl_drilldown(processing: Mapping[str, Any], classification: Mapping[str, Any], *, data_as_of: int | None) -> tuple[dict[str, Any], list[str]]:
-    series = processing["series"]["nupl"]
-    basis = processing["features"]["nupl_phase_basis"]
-    phase_source = classification["classifications"]["nupl_phase"]
-    warnings, warning_errors = _messages(phase_source.get("warnings"), "classification.nupl_phase.warnings")
-    errors, error_errors = _messages(phase_source.get("errors"), "classification.nupl_phase.errors")
-    ranges, range_errors = _record_ranges(series.get("records"), data_as_of=data_as_of, item_key="points",
-                                           point_builder=lambda record: {"timestamp": record.get("timestamp"), "value": record.get("value"),
-                                           "price_usd": record.get("price_usd")})
-    build_errors = [*warning_errors, *error_errors, *range_errors]
-    basis_current = basis.get("current", {})
-    if isinstance(basis_current, Mapping) and basis_current.get("status") in {"available", "partial"}:
-        current = {"status": basis_current.get("status"), "timestamp": basis_current.get("timestamp"), "value": basis_current.get("value"),
-                   "price_usd": basis_current.get("price_usd"), "display_value": format_sopr(basis_current.get("value")),
-                   "display_price": format_price(basis_current.get("price_usd"))}
-    else:
-        current = {"status": basis_current.get("status", "unavailable") if isinstance(basis_current, Mapping) else "invalid", "timestamp": None,
-                   "value": None, "price_usd": None, "display_value": "--", "display_price": "--"}
-    thresholds = copy.deepcopy(phase_source.get("thresholds", {}))
-    phase = {"status": phase_source.get("status"), "state": phase_source.get("state"), "signal": phase_source.get("signal"),
-             "classification_label": phase_source.get("display_label"), "display_color_token": phase_source.get("display_color_token"),
-             "reason": phase_source.get("reason"), "thresholds": thresholds,
-             "previous": copy.deepcopy(phase_source.get("source", {}).get("previous")),
-             "change_1d": phase_source.get("source", {}).get("change_1d")}
-    usable = current["status"] in {"available", "partial"} and phase_source.get("state") is not None
-    status, enabled = _drilldown_status(_combined_status(phase_source.get("status"), basis.get("status"), series.get("status")), usable=usable,
-                                        errors=build_errors)
-    return {"drilldown_id": "nupl_phases", "title": "NUPL phases", "status": status, "enabled": enabled, "unit": "ratio",
-            "current": current, "phase": phase, "series_by_range": ranges, "phase_bands": _phase_bands(thresholds),
-            "metadata": {"data_as_of": phase_source.get("source", {}).get("timestamp")}, "warnings": warnings, "errors": errors}, build_errors
-
-
-def build_drilldowns(processing: Mapping[str, Any], classification: Mapping[str, Any], *, data_as_of: int | None) -> tuple[dict[str, Any], list[str]]:
-    drilldowns: dict[str, Any] = {}
-    errors: list[str] = []
-    builders = (("miner_outflow_distribution", lambda: build_miner_outflow_drilldown(processing, data_as_of=data_as_of)),
-                ("reserve_aging", lambda: build_reserve_age_drilldown(processing, data_as_of=data_as_of)),
-                ("revenue_breakdown", lambda: build_revenue_drilldown(processing, data_as_of=data_as_of)),
-                ("nupl_phases", lambda: build_nupl_drilldown(processing, classification, data_as_of=data_as_of)))
-    for drilldown_id, builder in builders:
-        drilldowns[drilldown_id], item_errors = builder()
-        item = drilldowns[drilldown_id]
-        ranges = item.get("series_by_range") or item.get("miner_specific", {}).get("series_by_range") or item.get("network_context", {}).get("snapshots_by_range") or {}
-        item["calculation_history"] = {"source": "processing_full_available_history", "fabricated_records": 0,
-            "ranges": {range_id: {"actual_points": payload.get("actual_points"), "expected_points": payload.get("expected_points"),
-                "status": payload.get("status")} for range_id, payload in ranges.items() if isinstance(payload, Mapping)}}
-        errors.extend(f"drilldown_build_error:{drilldown_id}:{error}" for error in item_errors)
-    return drilldowns, errors
-
+def build_drilldowns(
+    processing: Mapping[str, Any], classification: Mapping[str, Any], *, data_as_of: int | None
+) -> tuple[dict[str, Any], list[str]]:
+    """VR1 has no On-Chain drilldown surface."""
+    del processing, classification, data_as_of
+    return {}, []
 
 def _fallback(mode: Any, errors: Sequence[str]) -> dict[str, Any]:
     ranges = {range_id: _empty_range(range_id, "invalid", "invalid_upstream_contract") for range_id in RANGE_OPTIONS}
@@ -557,25 +382,21 @@ def _fallback(mode: Any, errors: Sequence[str]) -> dict[str, Any]:
     widgets = {widget_id: {"widget_id": widget_id, "title": WIDGET_TITLES[widget_id], "status": "invalid", "state": None, "signal": None,
                            "classification_label": "INVALID", "display_value": "--", "display_color_token": "invalid", "source": {}, "thresholds": {},
                            "reason": "invalid_upstream_contract", "warnings": [], "errors": []} for widget_id in WIDGET_IDS}
-    drilldown_titles = {"miner_outflow_distribution": "Miner outflow distribution", "reserve_aging": "Reserve Age Context",
-                        "revenue_breakdown": "Miner revenue breakdown", "nupl_phases": "NUPL phases"}
-    drilldowns = {drilldown_id: {"drilldown_id": drilldown_id, "title": drilldown_titles[drilldown_id], "status": "invalid", "enabled": False,
-                                 "current": {"status": "unavailable", "timestamp": None, "value": None, "display_value": "--"},
-                                 "warnings": [], "errors": ["invalid_upstream_contract"]} for drilldown_id in DRILLDOWN_IDS}
+    drilldowns: dict[str, Any] = {}
     context = {"asset": None, "data_mode": None, "is_demo": None, "reference_timestamp": None, "execution_timestamp": None, "generated_at": None,
                "processing_data_as_of": None, "classification_data_as_of": None, "data_as_of": None,
                "calculation_history": "full_available_history", "presentation_default_range": DEFAULT_RANGE}
     quality = {"status": "invalid", "availability": {"charts": {chart_id: "invalid" for chart_id in CHART_IDS},
                                                        "widgets": {widget_id: "invalid" for widget_id in WIDGET_IDS},
-                                                       "drilldowns": {drilldown_id: "invalid" for drilldown_id in DRILLDOWN_IDS}}, "data_as_of": None,
-               "processing_status": "invalid", "classification_status": "invalid", "missing_fields": [*CHART_IDS, *WIDGET_IDS, *DRILLDOWN_IDS],
+                                                       }, "data_as_of": None,
+               "processing_status": "invalid", "classification_status": "invalid", "missing_fields": [*CHART_IDS, *WIDGET_IDS],
                "warnings": [], "errors": _stable_unique(list(errors)), "optional_unavailable": []}
     return {"schema": {"id": ON_CHAIN_MINERS_CONTRACT_SCHEMA, "version": ON_CHAIN_MINERS_CONTRACT_VERSION},
             "screen": {"id": ON_CHAIN_MINERS_SCREEN_ID, "route": ON_CHAIN_MINERS_ROUTE, "title": ON_CHAIN_MINERS_TITLE, "family": "on_chain_miners"},
             "stage": "screen_contract", "mode": mode if mode in VALID_MODES else None, "context": context, "range_selector": build_range_selector(),
             "operational_status": {"data_mode": None, "is_demo": None, "quality_status": "invalid", "connection_status": "not_reported",
                                    "cache_status": "not_reported", "generated_at": None, "data_as_of": None},
-            "charts": charts, "widgets": widgets, "drilldowns": drilldowns, "quality": quality}
+            "charts": charts, "widgets": widgets, "quality": quality}
 
 
 def evaluate_screen_quality(*, processing: Mapping[str, Any], classification: Mapping[str, Any], charts: Mapping[str, Any],
@@ -601,7 +422,8 @@ def evaluate_screen_quality(*, processing: Mapping[str, Any], classification: Ma
         warnings.extend(f"drilldown_warning:{drilldown_id}:{message}" for message in drilldown["warnings"])
         errors.extend(f"drilldown_error:{drilldown_id}:{message}" for message in drilldown["errors"])
     all_availability = (*chart_availability.values(), *widget_availability.values(), *drilldown_availability.values())
-    missing = [name for name, status in {**chart_availability, **widget_availability, **drilldown_availability}.items() if status in {"unavailable", "invalid"}]
+    missing = [name for name, status in {**chart_availability, **widget_availability}.items() if status in {"unavailable", "invalid"}]
+    optional_unavailable = [name for name, status in drilldown_availability.items() if status == "unavailable"]
     semantic = any(status in {"available", "partial"} for status in all_availability)
     if p_quality.get("status") == "invalid" or c_quality.get("status") == "invalid" or errors or "invalid" in all_availability:
         status = "invalid"
@@ -611,10 +433,10 @@ def evaluate_screen_quality(*, processing: Mapping[str, Any], classification: Ma
         status = "partial" if semantic else "invalid"
     if status == "partial" and not warnings and not errors and not missing:
         warnings.append("screen_quality_partial")
-    return {"status": status, "availability": {"charts": chart_availability, "widgets": widget_availability, "drilldowns": drilldown_availability},
+    return {"status": status, "availability": {"charts": chart_availability, "widgets": widget_availability},
             "data_as_of": data_as_of if status != "invalid" else None, "processing_status": p_quality.get("status"),
             "classification_status": c_quality.get("status"), "missing_fields": _stable_unique(missing), "warnings": _stable_unique(warnings),
-            "errors": _stable_unique(errors), "optional_unavailable": []}
+            "errors": _stable_unique(errors), "optional_unavailable": _stable_unique(optional_unavailable)}
 
 
 class OnChainMinersContractBuilder:
@@ -655,13 +477,13 @@ class OnChainMinersContractBuilder:
                   "operational_status": {"data_mode": context.get("data_mode"), "is_demo": context.get("is_demo"), "quality_status": quality["status"],
                                          "connection_status": "not_reported", "cache_status": "not_reported", "generated_at": context.get("generated_at"),
                                          "data_as_of": quality["data_as_of"]},
-                  "charts": charts, "widgets": widgets, "drilldowns": drilldowns,
+                  "charts": charts, "widgets": widgets,
                   "technical_analysis": {"status": "blocked_upstream", "recalculate_in_hmi": False,
                       "targets": {chart_id: {"status": "blocked_upstream", "reason": "daily_scalar_source_has_no_legitimate_ohlc",
                           "required_capability": "multiple_temporal_observations_per_daily_bucket", "indicator_ids": [],
                           "technical_event_ids": []} for chart_id in ("miner_reserve", "sopr_7d", "hashrate", "difficulty")},
                       "event_indexes": {"by_id": {}, "technical_event_ids": []}},
-                  "history_contract": {"requested_days": 360, "available_days": min(
+                  "history_contract": {"requested_days": 30, "available_days": min(
                       len(processing["series"][series_id].get("records", [])) for series_id, *_ in SERIES_CONFIG.values()),
                       "status": "blocked_upstream", "fabricated_records": 0},
                   "quality": quality}
@@ -688,3 +510,321 @@ def build_on_chain_miners_screen_contract(processing_contract: Mapping[str, Any]
     if processing_before != processing_after or classification_before != classification_after:
         raise RuntimeError("Contract Builder mutated an upstream contract")
     return output
+
+# --- Canonical Screen contract shaping ---
+from copy import deepcopy
+
+from datetime import datetime, timezone
+
+import json
+
+import math
+
+from pathlib import Path
+
+from typing import Any, Mapping
+
+_screen_TEMPLATE_PATH = Path(__file__).with_name('screen_template.json')
+
+_screen_VERSION = '2.0.0'
+
+_screen_RANGES = {'7D': 7, '30D': 30}
+
+_screen_PRIMARY = {'miner_reserve': 'miner_reserve_btc', 'sopr_7d': 'sopr_7d', 'hashrate': 'hashrate_eh_s', 'difficulty': 'difficulty_t'}
+
+_screen_MISSING = object()
+
+_screen_PROVIDERS = {'miner_reserve': 'glassnode', 'sopr_7d': 'glassnode', 'hashrate': 'glassnode', 'difficulty': 'glassnode'}
+
+def _screen_template() -> dict[str, Any]:
+    return json.loads(_screen_TEMPLATE_PATH.read_text(encoding='utf-8'))
+
+def _screen_finite(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+        return None
+    return 0.0 if value == 0 else value
+
+def _screen_iso(timestamp: Any) -> str | None:
+    if type(timestamp) is not int or timestamp <= 0:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def _screen_display(value: Any, chart_id: str) -> str:
+    value = _screen_finite(value)
+    if value is None:
+        return '—'
+    if chart_id == 'miner_reserve':
+        return f'{value / 1000000:.3f}M'
+    if chart_id == 'sopr_7d':
+        return f'{value:.3f}'
+    if chart_id == 'hashrate':
+        return f'{value:.1f} EH/s'
+    if chart_id == 'difficulty':
+        return f'{value:.2f} T'
+    if chart_id == 'miner_net_position_change':
+        return f'{value:+,.0f}'
+    return str(value)
+
+def _screen_context(reference: Mapping[str, Any], processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+    pctx = processing.get('context', {})
+    out = deepcopy(dict(reference))
+    data_as_of = min((x for x in (processing.get('quality', {}).get('data_as_of'), classification.get('quality', {}).get('data_as_of')) if type(x) is int)) if any((type(x) is int for x in (processing.get('quality', {}).get('data_as_of'), classification.get('quality', {}).get('data_as_of')))) else None
+    calc_days = min((len(processing.get('series', {}).get(series_id, {}).get('daily_candles', [])) for series_id in _screen_PRIMARY.values()))
+    is_demo = bool(pctx.get('is_demo'))
+    out.update({'asset': pctx.get('asset', 'BTC'), 'data_mode': pctx.get('data_mode'), 'is_demo': is_demo, 'reference_timestamp': pctx.get('reference_timestamp'), 'execution_timestamp': pctx.get('execution_timestamp'), 'generated_at': pctx.get('generated_at'), 'processing_data_as_of': processing.get('quality', {}).get('data_as_of'), 'classification_data_as_of': classification.get('quality', {}).get('data_as_of'), 'data_as_of': data_as_of, 'calculation_history': 'full_available_history', 'presentation_default_range': '30D', 'calculation_history_days': calc_days, 'fixture_seed': None, 'fixture_as_of_timestamp': None, 'fixture_as_of_iso': None, 'synthetic_fixture': False, 'realism_refactor_version': 'runtime_emulator_v1' if is_demo else 'runtime_provider_v1', 'realism_note': 'Glassnode-primary miner/on-chain runtime acquired at 24h resolution; Processing publishes daily presentation series.'})
+    return out
+
+def _screen_range_selector(reference: Mapping[str, Any]) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    out['options'] = [{'id': key, 'label': key, 'days': days} for key, days in _screen_RANGES.items()]
+    out.update({'default': '30D'})
+    out.pop('source_resolution', None)
+    out.pop('provider_intraday_resolution_used_for_ohlc', None)
+    out.pop('intraday_available', None)
+    return out
+
+def _screen_candle(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {'timestamp': row.get('timestamp'), 'open': _screen_finite(row.get('open')), 'high': _screen_finite(row.get('high')), 'low': _screen_finite(row.get('low')), 'close': _screen_finite(row.get('close')), 'is_closed': bool(row.get('is_closed', True))}
+
+def _screen_primary_range(
+    candles: list[dict[str, Any]], *, range_id: str, unit: str, representation: str
+) -> dict[str, Any]:
+    """Project Processing daily OHLC history to the HMI presentation points contract.
+
+    Processing may retain daily candles for calculations, but Screen A is a scalar
+    time-series view.  The HMI must receive ``points`` directly and never derive
+    presentation values from ``calculation_history.candles``.
+    """
+    days = _screen_RANGES[range_id]
+    rows = candles[-days:]
+    points = [
+        {"timestamp": row.get("timestamp"), "value": row.get("close"), "unit": unit}
+        for row in rows
+        if _screen_finite(row.get("close")) is not None
+    ]
+    actual = len(points)
+    status = 'available' if actual == days else 'partial' if actual else 'unavailable'
+    return {
+        'range_id': range_id,
+        'days': days,
+        'status': status,
+        'from_timestamp': points[0]['timestamp'] if points else None,
+        'to_timestamp': points[-1]['timestamp'] if points else None,
+        'expected_points': days,
+        'actual_points': actual,
+        'coverage_ratio': min(actual / days, 1.0),
+        'reason': None if status == 'available' else 'range_history_partial' if actual else 'range_history_unavailable',
+        'warnings': [],
+        'errors': [],
+        'representation': representation,
+        'points': points,
+        'point_count': actual,
+    }
+
+def _screen_primary_chart(ref: Mapping[str, Any], chart_id: str, processing: Mapping[str, Any], is_demo: bool) -> dict[str, Any]:
+    series = processing['series'][_screen_PRIMARY[chart_id]]
+    candles = [_screen_candle(row) for row in series.get('daily_candles', []) if isinstance(row, Mapping)]
+    last = candles[-1] if candles else None
+    out = deepcopy(dict(ref))
+    out['provider'] = _screen_PROVIDERS[chart_id]
+    out['status'] = series.get('status')
+    out['current'] = {'status': series.get('status'), 'timestamp': last.get('timestamp') if last else None, 'value': last.get('close') if last else None, 'unit': series.get('unit'), 'display_value': _screen_display(last.get('close') if last else None, chart_id)}
+    representation = str(ref.get('preferred_representation') or ref.get('chart_type') or 'line')
+    out['series_by_range'] = {
+        rid: _screen_primary_range(
+            candles, range_id=rid, unit=str(series.get('unit') or ''), representation=representation
+        )
+        for rid in _screen_RANGES
+    }
+    out['warnings'] = deepcopy(series.get('warnings', []))
+    out['errors'] = deepcopy(series.get('errors', []))
+    out['preferred_representation'] = representation
+    out['reason'] = None if candles else 'provider_history_unavailable'
+    ohlc = deepcopy(ref.get('ohlc_contract', {}))
+    ohlc.update({'construction_stage': 'processing', 'native_provider_ohlc': False, 'hmi_must_reconstruct_ohlc': False, 'line_fallback_allowed': False, 'volume_allowed': False})
+    ohlc['construction_rule'] = {'open': 'first_real_value_in_bucket', 'high': 'max_real_value_in_bucket', 'low': 'min_real_value_in_bucket', 'close': 'last_real_value_in_bucket'}
+    out['ohlc_contract'] = ohlc
+    out['history_contract'] = {'history_days': len(candles), 'history_points': len(candles), 'from_timestamp': candles[0]['timestamp'] if candles else None, 'to_timestamp': candles[-1]['timestamp'] if candles else None, 'calculation_resolution': '1D', 'provider_source_resolution': '24h', 'daily_ohlc_construction': 'processing_from_provider_daily_samples', 'minimum_warmup_required_days': 200, 'sma_200_fully_formed_in_all_visible_ranges': len(candles) >= 559, 'synthetic_fixture': False}
+    out['calculation_history'] = {'resolution': '1d', 'point_count': len(candles), 'candles': deepcopy(candles)}
+    return out
+
+def _screen_point_range(records: list[dict[str, Any]], range_id: str) -> dict[str, Any]:
+    days = _screen_RANGES[range_id]
+    rows = records[-days:]
+    actual = len(rows)
+    status = 'available' if actual == days else 'partial' if actual else 'unavailable'
+    return {'range_id': range_id, 'days': days, 'status': status, 'from_timestamp': rows[0]['timestamp'] if rows else None, 'to_timestamp': rows[-1]['timestamp'] if rows else None, 'expected_points': days, 'actual_points': actual, 'coverage_ratio': min(actual / days, 1.0), 'points': deepcopy(rows), 'reason': None if status == 'available' else 'range_history_partial' if actual else 'range_history_unavailable', 'warnings': [], 'errors': []}
+
+def _screen_net_position_chart(ref: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    series = processing['series']['miner_net_position_change']
+    records = [{'timestamp': row.get('timestamp'), 'value': _screen_finite(row.get('value')), 'unit': 'BTC/day'} for row in series.get('records', []) if isinstance(row, Mapping) and _screen_finite(row.get('value')) is not None]
+    last = records[-1] if records else None
+    out = deepcopy(dict(ref))
+    out.update({'provider': 'glassnode', 'source_provider': 'glassnode', 'calculation_source': 'processing.series.miner_net_position_change.records', 'status': series.get('status'), 'reason': None if records else 'provider_history_unavailable'})
+    out['subtitle'] = 'Direct Glassnode Miner Net Position Change'
+    out['current'] = {'status': series.get('status'), 'timestamp': last.get('timestamp') if last else None, 'value': last.get('value') if last else None, 'unit': 'BTC/day', 'display_value': _screen_display(last.get('value') if last else None, 'miner_net_position_change')}
+    out['series_by_range'] = {rid: _screen_point_range(records, rid) for rid in _screen_RANGES}
+    out['warnings'] = deepcopy(series.get('warnings', []))
+    out['errors'] = deepcopy(series.get('errors', []))
+    out['calculation_history'] = {'resolution': '1d', 'point_count': len(records), 'points': deepcopy(records)}
+    return out
+
+def _screen_charts(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    is_demo = bool(processing.get('context', {}).get('is_demo'))
+    out = {cid: _screen_primary_chart(reference[cid], cid, processing, is_demo) for cid in _screen_PRIMARY}
+    out['miner_net_position_change'] = _screen_net_position_chart(reference['miner_net_position_change'], processing)
+    return out
+
+def _screen_widgets(reference: Mapping[str, Any], candidate: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for wid, ref in reference.items():
+        item = deepcopy(candidate.get(wid, {})) if isinstance(candidate.get(wid), Mapping) else {}
+        if wid == 'net_position' and isinstance(item.get('source'), Mapping):
+            item['source']['feature_id'] = 'miner_net_position_change'
+        out[wid] = _screen_shape(ref, item)
+    return out
+
+def _screen_slice(values: Any, count: int) -> list[Any]:
+    return deepcopy(values[-count:]) if isinstance(values, list) else []
+
+def _screen_quality(reference: Mapping[str, Any], processing: Mapping[str, Any], classification: Mapping[str, Any], charts: Mapping[str, Any], drilldowns: Mapping[str, Any]) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    pq = processing.get('quality', {})
+    cq = classification.get('quality', {})
+    statuses = [pq.get('status'), cq.get('status'), *[x.get('status') for x in charts.values() if isinstance(x, Mapping)]]
+    status = 'invalid' if 'invalid' in statuses else 'partial' if 'partial' in statuses else 'unavailable' if all((x == 'unavailable' for x in statuses if x)) else 'available'
+    warnings = deepcopy(pq.get('warnings', []))
+    if pq.get('data_as_of') is None:
+        warnings.append('processing_data_as_of_unavailable')
+    if cq.get('data_as_of') is None:
+        warnings.append('classification_data_as_of_unavailable')
+    out.update({'status': status, 'data_as_of': pq.get('data_as_of'), 'processing_status': pq.get('status'), 'classification_status': cq.get('status'), 'missing_fields': deepcopy(pq.get('missing_fields', [])), 'warnings': list(dict.fromkeys(warnings)), 'errors': deepcopy(pq.get('errors', []))})
+    ext = deepcopy(out.get('extensions', {}))
+    for key in list(ext):
+        low = key.lower()
+        if 'net_position_derived' in low:
+            ext[key] = False
+    return out | {'extensions': ext}
+
+def _screen_history(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    out = deepcopy(dict(reference))
+    counts = [len(processing.get('series', {}).get(series_id, {}).get('daily_candles', [])) for series_id in _screen_PRIMARY.values()]
+    calc = min(counts) if counts else 0
+    demo = bool(processing.get('context', {}).get('is_demo'))
+    out.update({'calculation_records': calc, 'minimum_warmup_records': 200, 'maximum_standard_indicator_period': 200, 'all_visible_moving_averages_warm': calc >= 559, 'technical_indicators_precomputed': True, 'hmi_recalculation': False, 'synthetic_fixture': False, 'fixture_seed': None, 'resolution': '1d', 'note': f'{calc} daily calculation records available across all primary on-chain metrics.'})
+    return out
+
+def _screen_shape(reference: Any, candidate: Any=_screen_MISSING) -> Any:
+    """Project onto exact SP keys while preserving explicit runtime nulls."""
+    if isinstance(reference, dict):
+        source = candidate if isinstance(candidate, Mapping) else {}
+        return {key: _screen_shape(value, source.get(key, _screen_MISSING)) for key, value in reference.items()}
+    if isinstance(reference, list):
+        if candidate is _screen_MISSING:
+            return deepcopy(reference)
+        if not isinstance(candidate, list):
+            return deepcopy(candidate)
+        if not reference:
+            return deepcopy(candidate)
+        if all((not isinstance(x, (dict, list)) for x in reference)):
+            return deepcopy(candidate)
+        identity_keys = ('metric_id', 'widget_id', 'chart_id', 'indicator_id', 'event_group', 'event_id', 'id', 'state', 'range_id')
+
+        def ref_for(item: Any, index: int) -> Any:
+            if isinstance(item, Mapping):
+                if item.get('event_group') is not None:
+                    has_gate = isinstance(item.get('calculation'), Mapping) and 'gate' in item.get('calculation', {})
+                    for ref_item in reference:
+                        if not isinstance(ref_item, Mapping) or ref_item.get('event_group') != item.get('event_group'):
+                            continue
+                        ref_gate = isinstance(ref_item.get('calculation'), Mapping) and 'gate' in ref_item.get('calculation', {})
+                        if ref_gate == has_gate and bool(ref_item.get('indicator_id')) == bool(item.get('indicator_id')):
+                            return ref_item
+                for key in identity_keys:
+                    value = item.get(key)
+                    if value is None:
+                        continue
+                    for ref_item in reference:
+                        if isinstance(ref_item, Mapping) and ref_item.get(key) == value:
+                            return ref_item
+            return reference[index] if index < len(reference) else reference[0]
+        return [_screen_shape(ref_for(item, index), item) for index, item in enumerate(candidate)]
+    return deepcopy(reference if candidate is _screen_MISSING else candidate)
+
+def _screen_analysis_summary(indicator_id: str, package: Mapping[str, Any]) -> dict[str, Any]:
+    series = package if isinstance(package, Mapping) else {}
+
+    def last(name: str) -> float | None:
+        values = series.get(name, [])
+        if not isinstance(values, list):
+            return None
+        for value in reversed(values):
+            value = _screen_finite(value)
+            if value is not None:
+                return float(value)
+        return None
+    if indicator_id == 'miner_reserve_change_zscore':
+        value = last('reserve_change_zscore')
+        signal = 'DISTRIBUTION' if value is not None and value <= -1.0 else 'ACCUMULATION' if value is not None and value >= 1.0 else 'NEUTRAL'
+        display = '—' if value is None else f'{value:+.2f}σ'
+        return {'label': 'MINER TREASURY', 'display_value': display, 'signal': signal, 'strength': 2 if value is not None and abs(value) >= 2 else 1}
+    if indicator_id == 'miner_selling_pressure':
+        value = last('selling_pressure_score')
+        signal = 'HIGH PRESSURE' if value is not None and value >= 1.0 else 'LOW PRESSURE' if value is not None and value <= -1.0 else 'NORMAL'
+        return {'label': 'SELLING PRESSURE', 'display_value': '—' if value is None else f'{value:+.2f}', 'signal': signal, 'strength': 2 if value is not None and abs(value) >= 2 else 1}
+    if indicator_id == 'puell_revenue_stress':
+        value = last('puell_multiple')
+        signal = 'STRESSED' if value is not None and value < 0.7 else 'ELEVATED PROFITABILITY' if value is not None and value > 1.5 else 'NORMAL'
+        return {'label': 'MINER ECONOMICS', 'display_value': '—' if value is None else f'{value:.2f}x', 'signal': signal, 'strength': 2 if value is not None and (value < 0.5 or value > 2.0) else 1}
+    if indicator_id == 'hashrate_momentum_hash_ribbon':
+        value = last('hash_momentum_pct')
+        signal = 'HASH RECOVERY' if value is not None and value >= 0 else 'HASH CONTRACTION'
+        return {'label': 'NETWORK HEALTH', 'display_value': '—' if value is None else f'{value:+.2f}%', 'signal': signal, 'strength': 1}
+    if indicator_id == 'hashrate_difficulty_stress':
+        value = last('network_stress_score')
+        signal = 'STRESS' if value is not None and value >= 1 else 'RELIEF' if value is not None and value <= -1 else 'BALANCED'
+        return {'label': 'NETWORK STRESS', 'display_value': '—' if value is None else f'{value:+.2f}', 'signal': signal, 'strength': 2 if value is not None and abs(value) >= 2 else 1}
+    value = last('regime_score')
+    cap = last('capitulation_probability_pct')
+    wass = last('wasserstein_distance')
+    signal = 'CAPITULATION' if value is not None and value >= 1 else 'RECOVERY' if value is not None and value <= -0.5 else 'TRANSITION'
+    secondary = '—'
+    if cap is not None or wass is not None:
+        secondary = f'Capitulation {(0 if cap is None else cap):.0f}% · W {(0 if wass is None else wass):.2f}'
+    return {'label': 'MINER REGIME', 'display_value': '—' if value is None else f'{value:+.2f}', 'signal': signal, 'strength': 2 if value is not None and abs(value) >= 2 else 1, 'secondary': secondary}
+
+def _screen_miner_analysis(reference: Mapping[str, Any], processing: Mapping[str, Any]) -> dict[str, Any]:
+    native = processing.get('miner_analysis', {})
+    native = native if isinstance(native, Mapping) else {}
+    native_indicators = native.get('indicators', {}) if isinstance(native.get('indicators'), Mapping) else {}
+    timestamps = native.get('timestamps', [])
+    timestamps = list(timestamps) if isinstance(timestamps, list) else []
+    is_demo = bool(processing.get('context', {}).get('is_demo'))
+    built_indicators: dict[str, Any] = {}
+    for indicator_id, ref_indicator in reference.get('indicators', {}).items():
+        package = native_indicators.get(indicator_id, {})
+        package = package if isinstance(package, Mapping) else {}
+        ranges: dict[str, Any] = {}
+        for range_id, ref_range in ref_indicator.get('series_by_range', {}).items():
+            count = _screen_RANGES.get(range_id, len(timestamps))
+            selected_ts = timestamps[-count:]
+            series = {}
+            for series_id in ref_range.get('series', {}):
+                values = package.get(series_id, [])
+                series[series_id] = _screen_slice(values, len(selected_ts))
+            dynamic_range = {'timestamps': selected_ts, 'series': series, 'point_count': len(selected_ts), 'status': 'available' if selected_ts else 'unavailable'}
+            ranges[range_id] = _screen_shape(ref_range, dynamic_range)
+        dynamic = {'indicator_id': indicator_id, 'status': native.get('status', 'unavailable'), 'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'processing_contract_target': True, 'real_market_calculation': not is_demo, 'hmi_recalculate': False, 'series_by_range': ranges, 'summary': _screen_analysis_summary(indicator_id, package)}
+        built_indicators[indicator_id] = _screen_shape(ref_indicator, dynamic)
+    dynamic_root = {'analysis_id': 'on_chain_miners_native_v1', 'status': native.get('status', 'unavailable'), 'data_mode': 'synthetic_emulator' if is_demo else 'live_provider', 'processing_contract_target': True, 'hmi_computes_market_indicators': False, 'indicators': built_indicators}
+    return _screen_shape(reference, dynamic_root)
+
+def align_on_chain_miners_to_sp_v2_0(candidate: Mapping[str, Any], processing: Mapping[str, Any], classification: Mapping[str, Any]) -> dict[str, Any]:
+    ref = _screen_template()
+    context = _screen_context(ref['context'], processing, classification)
+    charts = _screen_charts(ref['charts'], processing)
+    drilldowns: dict[str, Any] = {}
+    built = {'schema': {'id': ref['schema']['id'], 'version': _screen_VERSION}, 'screen': deepcopy(ref['screen']), 'stage': 'screen_contract', 'mode': processing.get('mode'), 'context': context, 'range_selector': _screen_range_selector(ref['range_selector']), 'operational_status': {**deepcopy(ref['operational_status']), 'data_mode': context.get('data_mode'), 'is_demo': context.get('is_demo'), 'quality_status': processing.get('quality', {}).get('status'), 'connection_status': 'emulator' if context.get('is_demo') else 'market_api', 'generated_at': context.get('generated_at'), 'data_as_of': context.get('data_as_of')}, 'charts': charts, 'widgets': _screen_widgets(ref['widgets'], candidate.get('widgets', {}), classification), 'quality': {}, 'history_contract': _screen_history(ref['history_contract'], processing), 'miner_analysis': _screen_miner_analysis(ref['miner_analysis'], processing)}
+    built['quality'] = _screen_quality(ref['quality'], processing, classification, charts, drilldowns)
+    built['operational_status']['quality_status'] = built['quality']['status']
+    return _screen_shape(ref, built)

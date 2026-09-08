@@ -10,17 +10,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .volatility_market_regimes_data_raw_extract import (
-    BASE_INTERVAL, BOOTSTRAP_HISTORY_DAYS, GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID,
+    BASE_INTERVAL, BOOTSTRAP_HISTORY_DAYS, GLASSNODE_PROVIDER,
     GLASSNODE_DVOL_ENDPOINT_ID, INTERVAL_SECONDS, VALID_MODES,
     VOLATILITY_MARKET_REGIMES_FAMILY,
 )
 
 STALE_TOLERANCE = 2 * INTERVAL_SECONDS
-DATASETS = {
-    (GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID): ("glassnode", "realized_volatility"),
-    (GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): ("glassnode", "dvol"),
-}
-DATASET_IDS = tuple(f"{provider}.{name}" for provider, name in DATASETS.values())
+DATASETS = {(GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): ("glassnode", "dvol")}
+DATASET_IDS = ("glassnode.dvol",)
 
 
 def _sequence(value: Any) -> bool:
@@ -63,18 +60,15 @@ def unwrap_glassnode_response(response: Any) -> list[Any]:
     return list(response)
 
 
-def normalize_glassnode_realized_volatility_record(record: Any) -> dict[str, Any]:
-    if not isinstance(record, Mapping):
-        raise ValueError("invalid_record")
-    value = _finite(record.get("v"), "realized_volatility", non_negative=True)
-    return {"timestamp": _timestamp(record.get("t"), "timestamp"), "value_native": value,
-            "value_percent": 0.0 if value == 0 else value * 100}
-
-
 def normalize_glassnode_dvol_record(record: Any) -> dict[str, Any]:
     if not isinstance(record, Mapping):
         raise ValueError("invalid_record")
-    payload = record.get("v") if isinstance(record.get("v"), Mapping) else record
+    if isinstance(record.get("v"), Mapping):
+        payload = record["v"]
+    elif isinstance(record.get("o"), Mapping):
+        payload = record["o"]
+    else:
+        payload = record
     o = _finite(payload.get("o"), "dvol_open", non_negative=True)
     h = _finite(payload.get("h"), "dvol_high", non_negative=True)
     l = _finite(payload.get("l"), "dvol_low", non_negative=True)
@@ -106,7 +100,7 @@ def _previous(existing: Mapping[str, Any] | None, name: str) -> Mapping[str, Any
 
 def _dataset(*, requests: Sequence[Mapping[str, Any]], existing: Mapping[str, Any], endpoint_id: str,
              reference_timestamp: int, execution_timestamp: int) -> dict[str, Any]:
-    normalizer = normalize_glassnode_dvol_record if endpoint_id == GLASSNODE_DVOL_ENDPOINT_ID else normalize_glassnode_realized_volatility_record
+    normalizer = normalize_glassnode_dvol_record
     incoming_by_ts: dict[int,dict[str,Any]]={}
     failed=invalid_count=successful=empty=0
     warnings=[]; errors=[]
@@ -147,7 +141,7 @@ def _dataset(*, requests: Sequence[Mapping[str, Any]], existing: Mapping[str, An
 
 def evaluate_volatility_market_regimes_input_quality(providers: Mapping[str, Any], *, mode: str,
                                                      required_datasets: Sequence[str] = DATASET_IDS) -> dict[str, Any]:
-    statuses={f"glassnode.{name}":providers["glassnode"][name]["status"] for name in ("realized_volatility","dvol")}
+    statuses={"glassnode.dvol": providers["glassnode"]["dvol"]["status"]}
     required=list(required_datasets)
     missing=[x for x in required if statuses[x]=="unavailable"]
     partial=[x for x in required if statuses[x]=="partial"]

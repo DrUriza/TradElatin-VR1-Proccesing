@@ -3,72 +3,72 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import datetime, timezone
 import math
+import os
 import time
 from typing import Any
 
 LONG_SHORT_LIQUIDATIONS_FAMILY = "long_short_liquidations"
 COINGLASS_PROVIDER = "coinglass"
-CRYPTOQUANT_PROVIDER = "cryptoquant"
-GLASSNODE_PROVIDER = "glassnode"
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
 DEFAULT_ASSET = "BTC"
-DEFAULT_INTERVAL = "1h"
-POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h")
+DEFAULT_INTERVAL = "15m"
+POSITIONING_TIMEFRAMES = ("1m", "5m", "15m", "4h")
 DEFAULT_HISTORY_HOURS = 730
 DEFAULT_INCREMENTAL_OVERLAP_H = 6
 DEFAULT_EVENT_LOOKBACK_H = 24
 DEFAULT_EVENT_OVERLAP_MINUTES = 15
 DEFAULT_MIN_EVENT_USD = 10_000
+PUBLIC_MAP_RANGES = ("1d", "7d", "30d")
 DEFAULT_MAP_RANGE = "1d"
-DEFAULT_EXCHANGE_RANGE = "24h"
-DEFAULT_MAX_PAIN_RANGE = "24h"
-DEFAULT_EXCHANGES = ("Binance", "OKX", "Bybit", "Hyperliquid")
-DEFAULT_CRYPTOQUANT_EXCHANGES = ("binance", "bybit", "okx")
-GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID = "glassnode_long_liquidations"
-GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID = "glassnode_short_liquidations"
-GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID = "glassnode_total_liquidations"
-GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID = "glassnode_long_liquidation_dominance"
-COINGLASS_TOP_POSITION_ENDPOINT_ID = "top_position_long_short_ratio"
-COINGLASS_TOP_ACCOUNT_ENDPOINT_ID = "top_account_long_short_ratio"
+DEFAULT_EXCHANGE_RANGE = "24h"  # compatibility-only; no external exchange-list request
+DEFAULT_MAX_PAIN_RANGE = "24h"  # compatibility-only; max-pain endpoint removed from final 33
+DEFAULT_EXCHANGES = ("Binance", "OKX", "Bybit")
+PAIR_MAP_EXCHANGES = (*DEFAULT_EXCHANGES, "Hyperliquid")
 COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID = "global_account_long_short_ratio"
 
 RawFetcher = Callable[..., Any]
 Clock = Callable[[], int | float]
 
+
+def _fetch_worker_count(fetcher: RawFetcher | None = None) -> int:
+    """Choose bounded request concurrency without changing data semantics.
+
+    The real provider is network-bound, so a small worker pool cuts manual
+    RELOAD latency substantially.  The Emulator is CPU-bound while it builds
+    deterministic stochastic histories; parallel HTTP calls only contend for
+    the same simulation engine and are slower there, so its safe default is 1.
+
+    ``TRADELATIN_LIQUIDATIONS_FETCH_WORKERS`` remains an explicit override for
+    either source and is clamped to 1..16.
+    """
+    override = os.environ.get("TRADELATIN_LIQUIDATIONS_FETCH_WORKERS", "").strip()
+    if override:
+        try:
+            return max(1, min(16, int(override)))
+        except (TypeError, ValueError):
+            pass
+
+    owner = getattr(fetcher, "__self__", None)
+    if str(getattr(owner, "source_mode", "")).lower() == "emulator":
+        return 1
+    return 6
+
+# Liquidations uses exactly these seven CoinGlass primitives from the frozen 33.
 ENDPOINT_MANIFEST: dict[tuple[str, str], str] = {
-    (COINGLASS_PROVIDER, "supported_exchange_pairs"): "/api/futures/supported-exchange-pairs",
     (COINGLASS_PROVIDER, "aggregated_liquidation_history"): "/api/futures/liquidation/aggregated-history",
-    (COINGLASS_PROVIDER, "liquidation_exchange_list"): "/api/futures/liquidation/exchange-list",
-    (COINGLASS_PROVIDER, "pair_liquidation_history"): "/api/futures/liquidation/history",
     (COINGLASS_PROVIDER, "liquidation_order_events"): "/api/futures/liquidation/order",
     (COINGLASS_PROVIDER, "aggregated_liquidation_map"): "/api/futures/liquidation/aggregated-map",
     (COINGLASS_PROVIDER, "pair_liquidation_map"): "/api/futures/liquidation/map",
-    (COINGLASS_PROVIDER, "liquidation_max_pain"): "/api/futures/liquidation/max-pain",
-    (COINGLASS_PROVIDER, COINGLASS_TOP_POSITION_ENDPOINT_ID): "/api/futures/top-long-short-position-ratio/history",
-    (COINGLASS_PROVIDER, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID): "/api/futures/top-long-short-account-ratio/history",
     (COINGLASS_PROVIDER, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID): "/api/futures/global-long-short-account-ratio/history",
-    (CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations"): "/btc/market-data/liquidations",
-    (GLASSNODE_PROVIDER, GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_volume_long_sum",
-    (GLASSNODE_PROVIDER, GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_volume_short_sum",
-    (GLASSNODE_PROVIDER, GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_total_volume_sum",
-    (GLASSNODE_PROVIDER, GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID): "/v1/metrics/derivatives/futures_liquidated_volume_long_relative",
 }
 
 ENDPOINT_REQUEST_SCHEMAS: dict[tuple[str, str], dict[str, Any]] = {
-    (COINGLASS_PROVIDER, "supported_exchange_pairs"): {"params": (), "dimensions": ()},
     (COINGLASS_PROVIDER, "aggregated_liquidation_history"): {
         "params": ("exchange_list", "symbol", "interval", "limit", "start_time", "end_time"),
         "dimensions": ("asset", "symbol"),
-    },
-    (COINGLASS_PROVIDER, "liquidation_exchange_list"): {
-        "params": ("symbol", "range"), "dimensions": ("asset", "symbol"),
-    },
-    (COINGLASS_PROVIDER, "pair_liquidation_history"): {
-        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"),
-        "dimensions": ("exchange", "asset", "symbol"),
     },
     (COINGLASS_PROVIDER, "liquidation_order_events"): {
         "params": ("exchange", "symbol", "min_liquidation_amount", "start_time", "end_time"),
@@ -81,40 +81,14 @@ ENDPOINT_REQUEST_SCHEMAS: dict[tuple[str, str], dict[str, Any]] = {
         "params": ("exchange", "symbol", "range"),
         "dimensions": ("exchange", "asset", "symbol"),
     },
-    (COINGLASS_PROVIDER, "liquidation_max_pain"): {"params": ("range",), "dimensions": ()},
-    (COINGLASS_PROVIDER, COINGLASS_TOP_POSITION_ENDPOINT_ID): {
-        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
-    },
-    (COINGLASS_PROVIDER, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID): {
-        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
-    },
     (COINGLASS_PROVIDER, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID): {
-        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"), "dimensions": ("exchange", "asset", "symbol"),
-    },
-    (CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations"): {
-        "params": ("exchange", "symbol", "window", "from", "to", "limit", "format"),
+        "params": ("exchange", "symbol", "interval", "limit", "start_time", "end_time"),
         "dimensions": ("exchange", "asset", "symbol"),
     },
 }
-for _glassnode_endpoint in (
-    GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID,
-    GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
-    GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
-    GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
-):
-    ENDPOINT_REQUEST_SCHEMAS[(GLASSNODE_PROVIDER, _glassnode_endpoint)] = {
-        "params": (("a", "s", "u", "i", "f", "timestamp_format", "c")
-                   if _glassnode_endpoint != GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID else
-                   ("a", "s", "u", "i", "f", "timestamp_format")),
-        "dimensions": ("asset", "symbol"),
-        "dimension_param_matches": {"asset": "a", "symbol": "a"},
-    }
 
-_COINGLASS_INTERVALS = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "6h", "8h", "12h", "1d", "1w"}
-_EXCHANGE_RANGES = {"1h", "4h", "12h", "24h"}
+_COINGLASS_INTERVALS = {"1m", "5m", "15m", "4h"}
 _MAP_RANGES = {"1d", "7d", "30d", "180d", "365d"}
-_MAX_PAIN_RANGES = {"12h", "24h", "48h", "3d", "7d", "14d", "30d"}
-_CRYPTOQUANT_WINDOWS = {"min", "hour", "day"}
 
 
 def _require_string(mapping: Mapping[str, Any], field: str, kind: str) -> str:
@@ -138,16 +112,6 @@ def _require_positive_int(mapping: Mapping[str, Any], field: str, kind: str = "p
 def _validate_string_keys(mapping: Mapping[Any, Any], kind: str) -> None:
     if any(not isinstance(key, str) for key in mapping):
         raise ValueError(f"invalid_request_{kind}:non_string_key")
-
-
-def _parse_cryptoquant_time(value: str, field: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid_request_param:{field}") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise ValueError(f"invalid_request_param:{field}")
-    return parsed
 
 
 def validate_request_contract(request: Mapping[str, Any], *, require_dimensions: bool = True,
@@ -197,13 +161,9 @@ def validate_request_contract(request: Mapping[str, Any], *, require_dimensions:
         raise ValueError("invalid_request_time_range")
     if "s" in schema["params"] and params["s"] > params["u"]:
         raise ValueError("invalid_request_time_range")
-    if endpoint_id in {"aggregated_liquidation_history", "pair_liquidation_history", COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID} and params["interval"] not in _COINGLASS_INTERVALS:
+    if endpoint_id in {"aggregated_liquidation_history", COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID} and params["interval"] not in _COINGLASS_INTERVALS:
         raise ValueError("invalid_request_param:interval")
-    if endpoint_id == "liquidation_exchange_list" and params["range"] not in _EXCHANGE_RANGES:
-        raise ValueError("invalid_request_param:range")
     if endpoint_id in {"aggregated_liquidation_map", "pair_liquidation_map"} and params["range"] not in _MAP_RANGES:
-        raise ValueError("invalid_request_param:range")
-    if endpoint_id == "liquidation_max_pain" and params["range"] not in _MAX_PAIN_RANGES:
         raise ValueError("invalid_request_param:range")
     if endpoint_id == "liquidation_order_events":
         try:
@@ -212,18 +172,6 @@ def validate_request_contract(request: Mapping[str, Any], *, require_dimensions:
             raise ValueError("invalid_request_param:min_liquidation_amount") from exc
         if not math.isfinite(amount) or amount <= 0 or isinstance(params["min_liquidation_amount"], bool):
             raise ValueError("invalid_request_param:min_liquidation_amount")
-    if endpoint_id == "cryptoquant_liquidations":
-        if params["window"] not in _CRYPTOQUANT_WINDOWS:
-            raise ValueError("invalid_request_param:window")
-        if params["format"] != "json":
-            raise ValueError("invalid_request_param:format")
-        start = _parse_cryptoquant_time(params["from"], "from")
-        end = _parse_cryptoquant_time(params["to"], "to")
-        if start > end:
-            raise ValueError("invalid_request_time_range")
-    if provider == GLASSNODE_PROVIDER:
-        if params["i"] not in _COINGLASS_INTERVALS or params["f"] != "json" or params["timestamp_format"] != "unix":
-            raise ValueError("invalid_request_param:glassnode_format")
 
     for field in ("exchange", "symbol"):
         if field in params and field in schema["dimensions"] and dimensions.get(field) != params[field]:
@@ -273,6 +221,7 @@ def build_long_short_liquidations_fetch_plan(
     reference_timestamp: int,
     asset: str = DEFAULT_ASSET,
     exchanges: Sequence[str] = DEFAULT_EXCHANGES,
+    map_exchanges: Sequence[str] = PAIR_MAP_EXCHANGES,
     exchange_pairs: Mapping[str, str] | None = None,
     cryptoquant_exchanges: Sequence[str] | None = None,
     history_hours: int = DEFAULT_HISTORY_HOURS,
@@ -324,8 +273,7 @@ def build_long_short_liquidations_fetch_plan(
         return plan
 
     pairs = dict(exchange_pairs or {})
-    cq_exchanges = (DEFAULT_CRYPTOQUANT_EXCHANGES if cryptoquant_exchanges is None else
-                    tuple(cryptoquant_exchanges))
+    del cryptoquant_exchanges, exchange_range, max_pain_range, refresh_discovery, include_confirmations
     history_window = history_hours if mode == "bootstrap" else incremental_overlap_hours
     start, end = _window(reference_timestamp, history_window)
     limit = max(1, history_window)
@@ -339,16 +287,19 @@ def build_long_short_liquidations_fetch_plan(
             "limit": limit, "start_time": start * 1000, "end_time": end * 1000,
         }, f"{asset}:{DEFAULT_INTERVAL}:{start}:{end}",
             {"exchange": None, "asset": asset, "symbol": asset}))
-        # Long/Short Positioning is multi-timeframe without adding endpoints:
-        # the same three CoinGlass paths are parameterized at 1m/5m/15m/30m/1h/4h.
-        positioning_limit = 1000
-        for endpoint_id in (COINGLASS_TOP_POSITION_ENDPOINT_ID, COINGLASS_TOP_ACCOUNT_ENDPOINT_ID, COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID):
+        # Long/Short Positioning exposes one canonical market-wide ratio.
+        # The frozen registry still retains the historical 33 endpoint identities,
+        # but Processing consumes only Global Account L/S for the public view.
+        positioning_limit = 500
+        for exchange in exchanges:
+            symbol = pairs.get(exchange, "BTCUSDT")
+            endpoint_id = COINGLASS_GLOBAL_ACCOUNT_ENDPOINT_ID
             for positioning_timeframe in POSITIONING_TIMEFRAMES:
                 plan.append(_request(COINGLASS_PROVIDER, endpoint_id, {
-                    "exchange": "Binance", "symbol": "BTCUSDT", "interval": positioning_timeframe,
+                    "exchange": exchange, "symbol": symbol, "interval": positioning_timeframe,
                     "limit": positioning_limit, "start_time": start * 1000, "end_time": end * 1000,
-                }, f"Binance:BTCUSDT:{positioning_timeframe}:{start}:{end}",
-                    {"exchange": "Binance", "asset": asset, "symbol": "BTCUSDT"}))
+                }, f"{exchange}:{symbol}:{positioning_timeframe}:{start}:{end}",
+                    {"exchange": exchange, "asset": asset, "symbol": symbol}))
         # Exchange-distribution snapshot was a drilldown-only duplicate and is
         # intentionally not requested in the 33-endpoint runtime.
 
@@ -368,42 +319,20 @@ def build_long_short_liquidations_fetch_plan(
         }, f"{exchange}:{event_start}:{end}",
             {"exchange": exchange, "asset": asset, "symbol": asset}))
 
-    if not reuse_hourly:
+    # Liquidation maps are snapshots and MUST refresh on every manual RELOAD,
+    # even when hourly history/positioning is safely reused.  These are requests
+    # against the SAME frozen logical endpoints; endpoint inventory remains 33.
+    public_ranges = PUBLIC_MAP_RANGES
+    for public_range in public_ranges:
         plan.append(_request(COINGLASS_PROVIDER, "aggregated_liquidation_map", {
-            "symbol": asset, "range": map_range,
-        }, f"{asset}:{map_range}", {"exchange": None, "asset": asset, "symbol": asset}))
-        # Screen A only renders the Binance leverage map and Hyperliquid map.
-        for exchange in ("Binance", "Hyperliquid"):
-            pair = pairs.get(exchange)
-            if pair:
-                plan.append(_request(COINGLASS_PROVIDER, "pair_liquidation_map", {
-                    "exchange": exchange, "symbol": pair, "range": map_range,
-                }, f"{exchange}:{pair}:{map_range}",
-                    {"exchange": exchange, "asset": asset, "symbol": pair}))
-        # Max-pain was a diagnostic-only endpoint and is retired from the
-        # contractual Emulator surface.
-    if include_confirmations:
-        cq_common = {
-            "window": "hour",
-            "from": datetime.fromtimestamp(start, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "to": datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "limit": limit, "format": "json",
-        }
-        plan.append(_request(CRYPTOQUANT_PROVIDER, "cryptoquant_liquidations", {
-            "exchange": "all_exchange", "symbol": "all_symbol", **cq_common,
-        }, f"aggregate:{start}:{end}",
-            {"exchange": "all_exchange", "asset": asset, "symbol": "all_symbol"}))
-        for endpoint_id in (
-            GLASSNODE_LONG_LIQUIDATIONS_ENDPOINT_ID,
-            GLASSNODE_SHORT_LIQUIDATIONS_ENDPOINT_ID,
-            GLASSNODE_TOTAL_LIQUIDATIONS_ENDPOINT_ID,
-            GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID,
-        ):
-            params = {"a": asset, "s": start, "u": end, "i": DEFAULT_INTERVAL, "f": "json", "timestamp_format": "unix"}
-            if endpoint_id != GLASSNODE_LONG_LIQUIDATION_DOMINANCE_ENDPOINT_ID:
-                params["c"] = "USD"
-            plan.append(_request(GLASSNODE_PROVIDER, endpoint_id, params, f"{asset}:{start}:{end}",
-                                 {"exchange": None, "asset": asset, "symbol": asset}))
+            "symbol": asset, "range": public_range,
+        }, f"{asset}:{public_range}", {"exchange": None, "asset": asset, "symbol": asset}))
+        for exchange in map_exchanges:
+            symbol = pairs.get(exchange, "BTCUSDT")
+            plan.append(_request(COINGLASS_PROVIDER, "pair_liquidation_map", {
+                "exchange": exchange, "symbol": symbol, "range": public_range,
+            }, f"{exchange}:{symbol}:{public_range}",
+                {"exchange": exchange, "asset": asset, "symbol": symbol}))
     return plan
 
 
@@ -433,53 +362,59 @@ def _event_rows(response: Any) -> list[Any] | None:
 def _execute_event_window(
     *, fetcher: RawFetcher, request: Mapping[str, Any], minimum_event_window_seconds: int,
 ) -> list[dict[str, Any]]:
+    """Execute the liquidation-event primitive exactly once.
+
+    The final 33-endpoint Emulator contract returns a fixed 500-record snapshot.
+    Recursively bisecting the requested window when that snapshot is full would
+    re-request the same logical endpoint exponentially and can stall bootstrap.
+    Processing therefore consumes the provider response as one primitive; any
+    provider-side paging policy belongs to the real Market API adapter, not to
+    this family extractor.
+    """
+    del minimum_event_window_seconds
     validate_request_contract(request)
     result = execute_raw_request(fetcher=fetcher, request=request)
     rows = _event_rows(result.get("response")) if result["status"] == "ok" else None
-    if rows is None or len(rows) < 200:
-        return [result]
-    params = request["params"]
-    start_ms = _require_positive_int(params, "start_time")
-    end_ms = _require_positive_int(params, "end_time")
-    if start_ms > end_ms:
-        raise ValueError("invalid_request_time_range")
-    if end_ms - start_ms <= minimum_event_window_seconds * 1000:
-        result["warnings"].append("event_endpoint_record_limit_reached")
-        return [result]
-    midpoint = (start_ms + end_ms) // 2
-    if midpoint <= start_ms or midpoint >= end_ms:
-        result["warnings"].append("event_endpoint_record_limit_reached")
-        return [result]
-    children = []
-    for child_start, child_end in ((start_ms, midpoint), (midpoint, end_ms)):
-        child = deepcopy(dict(request))
-        child["params"]["start_time"] = child_start
-        child["params"]["end_time"] = child_end
-        child["request_id"] = f"{request['provider']}:{request['endpoint_id']}:{params['exchange']}:{child_start}:{child_end}"
-        children.extend(_execute_event_window(
-            fetcher=fetcher, request=child, minimum_event_window_seconds=minimum_event_window_seconds,
-        ))
-    return children
+    if rows is not None and len(rows) >= 500:
+        result["warnings"].append("event_snapshot_fixed_limit_no_recursive_pagination")
+    return [result]
 
 
 def extract_long_short_liquidations_raw(
     *, fetcher: RawFetcher, mode: str, reference_timestamp: int,
     execution_timestamp: int | None = None, minimum_event_window_seconds: int = 60, **plan_options: Any,
 ) -> dict[str, Any]:
-    """Build and execute a Raw bundle while preserving every response."""
+    """Build and execute a Raw bundle while preserving every response.
+
+    The fetch plan remains deterministic, but independent provider requests are
+    executed concurrently. ``executor.map`` preserves plan order in the final
+    Raw contract, so downstream normalization and audit trails remain stable.
+    """
     executed_at = int(time.time()) if execution_timestamp is None else execution_timestamp
     plan = build_long_short_liquidations_fetch_plan(
         mode=mode, reference_timestamp=reference_timestamp, **plan_options,
     )
-    results: list[dict[str, Any]] = []
     for request in plan:
         validate_request_contract(request, allow_skipped=True)
+
+    def execute_one(request: Mapping[str, Any]) -> list[dict[str, Any]]:
         if request["endpoint_id"] == "liquidation_order_events" and not request.get("skip_reason"):
-            results.extend(_execute_event_window(
+            return _execute_event_window(
                 fetcher=fetcher, request=request, minimum_event_window_seconds=minimum_event_window_seconds,
-            ))
-        else:
-            results.append(execute_raw_request(fetcher=fetcher, request=request))
+            )
+        return [execute_raw_request(fetcher=fetcher, request=request)]
+
+    workers = min(_fetch_worker_count(fetcher), max(1, len(plan)))
+    if workers <= 1 or len(plan) <= 1:
+        batches = [execute_one(request) for request in plan]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="tradelatin-liquidations",
+        ) as executor:
+            batches = list(executor.map(execute_one, plan))
+
+    results = [result for batch in batches for result in batch]
     return {
         "family": LONG_SHORT_LIQUIDATIONS_FAMILY, "stage": "extracted_raw", "mode": mode,
         "reference_timestamp": reference_timestamp, "execution_timestamp": executed_at,
@@ -506,8 +441,7 @@ class LongShortLiquidationsRawExtractor:
         self.asset = asset
         self.exchanges = tuple(exchanges)
         self.exchange_pairs = deepcopy(dict(exchange_pairs or {}))
-        self.cryptoquant_exchanges = (DEFAULT_CRYPTOQUANT_EXCHANGES if cryptoquant_exchanges is None else
-                                     tuple(cryptoquant_exchanges))
+        del cryptoquant_exchanges, exchange_range, max_pain_range
         self.clock = clock or time.time
         self.reference_timestamp = reference_timestamp
         self.history_hours = history_hours
@@ -516,19 +450,16 @@ class LongShortLiquidationsRawExtractor:
         self.event_overlap_minutes = event_overlap_minutes
         self.min_event_usd = min_event_usd
         self.map_range = map_range
-        self.exchange_range = exchange_range
-        self.max_pain_range = max_pain_range
         self.minimum_event_window_seconds = minimum_event_window_seconds
 
     def _options(self) -> dict[str, Any]:
         return {
             "asset": self.asset, "exchanges": self.exchanges, "exchange_pairs": self.exchange_pairs,
-            "cryptoquant_exchanges": self.cryptoquant_exchanges, "history_hours": self.history_hours,
+            "history_hours": self.history_hours,
             "incremental_overlap_hours": self.incremental_overlap_hours,
             "event_lookback_hours": self.event_lookback_hours,
             "event_overlap_minutes": self.event_overlap_minutes, "min_event_usd": self.min_event_usd,
-            "map_range": self.map_range, "exchange_range": self.exchange_range,
-            "max_pain_range": self.max_pain_range,
+            "map_range": self.map_range,
         }
 
     def build_fetch_plan(self, *, mode: str, recovery_requests: Sequence[Mapping[str, Any]] | None = None,

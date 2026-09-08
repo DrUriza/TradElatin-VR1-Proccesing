@@ -12,12 +12,12 @@ from processing_signals.processing.prices_ohlcv.prices_ohlcv_processor import (
     PRICE_INDICATOR_CONFIG,
     calculate_prices_indicator_package,
 )
-from processing_signals.processing.math.indicators.trend.moving_averages import ema
-from processing_signals.processing.math.technical_cross_signals import detect_cross_pairs
+from .etf_exchange_flows_math import ema
+from .etf_exchange_flows_math import detect_cross_pairs
 
 FAMILY                     = "etf_exchange_flows"
-SUPPORTED_RANGES           = ("1d", "7d", "30d", "90d", "360d")
-RANGE_SECONDS              = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000, "90d": 7_776_000, "360d": 31_104_000}
+SUPPORTED_RANGES           = ("1d", "7d", "30d")
+RANGE_SECONDS              = {"1d": 86_400, "7d": 604_800, "30d": 2_592_000}
 HOURLY_STEP_SECONDS        = 3_600
 DAILY_STEP_SECONDS         = 86_400
 PRESSURE_WINDOW            = 86_400
@@ -239,73 +239,12 @@ def _build_etf(datasets: Mapping[str, Any], generated_timestamp: int, snapshot_a
         daily.append(deepcopy(base))
         cumulative.append({**base, "cumulative_flow_usd": cumulative_usd if flow is not None else None,
                            "cumulative_flow_btc": cumulative_btc if any(row.get("flow_btc") is not None for row in daily) else None})
-    net_assets, net_warn, net_future = _dedupe(datasets.get("etf_net_assets_daily", []), ("timestamp", "scope", "ticker", "provider", "endpoint_id"), generated_timestamp)
-    reported_rows = [item for item in net_assets if item.get("scope") == "aggregate" and item.get("ticker") is None and _finite(item.get("net_assets_usd")) is not None]
-    if reported_rows:
-        row = reported_rows[-1]
-        reported = _feature(_finite(row["net_assets_usd"]), status="partial" if net_future else "available",
-                            reason="future_timestamp" if net_future else None, timestamp=int(row["timestamp"]), unit="USD",
-                            provider="coinglass", endpoint_id=str(row.get("endpoint_id")), coverage=_coverage([row]), warnings=net_warn)
-    else:
-        reported = _missing(reason="future_timestamp" if net_future else "source_unavailable", unit="USD", provider="coinglass",
-                            endpoint_id="bitcoin_etf_net_assets_history", status="invalid" if net_future else "unavailable")
+    # Total AUM is sourced from the contracted ``bitcoin_etf_list`` catalog in
+    # _build_funds and injected by build_etf_exchange_flows_features.
+    reported = _missing(reason="derived_from_etf_catalog", unit="USD", provider="coinglass", endpoint_id="bitcoin_etf_list")
     return {"net_flow_usd_latest": latest_usd, "net_flow_btc_latest": latest_btc, "period_flow_usd": period_usd,
-            "period_flow_btc": period_btc, "reported_total_aum_usd": reported}, {"etf_flow_daily": daily, "etf_cumulative_flow": cumulative}, warnings+net_warn
+            "period_flow_btc": period_btc, "reported_total_aum_usd": reported}, {"etf_flow_daily": daily, "etf_cumulative_flow": cumulative}, warnings
 
-
-def _glassnode_latest(secondary_root: Mapping[str, Any], endpoint_id: str, generated_timestamp: int, *,
-                      unit: str, preferred_intervals: Sequence[str] = ("24h", "1h")) -> dict[str, Any]:
-    """Return the latest usable Glassnode confirmation for one normalized endpoint.
-
-    This is deliberately a Processing-side confirmation feature.  It does not
-    alter the primary provider semantics used by the HMI contract.
-    """
-    glassnode = secondary_root.get("glassnode", {}) if isinstance(secondary_root.get("glassnode"), Mapping) else {}
-    endpoint = glassnode.get(endpoint_id, {}) if isinstance(glassnode.get(endpoint_id), Mapping) else {}
-    records: list[dict[str, Any]] = []
-    selected_interval = None
-    warnings: list[str] = []
-    future = 0
-    for interval in preferred_intervals:
-        source = endpoint.get(interval, [])
-        normalized, row_warnings, row_future = _dedupe(
-            source, ("timestamp", "interval", "asset", "exchange_scope", "provider", "endpoint_id"), generated_timestamp
-        )
-        warnings.extend(row_warnings)
-        future += row_future
-        usable = [item for item in normalized if item.get("asset") == "BTC" and _finite(item.get("value")) is not None]
-        if usable:
-            records = usable
-            selected_interval = interval
-            break
-    if not records:
-        return _missing(reason="future_timestamp" if future else "secondary_unavailable", unit=unit,
-                        provider="glassnode", endpoint_id=endpoint_id, status="invalid" if future else "unavailable",
-                        warnings=warnings)
-    latest = records[-1]
-    return _feature(_finite(latest.get("value")), status="partial" if future else "available",
-                    reason="future_timestamp" if future else None, timestamp=int(latest["timestamp"]), unit=unit,
-                    provider="glassnode", endpoint_id=endpoint_id, coverage=_coverage(records), warnings=warnings,
-                    interval=selected_interval, asset="BTC", exchange_scope=latest.get("exchange_scope"))
-
-
-def _comparison(primary: Mapping[str, Any], secondary: Mapping[str, Any], *, unit: str) -> dict[str, Any]:
-    primary_value = _finite(primary.get("value"))
-    secondary_value = _finite(secondary.get("value"))
-    primary_ts = _timestamp(primary.get("data_as_of"))
-    secondary_ts = _timestamp(secondary.get("data_as_of"))
-    if primary_value is None or secondary_value is None or primary_ts is None or secondary_ts is None:
-        return {"primary_value": primary_value, "secondary_value": secondary_value, "difference": None,
-                "unit": unit, "primary_provider": primary.get("provider"), "secondary_provider": secondary.get("provider"),
-                "timestamp_distance": None if primary_ts is None or secondary_ts is None else abs(primary_ts-secondary_ts),
-                "data_as_of": None, "status": "unavailable", "reason": secondary.get("reason") or primary.get("reason") or "secondary_unavailable"}
-    distance = abs(primary_ts-secondary_ts)
-    aligned = distance <= DAILY_STEP_SECONDS
-    return {"primary_value": primary_value, "secondary_value": secondary_value,
-            "difference": primary_value-secondary_value if aligned else None, "unit": unit,
-            "primary_provider": primary.get("provider"), "secondary_provider": secondary.get("provider"),
-            "timestamp_distance": distance, "data_as_of": min(primary_ts, secondary_ts) if aligned else None,
-            "status": "available" if aligned else "unavailable", "reason": None if aligned else "anchors_not_aligned"}
 
 
 def _build_funds(datasets: Mapping[str, Any], generated_timestamp: int, snapshot_anchor: int | None) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
@@ -360,15 +299,30 @@ def _build_funds(datasets: Mapping[str, Any], generated_timestamp: int, snapshot
 
 
 def _build_premium(datasets: Mapping[str, Any], generated_timestamp: int) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
-    records, warnings, future = _dedupe(datasets.get("etf_premium_discount_daily", []), ("timestamp", "ticker", "provider", "endpoint_id"), generated_timestamp)
-    gbtc = [item for item in records if item.get("ticker") == "GBTC" and _finite(item.get("premium_discount_percent")) is not None]
-    feature = (_feature(_finite(gbtc[-1]["premium_discount_percent"]), status="partial" if future else "available",
-        reason="future_timestamp" if future else None, timestamp=int(gbtc[-1]["timestamp"]), unit="percent",
-        provider="coinglass", endpoint_id=str(gbtc[-1].get("endpoint_id")), coverage=_coverage([gbtc[-1]]), warnings=warnings) if gbtc else
-        _missing(reason="future_timestamp" if future else "source_unavailable", unit="percent", provider="coinglass",
-                 endpoint_id="bitcoin_etf_premium_discount_history", status="invalid" if future else "unavailable"))
-    return feature, records, warnings
+    """Read GBTC premium/discount from the contracted ETF catalog snapshot.
 
+    The former premium-history endpoint is not part of the frozen 33. CoinGlass
+    already exposes ``asset_details.premium_discount_percent`` on
+    ``bitcoin_etf_list``; using that primitive avoids an unnecessary endpoint.
+    """
+    snapshots = datasets.get("etf_funds_snapshot", [])
+    snapshots = snapshots if isinstance(snapshots, list) else []
+    gbtc = [row for row in snapshots if isinstance(row, Mapping) and str(row.get("ticker", "")).upper() == "GBTC"]
+    if not gbtc:
+        return (_missing(reason="source_unavailable", unit="percent", provider="coinglass", endpoint_id="bitcoin_etf_list"), [], [])
+    row = gbtc[-1]
+    details = row.get("asset_details", {}) if isinstance(row.get("asset_details"), Mapping) else {}
+    value = _finite(details.get("premium_discount_percent"))
+    if value is None:
+        return (_missing(reason="premium_discount_missing", unit="percent", provider="coinglass", endpoint_id="bitcoin_etf_list"), [], [])
+    anchor = _timestamp(row.get("snapshot_timestamp")) or generated_timestamp
+    point = {
+        "timestamp": anchor, "ticker": "GBTC", "premium_discount_percent": value,
+        "provider": "coinglass", "endpoint_id": "bitcoin_etf_list",
+    }
+    return (_feature(value, status="available", reason=None, timestamp=anchor, unit="percent",
+                     provider="coinglass", endpoint_id="bitcoin_etf_list", coverage=_coverage([point])),
+            [point], [])
 
 def _scope_records(records: list[dict[str, Any]], exchange_scope: str | None) -> tuple[list[dict[str, Any]], str | None]:
     scopes = {item.get("exchange_scope") for item in records}
@@ -491,31 +445,88 @@ def _exchange_balance_technical_analysis(candles: list[dict[str, Any]]) -> dict[
                 "parameters": {"period": period, "standard_deviations": 2.0}}, "cross_candidates": crosses}
 
 
+def _derive_exchange_netflow_series(
+    inflow_rows: Sequence[Mapping[str, Any]],
+    outflow_rows: Sequence[Mapping[str, Any]],
+    *,
+    window: str,
+    exchange_scope: str | None,
+) -> list[dict[str, Any]]:
+    """Derive Net Flow from the two contracted CryptoQuant primitives.
+
+    ``exchange_netflow`` is intentionally not a logical endpoint in the frozen
+    33-endpoint inventory.  Processing therefore owns the exact identity
+    ``netflow = inflow - outflow`` and publishes it as a calculated series.
+    """
+    incoming = {
+        int(row["timestamp"]): _finite(row.get("inflow_total"))
+        for row in inflow_rows
+        if isinstance(row, Mapping) and type(row.get("timestamp")) is int
+    }
+    outgoing = {
+        int(row["timestamp"]): _finite(row.get("outflow_total"))
+        for row in outflow_rows
+        if isinstance(row, Mapping) and type(row.get("timestamp")) is int
+    }
+    rows: list[dict[str, Any]] = []
+    for timestamp in sorted(set(incoming) & set(outgoing)):
+        left, right = incoming[timestamp], outgoing[timestamp]
+        if left is None or right is None:
+            continue
+        rows.append({
+            "timestamp": timestamp,
+            "window": window,
+            "exchange_scope": exchange_scope,
+            "netflow_total": float(left) - float(right),
+            "provider": "calculated",
+            "endpoint_id": None,
+            "source_endpoints": ["exchange_inflow", "exchange_outflow"],
+            "calculation": "inflow_total-outflow_total",
+        })
+    return rows
+
+
 def _build_exchange(datasets: Mapping[str, Any], generated_timestamp: int, exchange_scope: str | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
-    series: dict[str, Any] = {}
     warnings: list[str] = []
     prepared: dict[str, dict[str, list[dict[str, Any]]]] = {}
     future_counts: dict[str, dict[str, int]] = {}
-    for endpoint in ("exchange_inflow", "exchange_outflow", "exchange_netflow", "exchange_reserve"):
+    series: dict[str, Any] = {"inflow": {}, "outflow": {}, "netflow": {}, "reserve": {}}
+
+    # Only the three contracted CryptoQuant primitives are acquired.
+    for endpoint in ("exchange_inflow", "exchange_outflow", "exchange_reserve"):
         prepared[endpoint] = {}
         future_counts[endpoint] = {}
-        series[endpoint.removeprefix("exchange_")] = {}
+        series_name = endpoint.removeprefix("exchange_")
         source = datasets.get(endpoint, {}) if isinstance(datasets.get(endpoint), Mapping) else {}
         for window in ("hour", "day"):
-            records, duplicate, future_count = _dedupe(source.get(window, []), ("timestamp", "window", "exchange_scope", "provider", "endpoint_id"), generated_timestamp)
+            records, duplicate, future_count = _dedupe(
+                source.get(window, []),
+                ("timestamp", "window", "exchange_scope", "provider", "endpoint_id"),
+                generated_timestamp,
+            )
             records, _ = _scope_records(records, exchange_scope)
             prepared[endpoint][window] = records
             future_counts[endpoint][window] = future_count
-            series[endpoint.removeprefix("exchange_")][window] = deepcopy(records)
+            series[series_name][window] = deepcopy(records)
             warnings.extend(duplicate)
+
+    for window in ("hour", "day"):
+        series["netflow"][window] = _derive_exchange_netflow_series(
+            prepared["exchange_inflow"][window],
+            prepared["exchange_outflow"][window],
+            window=window,
+            exchange_scope=exchange_scope,
+        )
+
     inflow, in_scope = _scope_records(prepared["exchange_inflow"]["hour"], exchange_scope)
     outflow, out_scope = _scope_records(prepared["exchange_outflow"]["hour"], exchange_scope)
-    if not inflow or not outflow:
-        common_anchor = None
-        mismatch = bool(inflow or outflow) and in_scope != out_scope
-    else:
-        mismatch = in_scope != out_scope
-        common_anchor = min(int(inflow[-1]["timestamp"]), int(outflow[-1]["timestamp"])) if not mismatch else None
+    mismatch = bool(inflow or outflow) and in_scope != out_scope
+    common_anchor = (
+        min(int(inflow[-1]["timestamp"]), int(outflow[-1]["timestamp"]))
+        if inflow and outflow and not mismatch
+        else None
+    )
+
     if mismatch:
         inflow_feature = _missing(reason="exchange_scope_mismatch", unit="BTC", provider="cryptoquant", endpoint_id="exchange_inflow")
         outflow_feature = _missing(reason="exchange_scope_mismatch", unit="BTC", provider="cryptoquant", endpoint_id="exchange_outflow")
@@ -523,204 +534,124 @@ def _build_exchange(datasets: Mapping[str, Any], generated_timestamp: int, excha
         inflow_feature = _missing(unit="BTC", provider="cryptoquant", endpoint_id="exchange_inflow")
         outflow_feature = _missing(unit="BTC", provider="cryptoquant", endpoint_id="exchange_outflow")
     else:
-        inflow_feature = _regular_sum(inflow, "inflow_total", common_anchor,
-                                      future_records=future_counts["exchange_inflow"]["hour"], reject_negative=True)
-        outflow_feature = _regular_sum(outflow, "outflow_total", common_anchor,
-                                       future_records=future_counts["exchange_outflow"]["hour"], reject_negative=True)
-    netflow_records, net_scope = _scope_records(prepared["exchange_netflow"]["hour"], exchange_scope)
-    if netflow_records:
-        net_anchor = int(netflow_records[-1]["timestamp"])
-        net_reported = _regular_sum(netflow_records, "netflow_total", net_anchor,
-                                    future_records=future_counts["exchange_netflow"]["hour"])
-        net_reported["endpoint_id"] = "exchange_netflow"
-    else:
-        net_reported = _missing(unit="BTC", provider="cryptoquant", endpoint_id="exchange_netflow")
-    usable_components = all(item["status"] in {"available", "partial"} and item["value"] is not None for item in (inflow_feature, outflow_feature))
+        inflow_feature = _regular_sum(
+            inflow, "inflow_total", common_anchor,
+            future_records=future_counts["exchange_inflow"]["hour"], reject_negative=True,
+        )
+        outflow_feature = _regular_sum(
+            outflow, "outflow_total", common_anchor,
+            future_records=future_counts["exchange_outflow"]["hour"], reject_negative=True,
+        )
+
+    usable_components = all(
+        item["status"] in {"available", "partial"} and item["value"] is not None
+        for item in (inflow_feature, outflow_feature)
+    )
     invalid_component = any(item["status"] == "invalid" for item in (inflow_feature, outflow_feature))
     if usable_components:
         calc_status = "available" if inflow_feature["status"] == outflow_feature["status"] == "available" else "partial"
         calc_reason = None if calc_status == "available" else "insufficient_coverage"
-        net_calculated = _feature(inflow_feature["value"]-outflow_feature["value"], status=calc_status, reason=calc_reason,
-            timestamp=common_anchor, data_as_of=min(inflow_feature["data_as_of"], outflow_feature["data_as_of"]), unit="BTC", provider="calculated",
-            endpoint_id=None, coverage=inflow_feature["coverage"], exchange_scope=in_scope)
-        denominator = inflow_feature["value"]+outflow_feature["value"]
+        net_calculated = _feature(
+            inflow_feature["value"] - outflow_feature["value"],
+            status=calc_status, reason=calc_reason, timestamp=common_anchor,
+            data_as_of=min(inflow_feature["data_as_of"], outflow_feature["data_as_of"]),
+            unit="BTC", provider="calculated", endpoint_id=None,
+            coverage=inflow_feature["coverage"], exchange_scope=in_scope,
+            source_endpoints=["exchange_inflow", "exchange_outflow"],
+            calculation="inflow_24h-outflow_24h",
+        )
+        denominator = inflow_feature["value"] + outflow_feature["value"]
         if denominator == 0:
             pressure = _missing(reason="zero_total_flow", unit="ratio", provider="calculated", endpoint_id=None)
         else:
-            pressure_value = (inflow_feature["value"]-outflow_feature["value"])/denominator
-            pressure = (_feature(pressure_value, status=calc_status, reason=calc_reason, timestamp=common_anchor,
-                data_as_of=min(inflow_feature["data_as_of"], outflow_feature["data_as_of"]), unit="ratio", provider="calculated", endpoint_id=None,
-                coverage=inflow_feature["coverage"], exchange_scope=in_scope, window_start=common_anchor-PRESSURE_WINDOW, window_end=common_anchor)
-                if -1 <= pressure_value <= 1 else _missing(reason="nonfinite_result", unit="ratio", provider="calculated", endpoint_id=None, status="invalid"))
+            pressure_value = (inflow_feature["value"] - outflow_feature["value"]) / denominator
+            pressure = _feature(
+                pressure_value, status=calc_status, reason=calc_reason, timestamp=common_anchor,
+                data_as_of=min(inflow_feature["data_as_of"], outflow_feature["data_as_of"]),
+                unit="ratio", provider="calculated", endpoint_id=None,
+                coverage=inflow_feature["coverage"], exchange_scope=in_scope,
+                window_start=common_anchor-PRESSURE_WINDOW, window_end=common_anchor,
+                source_endpoints=["exchange_inflow", "exchange_outflow"],
+            ) if -1 <= pressure_value <= 1 else _missing(
+                reason="nonfinite_result", unit="ratio", provider="calculated", endpoint_id=None, status="invalid"
+            )
     else:
         reason = "exchange_scope_mismatch" if mismatch else "source_invalid" if invalid_component else "source_unavailable"
         net_calculated = _missing(reason=reason, unit="BTC", provider="calculated", endpoint_id=None)
         pressure = _missing(reason=reason, unit="ratio", provider="calculated", endpoint_id=None)
-    reported_aligned = (_regular_sum(netflow_records, "netflow_total", common_anchor,
-        future_records=future_counts["exchange_netflow"]["hour"]) if common_anchor is not None and net_scope == in_scope else
-                        _missing(reason="anchors_not_aligned", unit="BTC", provider="cryptoquant", endpoint_id="exchange_netflow"))
-    reported_anchor = reported_aligned.get("observed_anchor")
-    timestamp_distance = (abs(common_anchor-reported_anchor)
-                          if common_anchor is not None and reported_anchor is not None else None)
-    alignment = {"calculated_anchor": common_anchor, "reported_anchor": reported_anchor,
-                 "timestamp_distance": timestamp_distance, "window_seconds": PRESSURE_WINDOW,
-                 "scope": in_scope, "alignment_required": "exact"}
-    if (net_calculated["value"] is not None and reported_aligned["value"] is not None and net_scope == in_scope
-            and reported_anchor == common_anchor):
-        difference_status = "partial" if "partial" in {net_calculated["status"], reported_aligned["status"]} else "available"
-        difference_reason = "future_timestamp" if reported_aligned["reason"] == "future_timestamp" else None
-        net_reconciliation = {"reported": deepcopy(reported_aligned), "calculated": deepcopy(net_calculated),
-            "difference": _feature(net_calculated["value"]-reported_aligned["value"], status=difference_status,
-                reason=difference_reason, timestamp=min(reported_aligned["data_as_of"], net_calculated["data_as_of"]),
-                unit="BTC", provider="calculated", endpoint_id=None), **alignment}
-    else:
-        reason = ("exchange_scope_mismatch" if net_scope != in_scope and netflow_records else
-                  "source_invalid" if invalid_component else "invalid_unit" if reported_aligned.get("reason") == "invalid_unit" else
-                  "anchors_not_aligned")
-        net_reconciliation = {"reported": deepcopy(net_reported), "calculated": deepcopy(net_calculated),
-                              "difference": _missing(reason=reason, unit="BTC", provider="calculated", endpoint_id=None),
-                              **alignment}
+
+    # Kept only as an explicit provenance slot: no fourth CryptoQuant endpoint
+    # is required or queried for Net Flow.
+    net_reported = _missing(
+        reason="derived_from_contracted_primitives", unit="BTC", provider="calculated", endpoint_id=None
+    )
+    net_reconciliation = {
+        "reported": deepcopy(net_reported),
+        "calculated": deepcopy(net_calculated),
+        "difference": _missing(
+            reason="no_independent_netflow_endpoint", unit="BTC", provider="calculated", endpoint_id=None
+        ),
+        "calculated_anchor": common_anchor,
+        "reported_anchor": None,
+        "timestamp_distance": None,
+        "window_seconds": PRESSURE_WINDOW,
+        "scope": in_scope,
+        "alignment_required": "not_applicable_derived_identity",
+    }
+
     reserve_records = prepared["exchange_reserve"]["hour"] or prepared["exchange_reserve"]["day"]
     reserve_records, reserve_scope = _scope_records(reserve_records, exchange_scope)
     reserve_valid = [item for item in reserve_records if _finite(item.get("reserve")) is not None]
     reserve_future = future_counts["exchange_reserve"]["hour"] + future_counts["exchange_reserve"]["day"]
-    reserve = (_feature(_finite(reserve_valid[-1]["reserve"]), status="partial" if reserve_future else "available",
-        reason="future_timestamp" if reserve_future else None, timestamp=int(reserve_valid[-1]["timestamp"]), unit="BTC",
-        provider="cryptoquant", endpoint_id="exchange_reserve", coverage=_coverage([reserve_valid[-1]]),
-        exchange_scope=reserve_scope, warnings=["future_timestamp"] if reserve_future else []) if reserve_valid else
-        _missing(reason="future_timestamp" if reserve_future else "source_unavailable", unit="BTC", provider="cryptoquant",
-                 endpoint_id="exchange_reserve", status="invalid" if reserve_future else "unavailable",
-                 warnings=["future_timestamp"] if reserve_future else []))
-    for feature in (inflow_feature, outflow_feature, net_reported, net_calculated, pressure, reserve):
+    reserve = (
+        _feature(
+            _finite(reserve_valid[-1]["reserve"]),
+            status="partial" if reserve_future else "available",
+            reason="future_timestamp" if reserve_future else None,
+            timestamp=int(reserve_valid[-1]["timestamp"]), unit="BTC",
+            provider="cryptoquant", endpoint_id="exchange_reserve", coverage=_coverage([reserve_valid[-1]]),
+            exchange_scope=reserve_scope, warnings=["future_timestamp"] if reserve_future else [],
+        )
+        if reserve_valid else
+        _missing(
+            reason="future_timestamp" if reserve_future else "source_unavailable", unit="BTC",
+            provider="cryptoquant", endpoint_id="exchange_reserve",
+            status="invalid" if reserve_future else "unavailable",
+            warnings=["future_timestamp"] if reserve_future else [],
+        )
+    )
+    for feature in (inflow_feature, outflow_feature, net_calculated, pressure, reserve):
         warnings.extend(feature.get("warnings", []))
     reserve_candles = _daily_reserve_candles(prepared["exchange_reserve"]["hour"])
-    return ({"inflow_24h": inflow_feature, "outflow_24h": outflow_feature, "netflow_24h_reported": net_reported,
-             "netflow_24h_calculated": net_calculated, "cryptoquant_reserve": reserve}, {"flow_24h": pressure},
-            {"netflow": net_reconciliation, "series": series, "reserve_daily_candles": reserve_candles}, sorted(set(warnings)))
-
+    return (
+        {
+            "inflow_24h": inflow_feature,
+            "outflow_24h": outflow_feature,
+            "netflow_24h_reported": net_reported,
+            "netflow_24h_calculated": net_calculated,
+            "cryptoquant_reserve": reserve,
+        },
+        {"flow_24h": pressure},
+        {"netflow": net_reconciliation, "series": series, "reserve_daily_candles": reserve_candles},
+        sorted(set(warnings)),
+    )
 
 def _build_balances(datasets: Mapping[str, Any], generated_timestamp: int, exchange_scope: str | None,
                     reserve: Mapping[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]],
                                                          dict[str, Any], dict[str, Any], list[str]]:
-    snapshots = datasets.get("exchange_balances_snapshot", []) if isinstance(datasets.get("exchange_balances_snapshot"), list) else []
-    merged: dict[tuple[Any, Any], dict[str, Any]] = {}
-    warnings: list[str] = []
-    invalid_identity_counts: dict[str, int] = {}
+    """Expose the contracted CryptoQuant reserve without legacy confirmations.
 
-    def accept_identity(item: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
-        identity, invalid_fields = _entity_identity(item)
-        for field in invalid_fields:
-            invalid_identity_counts[field] = invalid_identity_counts.get(field, 0) + 1
-        if invalid_fields:
-            warnings.append("invalid_entity_identity")
-        return identity
-
-    for item in snapshots:
-        if not isinstance(item, Mapping):
-            continue
-        identity = accept_identity(item)
-        if identity is None:
-            continue
-        key = identity[:2]
-        if key in merged:
-            warnings.append("duplicate_input_record")
-        merged[key] = deepcopy(dict(item)) | dict(zip(ENTITY_IDENTITY_FIELDS, identity))
-    btc = [item for item in merged.values() if item.get("symbol") == "BTC"]
-    valid = [item for item in btc if _finite(item.get("total_balance")) is not None]
-    anchor = None
-    coinglass = (_feature(sum(_finite(item["total_balance"]) for item in valid), status="partial" if len(valid)<len(btc) else "available",
-        reason="missing_required_value" if len(valid)<len(btc) else None, timestamp=anchor, unit="BTC", provider="coinglass", endpoint_id="exchange_balance_list",
-        coverage=_coverage([]), warnings=["missing_required_value"] if len(valid)<len(btc) else []) if valid else
-        _missing(unit="BTC", provider="coinglass", endpoint_id="exchange_balance_list"))
-    exchange_snapshots = [{**deepcopy(item), "status": "available" if _finite(item.get("total_balance")) is not None else "unavailable",
-                           "warnings": [] if _finite(item.get("total_balance")) is not None else ["missing_required_value"]} for item in merged.values()]
-    history_source = datasets.get("exchange_balances_history", [])
-    future_by_entity: dict[tuple[str, str, str, str], int] = {}
-    valid_history_source: list[dict[str, Any]] = []
-    if isinstance(history_source, list):
-        for item in history_source:
-            if not isinstance(item, Mapping):
-                continue
-            identity = accept_identity(item)
-            if identity is None:
-                continue
-            normalized = deepcopy(dict(item)) | dict(zip(ENTITY_IDENTITY_FIELDS, identity))
-            valid_history_source.append(normalized)
-            timestamp = _timestamp(item.get("timestamp"))
-            if timestamp is not None and timestamp > generated_timestamp:
-                future_by_entity[identity] = future_by_entity.get(identity, 0) + 1
-    history, hist_warn, hist_future = _dedupe(valid_history_source, ("timestamp", "exchange_name", "symbol", "provider", "endpoint_id"), generated_timestamp)
-    decorated_history = []
-    for item in history:
-        key = (item.get("exchange_name"), item.get("symbol"), item.get("provider"), item.get("endpoint_id"))
-        entity_future = future_by_entity.get(key, 0)
-        decorated_history.append({**item, "status": "partial" if entity_future else "available",
-            "reason": "future_timestamp" if entity_future else None,
-            "warnings": ["future_timestamp"] if entity_future else [], "future_records_excluded": entity_future})
-    history = decorated_history
-    history_timestamps = [int(item["timestamp"]) for item in history]
-    invalid_identity_total = sum(invalid_identity_counts.values())
-    if history:
-        history_status, history_reason = (("partial", "invalid_entity_identity") if invalid_identity_total else
-                                          ("partial", "future_timestamp") if hist_future else ("available", None))
-    else:
-        history_status, history_reason = (("invalid", "invalid_entity_identity") if invalid_identity_total else
-                                          ("invalid", "future_timestamp") if hist_future else ("unavailable", "no_observations"))
-    entity_metadata = [{"exchange_name": key[0], "symbol": key[1], "provider": key[2],
-        "endpoint_id": key[3], "future_records_excluded": count}
-        for key, count in sorted(future_by_entity.items())]
-    history_metadata = {"status": history_status, "reason": history_reason,
-        "warnings": sorted(({"future_timestamp"} if hist_future else set()) |
-                           ({"invalid_entity_identity"} if invalid_identity_total else set())), "records_available": len(history),
-        "future_records_excluded": hist_future, "future_records_by_entity": entity_metadata,
-        "first_timestamp": min(history_timestamps) if history_timestamps else None,
-        "last_timestamp": max(history_timestamps) if history_timestamps else None}
-    if invalid_identity_total:
-        history_metadata["invalid_entities"] = [
-            {"identity_field": field, "reason": "invalid_entity_identity", "count": count}
-            for field, count in sorted(invalid_identity_counts.items())]
-    warnings.extend(hist_warn)
-    secondary_root = datasets.get("secondary_sources", {}) if isinstance(datasets.get("secondary_sources"), Mapping) else {}
-    glassnode = secondary_root.get("glassnode", {}) if isinstance(secondary_root.get("glassnode"), Mapping) else {}
-    balance = glassnode.get("exchange_balance", {}) if isinstance(glassnode.get("exchange_balance"), Mapping) else {}
-    records = balance.get("1h", []) or balance.get("24h", [])
-    gn_records, gn_warn, gn_future = _dedupe(records, ("timestamp", "interval", "asset", "exchange_scope", "provider", "endpoint_id"), generated_timestamp)
-    warnings.extend(gn_warn)
-    compatible = []
-    unit_rejected = scope_rejected = False
-    for item in gn_records:
-        currency = item.get("currency", GLASSNODE_DEFAULT_CURRENCY)
-        if item.get("asset") != "BTC" or currency != "NATIVE" or _finite(item.get("value")) is None:
-            unit_rejected = True
-        elif exchange_scope is not None and item.get("exchange_scope") not in {None, exchange_scope}:
-            scope_rejected = True
-        else:
-            compatible.append(item)
-    glassnode_feature = (_feature(_finite(compatible[-1]["value"]), status="partial" if gn_future else "available",
-        reason="future_timestamp" if gn_future else None, timestamp=int(compatible[-1]["timestamp"]), unit="BTC",
-        provider="glassnode", endpoint_id="exchange_balance", coverage=_coverage([compatible[-1]]), exchange_scope=compatible[-1].get("exchange_scope"),
-        currency="NATIVE", warnings=gn_warn) if compatible else _missing(reason="future_timestamp" if gn_future else
-        "exchange_scope_mismatch" if scope_rejected and not unit_rejected else "provider_unit_unconfirmed" if gn_records else
-        "secondary_unavailable", unit="BTC", provider="glassnode", endpoint_id="exchange_balance",
-        status="invalid" if gn_future else "unavailable", warnings=gn_warn))
-    if reserve.get("value") is not None and glassnode_feature.get("value") is not None:
-        distance = abs(int(reserve["data_as_of"])-int(glassnode_feature["data_as_of"]))
-        scope_ok = glassnode_feature.get("exchange_scope") in {None, reserve.get("exchange_scope")}
-        if distance <= PRESSURE_WINDOW and scope_ok:
-            spread = {"primary_value": reserve["value"], "secondary_value": glassnode_feature["value"],
-                "difference": reserve["value"]-glassnode_feature["value"], "primary_provider": "cryptoquant", "secondary_provider": "glassnode",
-                "timestamp_distance": distance, "data_as_of": min(reserve["data_as_of"], glassnode_feature["data_as_of"]), "status": "available", "reason": None}
-        else:
-            spread = {"primary_value": reserve["value"], "secondary_value": glassnode_feature["value"], "difference": None,
-                "primary_provider": "cryptoquant", "secondary_provider": "glassnode", "timestamp_distance": distance, "data_as_of": None,
-                "status": "unavailable", "reason": "exchange_scope_mismatch" if not scope_ok else "anchors_not_aligned"}
-    else:
-        spread = {"primary_value": reserve.get("value"), "secondary_value": glassnode_feature.get("value"), "difference": None,
-            "primary_provider": "cryptoquant", "secondary_provider": "glassnode", "timestamp_distance": None, "data_as_of": None,
-            "status": "unavailable", "reason": glassnode_feature.get("reason") or "secondary_unavailable"}
-    return ({"coinglass_total": coinglass, "cryptoquant_reserve": deepcopy(reserve), "glassnode_secondary": glassnode_feature},
-            exchange_snapshots, history, history_metadata, spread, sorted(set(warnings)))
-
+    Exchange balance/list/chart and Glassnode balance confirmations were removed
+    from the frozen endpoint inventory.  Reserve is the single source of truth
+    for the exchange inventory view; the HMI consumes it directly.
+    """
+    del datasets, generated_timestamp, exchange_scope
+    history_metadata = {
+        "status": "not_applicable", "reason": "reserve_series_is_primary_history",
+        "warnings": [], "records_available": 0, "future_records_excluded": 0,
+        "future_records_by_entity": [], "first_timestamp": None, "last_timestamp": None,
+    }
+    return ({"cryptoquant_reserve": deepcopy(reserve)}, [], [], history_metadata, {}, [])
 
 def build_etf_exchange_flows_features(*, input_contract: Mapping[str, Any], generated_at: Any = None,
                                       exchange_scope: str | None = None) -> dict[str, Any]:
@@ -736,6 +667,9 @@ def build_etf_exchange_flows_features(*, input_contract: Mapping[str, Any], gene
     etf, etf_series, warnings = _build_etf(datasets, generated_timestamp, snapshot_anchor)
     funds, calculated_aum, fund_warn = _build_funds(datasets, generated_timestamp, snapshot_anchor)
     etf["calculated_fund_aum_usd"] = calculated_aum
+    if etf.get("reported_total_aum_usd", {}).get("value") is None and calculated_aum.get("value") is not None:
+        etf["reported_total_aum_usd"] = deepcopy(calculated_aum)
+        etf["reported_total_aum_usd"].update(provider="derived_from_coinglass_etf_list", endpoint_id="bitcoin_etf_list", reason=None)
     premium, premium_series, premium_warn = _build_premium(datasets, generated_timestamp)
     exchange, pressure, exchange_payload, exchange_warn = _build_exchange(datasets, generated_timestamp, exchange_scope)
     balances, exchanges, balance_series, balance_metadata, balance_spread, balance_warn = _build_balances(
@@ -751,23 +685,16 @@ def build_etf_exchange_flows_features(*, input_contract: Mapping[str, Any], gene
     else:
         difference_usd = _missing(unit="USD", provider="calculated", endpoint_id=None)
         difference_percent = _missing(unit="percent", provider="calculated", endpoint_id=None)
-    secondary_root = datasets.get("secondary_sources", {}) if isinstance(datasets.get("secondary_sources"), Mapping) else {}
-    glassnode_confirmations = {
-        "etf_net_flow": _glassnode_latest(secondary_root, "us_spot_etf_flows_net", generated_timestamp, unit="USD", preferred_intervals=("24h",)),
-        "exchange_inflow": _glassnode_latest(secondary_root, "exchange_inflow", generated_timestamp, unit="BTC"),
-        "exchange_outflow": _glassnode_latest(secondary_root, "exchange_outflow", generated_timestamp, unit="BTC"),
-        "exchange_netflow": _glassnode_latest(secondary_root, "exchange_netflow", generated_timestamp, unit="BTC"),
-        "exchange_balance": deepcopy(balances["glassnode_secondary"]),
+    reconciliation = {
+        "aum": {"reported": deepcopy(reported), "calculated": deepcopy(calculated),
+                "difference_usd": difference_usd, "difference_percent": difference_percent},
+        "netflow": exchange_payload["netflow"],
     }
-    reconciliation = {"aum": {"reported": deepcopy(reported), "calculated": deepcopy(calculated), "difference_usd": difference_usd,
-                              "difference_percent": difference_percent}, "netflow": exchange_payload["netflow"], "exchange_balance": balance_spread,
-                      "etf_net_flow": _comparison(etf["net_flow_usd_latest"], glassnode_confirmations["etf_net_flow"], unit="USD")}
-    all_warnings = sorted(set(warnings+fund_warn+premium_warn+exchange_warn+balance_warn +
-                              [warning for feature in glassnode_confirmations.values() for warning in feature.get("warnings", [])]))
+    all_warnings = sorted(set(warnings + fund_warn + premium_warn + exchange_warn + balance_warn))
     balance_candles = exchange_payload["reserve_daily_candles"]
     return {"features": {"etf": etf, "exchange_flows": {key: value for key, value in exchange.items() if key != "cryptoquant_reserve"},
             "exchange_balances": balances, "premium_discount": {"gbtc_latest": premium}, "pressure": pressure,
-            "secondary_confirmations": {"glassnode": glassnode_confirmations}, "provider_reconciliation": reconciliation},
+            "provider_reconciliation": reconciliation},
         "series": {**etf_series, "fund_premium_discount": premium_series,
             "exchange_inflow": exchange_payload["series"]["inflow"], "exchange_outflow": exchange_payload["series"]["outflow"],
             "exchange_netflow": exchange_payload["series"]["netflow"], "exchange_reserve": exchange_payload["series"]["reserve"],

@@ -49,11 +49,16 @@ def _unified_profiles(markets: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_liquidity_microstructure_features(*, markets: Mapping[str, Any], whale_activity: Mapping[str, Any],
                                              market_history: Mapping[str, Any], comparison: Mapping[str, Any]) -> dict[str, Any]:
-    return deepcopy({"current_orderbooks": {market: data["orderbook"]["timeframes"] for market, data in markets.items()},
-                     "order_depth": {market: data["order_depth"]["timeframes"] for market, data in markets.items()},
-                     "large_trades": {market: data["large_trades"] for market, data in markets.items()},
-                     "profiles": _unified_profiles(markets), "whale_activity": whale_activity,
-                     "market_history": market_history, "comparison": comparison})
+    """Build only the derived feature payload that has a real consumer.
+
+    ``markets``, ``whale_activity``, ``market_history`` and ``comparison`` already
+    exist at Processing top level.  The legacy implementation deep-copied all of
+    them again under ``features`` even though Classification/Screen only consume
+    ``features.profiles``.  Keeping one owner removes a multi-megabyte duplicate
+    tree and a large deepcopy/JSON-serialization cost.
+    """
+    del whale_activity, market_history, comparison
+    return {"profiles": _unified_profiles(markets)}
 
 
 class LiquidityMicrostructureFeatureBuilder:

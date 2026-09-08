@@ -9,21 +9,34 @@ import math
 import time
 from typing import Any
 
-from ..math.microstructure.order_book import depth_metrics, derive_cumulative_band, process_order_book_levels
-from ..math.microstructure.series_metrics import absolute_change, clean_zero, observation_at_or_before, rolling_mean, rolling_std, rolling_z_score, safe_percent_change
-from ..math.microstructure.trade_flow import aggregate_trade_window, enrich_trade_event
-from ..math.native_analysis import rolling_zscore as native_rolling_zscore, rolling_wasserstein, difference as native_difference, latest as native_latest
+from .liquidity_microstructure_math import depth_metrics, derive_cumulative_band, process_order_book_levels
+from .liquidity_microstructure_math import (
+    absolute_change,
+    clean_zero,
+    observation_at_or_before,
+    rolling_mean,
+    rolling_std,
+    rolling_z_score,
+    safe_percent_change,
+)
+from .liquidity_microstructure_math import aggregate_trade_window, enrich_trade_event
+from .liquidity_microstructure_math import (
+    rolling_zscore as native_rolling_zscore,
+    rolling_wasserstein,
+    difference as native_difference,
+    latest as native_latest,
+)
 from .liquidity_microstructure_feature_builder import build_liquidity_microstructure_features
 
 PROCESSING_VERSION                  = "0.1"
 MARKETS                             = ("spot", "perpetual")
-TIMEFRAMES                          = ("1m", "5m", "15m", "1h")
-REQUIRED_TIMEFRAMES                 = ("1m", "1h")
+TIMEFRAMES                          = ("1m", "5m", "15m", "4h")
+REQUIRED_TIMEFRAMES                 = ("1m", "4h")
 DEPTH_RANGES_PERCENT                = (10,)
 SUPPORTED_DEPTH_RANGES_PERCENT      = (1, 5, 10)
 REFERENCE_DEPTH_RANGE_PERCENT       = 10
 MARKET_IMPACT_QUANTITY_BASE         = 1.0
-LARGE_TRADE_WINDOWS_SECONDS         = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "24h": 86400}
+LARGE_TRADE_WINDOWS_SECONDS         = {"1m": 60, "5m": 300, "15m": 900, "4h": 14400, "24h": 86400}
 WHALE_ROLLING_LOOKBACK              = 20
 MARKET_HISTORY_WINDOWS_DAYS         = (1, 7, 30)
 DATASET_STATUSES                    = {"available", "partial", "unavailable", "invalid"}
@@ -128,7 +141,7 @@ def _orderbooks(dataset: Mapping[str, Any], market: str, impact_quantity: float)
     path = f"providers.coinglass.orderbook.{market}"
     timeframes = {}
     for timeframe in TIMEFRAMES:
-        limit = 730 if timeframe == "1h" else 240 if timeframe == "1m" else 0
+        limit = 730 if timeframe == "4h" else 240 if timeframe == "1m" else 0
         source = ([record for record in dataset["records"] if record.get("timeframe") == timeframe][-limit:]
                   if limit else [])
         history = []
@@ -152,7 +165,7 @@ def _orderbooks(dataset: Mapping[str, Any], market: str, impact_quantity: float)
     required_nodes = [timeframes[timeframe] for timeframe in REQUIRED_TIMEFRAMES]
     aggregate = "invalid" if any(value["status"] == "invalid" for value in required_nodes) else (
         "available" if all(value["status"] == "available" for value in required_nodes) else "partial")
-    return {"status": aggregate, "reason": None if aggregate == "available" else "required_1m_or_1h_unavailable", "timeframes": timeframes}
+    return {"status": aggregate, "reason": None if aggregate == "available" else "required_1m_or_4h_unavailable", "timeframes": timeframes}
 
 
 def _direct_depth(record: Mapping[str, Any], dataset: Mapping[str, Any], path: str) -> dict[str, Any]:
@@ -170,7 +183,7 @@ def _depth(dataset: Mapping[str, Any], market: str) -> dict[str, Any]:
     timeframes = {}
     for timeframe in TIMEFRAMES:
         source = [record for record in dataset["records"] if record["timeframe"] == timeframe]
-        if timeframe == "1h":
+        if timeframe == "4h":
             source = source[-730:]
         elif timeframe == "1m":
             source = source[-240:]
@@ -196,7 +209,7 @@ def _depth(dataset: Mapping[str, Any], market: str) -> dict[str, Any]:
     required_nodes = [timeframes[timeframe] for timeframe in REQUIRED_TIMEFRAMES]
     aggregate = "invalid" if any(value["status"] == "invalid" for value in required_nodes) else (
         "available" if all(value["status"] == "available" for value in required_nodes) else "partial")
-    return {"status": aggregate, "reason": None if aggregate == "available" else "required_1m_or_1h_unavailable", "timeframes": timeframes}
+    return {"status": aggregate, "reason": None if aggregate == "available" else "required_1m_or_4h_unavailable", "timeframes": timeframes}
 
 
 def _rebuild_derived_depth_bands(timeframe_node: dict[str, Any]) -> None:
@@ -328,9 +341,9 @@ def _whale_orders(dataset: Mapping[str, Any], market: str, reference: int) -> di
 def _whale(dataset: Mapping[str, Any], lookback: int) -> dict[str, Any]:
     timeframes = {}
     for timeframe in TIMEFRAMES:
-        # VR1.4 owns a native 1h Whale Index history for Screen B.  Lower
-        # timeframes were legacy fan-out calls and are intentionally absent.
-        limit = 730 if timeframe == "1h" else 0
+        # Whale Activity is derived from normalized Large Limit Orders.
+        # The deep 4h history is retained for Screen B; no separate whale-index endpoint exists.
+        limit = 730 if timeframe == "4h" else 0
         records = ([deepcopy(record) for record in dataset["records"] if record["timeframe"] == timeframe][-limit:]
                    if limit else [])
         values = [float(record["whale_index_value"]) for record in records]
@@ -343,8 +356,8 @@ def _whale(dataset: Mapping[str, Any], lookback: int) -> dict[str, Any]:
                                                 "absolute_change": absolute_change(values[-1], values[-2]) if len(values) > 1 else None,
                                                 "percent_change": safe_percent_change(values[-1], values[-2]) if len(values) > 1 else None,
                                                 "rolling_mean_20": mean, "rolling_std_20": std, "rolling_z_score_20": zscore}}
-    status = timeframes["1h"]["status"]
-    return {"status": status, "reason": None if status == "available" else "hourly_whale_index_unavailable", "timeframes": timeframes}
+    status = timeframes["4h"]["status"]
+    return {"status": status, "reason": None if status == "available" else "whale_activity_history_unavailable", "timeframes": timeframes}
 
 
 def _historical_market_join(
@@ -352,17 +365,15 @@ def _historical_market_join(
     provider: Mapping[str, Any],
     cvd_processing_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Join shared price/CVD context with liquidity-native 1h provider data.
+    """Join shared price/CVD context with liquidity-native 4h provider data.
 
-    Price is reused from the Prices Input confirmation history; it is never
-    re-fetched by Liquidity.  Historical aggressive buy/sell notional is reused
-    from CVD Processing when available, so the Footprint endpoint remains a
-    recent Screen-A detail feed rather than a second deep historical source.
+    Price is reused from the canonical Prices Spot 4h history; it is never
+    re-fetched by Liquidity. Historical aggressive buy/sell notional is reused
+    from CVD Processing 4h when available, so all deep Screen-B primitives share
+    one exact timestamp grid. The Footprint endpoint remains a recent Screen-A
+    detail feed rather than a second deep historical source.
     """
-    try:
-        price_source = prices_input["confirmations"]["glassnode"]["price_ohlc"]
-    except (KeyError, TypeError):
-        price_source = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("1h", {})
+    price_source = prices_input.get("markets", {}).get("spot", {}).get("timeframes", {}).get("4h", {})
     prices = {row["timestamp"]: row for row in price_source.get("records", []) if isinstance(row, Mapping) and type(row.get("timestamp")) is int}
     if not prices:
         return {
@@ -378,7 +389,7 @@ def _historical_market_join(
         market: {
             row["timestamp"]: row
             for row in provider["orderbook"][market].get("records", [])
-            if row.get("timeframe") == "1h" and row.get("bid_levels") and row.get("ask_levels")
+            if row.get("timeframe") == "4h" and row.get("bid_levels") and row.get("ask_levels")
         }
         for market in MARKETS
     }
@@ -386,14 +397,14 @@ def _historical_market_join(
         market: {
             row["timestamp"]: row
             for row in provider["order_depth"][market].get("records", [])
-            if row.get("timeframe") == "1h" and row.get("range_percent") == REFERENCE_DEPTH_RANGE_PERCENT
+            if row.get("timeframe") == "4h" and row.get("range_percent") == REFERENCE_DEPTH_RANGE_PERCENT
         }
         for market in MARKETS
     }
     whales = {
         row["timestamp"]: row
         for row in provider["whale_activity"].get("records", [])
-        if row.get("timeframe") == "1h"
+        if row.get("timeframe") == "4h"
     }
 
     cvd_rows: dict[str, dict[int, Mapping[str, Any]]] = {market: {} for market in MARKETS}
@@ -403,7 +414,7 @@ def _historical_market_join(
                 cvd_processing_context.get("markets", {})
                 .get(cvd_market, {})
                 .get("timeframes", {})
-                .get("1h", {})
+                .get("4h", {})
                 .get("records", [])
             )
             cvd_rows[market] = {
@@ -418,7 +429,7 @@ def _historical_market_join(
     trade_bins: dict[str, dict[int, dict[str, float | int]]] = {market: {} for market in MARKETS}
     for market in MARKETS:
         for event in provider["large_trades"][market].get("events", []):
-            bucket = int(event["timestamp"]) // 3600 * 3600
+            bucket = int(event["timestamp"]) // 14400 * 14400
             totals = trade_bins[market].setdefault(bucket, {"buy": 0.0, "sell": 0.0, "count": 0})
             totals[str(event["side"])] = float(totals[str(event["side"])]) + float(event.get("volume_usd", 0.0))
             totals["count"] = int(totals["count"]) + 1
@@ -453,7 +464,7 @@ def _historical_market_join(
                 buy = float(cvd.get("taker_buy_volume_usd") or 0.0)
                 sell = float(cvd.get("taker_sell_volume_usd") or 0.0)
                 trade_count = None
-                executed_source = "cvd_processing_1h"
+                executed_source = "cvd_processing_4h_aligned_to_4h_liquidity"
             else:
                 trades = trade_bins[market].get(timestamp, {"buy": 0.0, "sell": 0.0, "count": 0})
                 buy = float(trades["buy"])
@@ -528,7 +539,7 @@ def _historical_market_join(
         },
     }
 
-def _native_liquidity_analysis(records: Sequence[Mapping[str, Any]], *, whale_order_history_available: bool = False) -> dict[str, Any]:
+def _native_liquidity_analysis(records: Sequence[Mapping[str, Any]], *, whale_activity_history_available: bool = False) -> dict[str, Any]:
     rows=list(records); timestamps=[int(r["timestamp"]) for r in rows]
     depth_imb=[r.get("depth_imbalance") for r in rows]; depth_z=native_rolling_zscore(depth_imb,30,10); ratios=[r.get("bid_ask_depth_ratio") for r in rows]
     spreads=[r.get("spread_bps") for r in rows]; impacts=[r.get("market_impact_1btc_bps") for r in rows]
@@ -565,7 +576,7 @@ def _native_liquidity_analysis(records: Sequence[Mapping[str, Any]], *, whale_or
         "depth_imbalance_pressure":{"depth_imbalance":depth_imb,"depth_imbalance_zscore":depth_z,"bid_ask_depth_ratio":ratios},
         "spread_market_impact_stress":{"spread_bps":spreads,"market_impact_1btc_bps":impacts,"liquidity_stress_score":stress},
         "liquidity_wall_concentration_vacuum":{"bid_wall_score":bid_wall,"ask_wall_score":ask_wall,"upside_vacuum_score":upside_vac,"downside_vacuum_score":downside_vac,"wall_concentration_score":wall_conc},
-        "whale_persistence_cancellation":{"whale_persistence_score":whale_persistence,"cancellation_activity":cancellation,"cancellation_activity_zscore":cancellation_z,"status":"available" if whale_order_history_available else "partial","reason":None if whale_order_history_available else "historical_whale_order_lifecycle_unavailable"},
+        "whale_persistence_cancellation":{"whale_persistence_score":whale_persistence,"cancellation_activity":cancellation,"cancellation_activity_zscore":cancellation_z,"status":"available" if whale_activity_history_available else "partial","reason":None if whale_activity_history_available else "historical_whale_activity_unavailable"},
         "executed_liquidity_absorption":{"buy_absorption_score":buy_abs,"sell_absorption_score":sell_abs,"absorption_index":absorption},
         "liquidity_regime_hmi":{"liquidity_hmi_score":hmi,"wasserstein_distance":wasserstein},
     },"current":{"liquidity_regime":"balanced" if native_latest(hmi) is None or abs(float(native_latest(hmi)))<0.5 else ("robust" if float(native_latest(hmi))>0 else "stressed"),
@@ -638,7 +649,7 @@ def _source_selection(provider: Mapping[str, Any]) -> dict[str, Any]:
     dataset = provider["whale_activity"]
     result["whale_activity"] = {"provider": "coinglass", "dataset_path": "providers.coinglass.whale_activity",
                                 "source_status": dataset["status"], "selected": True,
-                                "role": "proprietary_indicator", "fallback_applied": False}
+                                "role": "derived_large_limit_order_activity", "fallback_applied": False}
     # Market history is no longer a Liquidity provider endpoint.  It is joined
     # from the already-normalized Prices context inside Processing.
     result["market_history"] = {"provider": "shared_prices_context", "dataset_path": "processing.market_history",
@@ -666,7 +677,7 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
                                      prices_input_context: Mapping[str, Any] | None = None,
                                      cvd_processing_context: Mapping[str, Any] | None = None,
                                      now_timestamp: int | None = None, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    input_copy, config_copy = deepcopy(input_contract), deepcopy(dict(config or {}))
+    input_copy, config_copy = input_contract, dict(config or {})
     validate_liquidity_microstructure_input(input_copy)
     impact_quantity = float(config_copy.get("market_impact_quantity_base", MARKET_IMPACT_QUANTITY_BASE))
     lookback = int(config_copy.get("whale_rolling_lookback", WHALE_ROLLING_LOOKBACK))
@@ -694,26 +705,20 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
                                                   "records": market_dataset.get("market_records", {}).get(market, market_dataset.get("records", []) if market == "spot" else []),
                                                   "provenance": market_dataset.get("provenance", {})}, reference)
                         for market in MARKETS}
-    previous = deepcopy(existing_processing) if existing_processing is not None else None
+    previous = existing_processing
     compatible_previous = (isinstance(previous, Mapping) and previous.get("family") == "liquidity_microstructure" and
                            previous.get("configuration") == configuration and previous.get("context") == input_copy["context"])
     if compatible_previous:
-        try:
-            json.dumps(previous, allow_nan=False)
-        except (TypeError, ValueError):
-            compatible_previous = False
-    if compatible_previous:
         whale, history = _preserve_granular(provider=provider, markets=markets, whale=whale, history=history, previous=previous)
         _refresh_aggregate_statuses(markets, whale)
-        if isinstance(prices_input_context, Mapping):
-            market_dataset = _historical_market_join(prices_input_context, provider, cvd_processing_context)
-            history = _market_history(market_dataset, reference)
-            market_histories = {market: _market_history({"status": market_dataset.get("status", "unavailable"),
-                                                          "reason": market_dataset.get("reason"),
-                                                          "records": market_dataset.get("market_records", {}).get(market, []),
-                                                          "provenance": market_dataset.get("provenance", {})}, reference)
-                                for market in MARKETS}
-    liquidity_analysis = {market: _native_liquidity_analysis(market_histories[market].get("records", []), whale_order_history_available=False) for market in MARKETS}
+    whale_history_available = len(whale.get("timeframes", {}).get("4h", {}).get("records", [])) >= 20
+    liquidity_analysis = {
+        market: _native_liquidity_analysis(
+            market_histories[market].get("records", []),
+            whale_activity_history_available=whale_history_available,
+        )
+        for market in MARKETS
+    }
     comparison = _comparison(markets)
     required = {f"markets.{market}.{feature}": markets[market][feature]["status"] for market in MARKETS
                 for feature in ("orderbook", "order_depth")}
@@ -738,7 +743,6 @@ def process_liquidity_microstructure(input_contract: Mapping[str, Any], *, exist
                           "optional_feature_statuses": optional,
                           "missing_features": [], "partial_features": partial, "unavailable_features": unavailable,
                           "invalid_features": invalid, "warnings": [], "errors": []}}
-    json.dumps(output, ensure_ascii=False, allow_nan=False)
     return output
 
 

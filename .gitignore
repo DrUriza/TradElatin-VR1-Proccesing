@@ -1,2 +1,20 @@
-# Created by pytest automatically.
-*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+*.log
+.env
+.DS_Store
+Thumbs.db
+
+data/runtime/*
+!data/runtime/.gitkeep
+data/refresh_requests/*
+!data/refresh_requests/.gitkeep
+data/contracts/*
+!data/contracts/.gitkeep
+data/screen_contracts/*
+!data/screen_contracts/.gitkeep
+data/source_state.json

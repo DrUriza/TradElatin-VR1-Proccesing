@@ -106,6 +106,41 @@ def rolling_wasserstein(values: Sequence[Any], recent_window: int = 20, referenc
     return output
 
 
+def rolling_empirical_percentile(
+    values: Sequence[Any], window: int = 90, *, min_periods: int = 1, scale: float = 100.0
+) -> list[float | None]:
+    """Rolling empirical CDF rank of the current observation."""
+    if window <= 0 or min_periods <= 0:
+        raise ValueError("window and min_periods must be positive")
+    raw = [finite(v) for v in values]
+    output: list[float | None] = []
+    for index, current in enumerate(raw):
+        sample = [v for v in raw[max(0, index + 1 - window): index + 1] if v is not None]
+        if current is None or len(sample) < min_periods:
+            output.append(None)
+            continue
+        output.append(float(scale) * sum(v <= current for v in sample) / len(sample))
+    return output
+
+
+def rolling_normalized_wasserstein(
+    values: Sequence[Any], recent_window: int = 30, reference_window: int = 30, *, floor: float = 1e-9
+) -> list[float | None]:
+    """Dimensionless rolling 1-D Wasserstein distance normalized by reference mean magnitude."""
+    distances = rolling_wasserstein(values, recent_window=recent_window, reference_window=reference_window)
+    raw = [finite(v) for v in values]
+    required = recent_window + reference_window
+    output: list[float | None] = [None] * len(raw)
+    for end in range(required - 1, len(raw)):
+        distance = distances[end]
+        reference = [v for v in raw[end - required + 1:end - recent_window + 1] if v is not None]
+        if distance is None or not reference:
+            continue
+        scale_value = max(abs(sum(reference) / len(reference)), float(floor))
+        output[end] = float(distance) / scale_value
+    return output
+
+
 def latest(values: Sequence[Any]) -> float | None:
     for value in reversed(values):
         number = finite(value)
@@ -160,113 +195,94 @@ def interpolated_cross(
 
 
 def support_resistance_levels(
-    highs: Sequence[Any], lows: Sequence[Any], closes: Sequence[Any], *, lookback: int = 120, levels: int = 3,
-) -> dict[str, list[float]]:
-    """Return nearest clustered local supports/resistances around current close.
+    highs: Sequence[Any], lows: Sequence[Any], closes: Sequence[Any], *, lookback: int = 120, levels: int = 1,
+) -> dict[str, Any]:
+    """Return the strongest observed support and resistance around spot.
 
-    This is intentionally a market-structure calculation rather than classic
-    pivot-point arithmetic. Candidate swing extrema are clustered within a
-    small relative tolerance, ranked by touches, recency and distance, then the
-    nearest levels below/above current price are selected.
+    Local swing extrema are clustered with a tolerance derived from observed
+    candle range, then ranked by touches, recency and proximity. V4.1 keeps one
+    candidate per side. If a pivot cluster is absent, an actually observed
+    completed wick may be used; projected/synthetic offsets are never created.
     """
     h = [finite(v) for v in highs][-lookback:]
     l = [finite(v) for v in lows][-lookback:]
     c = [finite(v) for v in closes][-lookback:]
     valid_close = next((v for v in reversed(c) if v is not None), None)
     if valid_close is None:
-        return {"support": [], "resistance": []}
-    candidates: list[tuple[float, int, str]] = []
-    n = len(c)
+        return {"support": [], "resistance": [], "method": "observed_swing_cluster_single", "fallback_used": False, "fallback_type": None, "candidates": {}}
+
+    n = min(len(h), len(l), len(c))
     radius = 2
+    candidates: list[tuple[float, int, str]] = []
     for i in range(radius, n - radius):
-        if l[i] is not None:
-            local = [v for v in l[i-radius:i+radius+1] if v is not None]
-            if local and l[i] == min(local):
-                candidates.append((float(l[i]), i, "support"))
-        if h[i] is not None:
-            local = [v for v in h[i-radius:i+radius+1] if v is not None]
-            if local and h[i] == max(local):
-                candidates.append((float(h[i]), i, "resistance"))
-    tolerance = max(abs(valid_close) * 0.0025, 1e-12)
+        low_value = l[i]
+        if low_value is not None:
+            local_lows = [v for v in l[i - radius:i + radius + 1] if v is not None]
+            if local_lows and low_value == min(local_lows):
+                candidates.append((float(low_value), i, "support"))
+        high_value = h[i]
+        if high_value is not None:
+            local_highs = [v for v in h[i - radius:i + radius + 1] if v is not None]
+            if local_highs and high_value == max(local_highs):
+                candidates.append((float(high_value), i, "resistance"))
+
+    observed_ranges = [float(hi - lo) for hi, lo in zip(h, l) if hi is not None and lo is not None and hi >= lo]
+    median_range = float(np.median(observed_ranges)) if observed_ranges else 0.0
+    tolerance = max(median_range * 0.75, abs(float(valid_close)) * 0.0015, 1e-12)
+
     clusters: list[dict[str, Any]] = []
     for value, index, kind in candidates:
-        found = None
-        for cluster in clusters:
-            if cluster["kind"] == kind and abs(cluster["value"] - value) <= tolerance:
-                found = cluster
-                break
-        if found is None:
-            clusters.append({"value": value, "kind": kind, "touches": 1, "last_index": index})
-        else:
-            count = found["touches"]
-            found["value"] = (found["value"] * count + value) / (count + 1)
-            found["touches"] += 1
-            found["last_index"] = max(found["last_index"], index)
-    supports = [x for x in clusters if x["kind"] == "support" and x["value"] < valid_close]
-    resistances = [x for x in clusters if x["kind"] == "resistance" and x["value"] > valid_close]
-    supports.sort(key=lambda x: (valid_close - x["value"], -x["touches"], -x["last_index"]))
-    resistances.sort(key=lambda x: (x["value"] - valid_close, -x["touches"], -x["last_index"]))
-
-    support_values = [float(x["value"]) for x in supports[:levels]]
-    resistance_values = [float(x["value"]) for x in resistances[:levels]]
-
-    # Sparse swing clusters can legitimately produce fewer than the three
-    # horizontal levels required by Screen A. Fill only the missing slots with
-    # the nearest distinct observed lows/highs from the same lookback window.
-    # This remains a direct market-data calculation; no HMI placeholder values
-    # or synthetic offsets are introduced.
-    def fill_nearest(selected: list[float], observed: Sequence[float | None], *, below: bool) -> list[float]:
-        candidates = sorted(
-            {float(v) for v in observed if v is not None and ((v < valid_close) if below else (v > valid_close))},
-            key=lambda v: (valid_close - v) if below else (v - valid_close),
-        )
-        for value in candidates:
-            fallback_tolerance = max(abs(valid_close) * 0.0002, 1e-12)
-            if any(abs(value - existing) <= fallback_tolerance for existing in selected):
-                continue
-            selected.append(value)
-            if len(selected) >= levels:
-                break
-        return selected[:levels]
-
-    support_values = sorted(fill_nearest(support_values, l, below=True), reverse=True)[:levels]
-    resistance_values = sorted(fill_nearest(resistance_values, h, below=False))[:levels]
-
-    # In edge regimes (for example price sitting at a 500-bar low) there may
-    # simply be fewer than N observed extrema below/above spot. Screen A still
-    # requires three deterministic levels, so complete the sparse side with a
-    # volatility/range-derived projection. This fallback is explicitly marked
-    # as calculated rather than pretending an observed swing existed.
-    finite_highs = [float(v) for v in h if v is not None]
-    finite_lows = [float(v) for v in l if v is not None]
-    span = (max(finite_highs) - min(finite_lows)) if finite_highs and finite_lows else 0.0
-    step = max(span / max(8, levels * 4), abs(valid_close) * 0.0025, 1e-9)
-    fallback_used = False
-    k = 1
-    while len(support_values) < levels:
-        value = float(valid_close - step * k)
-        k += 1
-        if any(abs(value - existing) <= max(abs(valid_close) * 0.0002, 1e-12) for existing in support_values):
+        compatible = [cluster for cluster in clusters if cluster["kind"] == kind and abs(float(cluster["value"]) - value) <= tolerance]
+        if not compatible:
+            clusters.append({"value": value, "kind": kind, "touches": 1, "last_index": index, "first_index": index})
             continue
-        support_values.append(value)
-        fallback_used = True
-    k = 1
-    while len(resistance_values) < levels:
-        value = float(valid_close + step * k)
-        k += 1
-        if any(abs(value - existing) <= max(abs(valid_close) * 0.0002, 1e-12) for existing in resistance_values):
-            continue
-        resistance_values.append(value)
-        fallback_used = True
-    support_values = sorted(support_values, reverse=True)[:levels]
-    resistance_values = sorted(resistance_values)[:levels]
+        cluster = min(compatible, key=lambda item: abs(float(item["value"]) - value))
+        count = int(cluster["touches"])
+        cluster["value"] = (float(cluster["value"]) * count + value) / (count + 1)
+        cluster["touches"] = count + 1
+        cluster["last_index"] = max(int(cluster["last_index"]), index)
+
+    def score(cluster: Mapping[str, Any]) -> float:
+        value = float(cluster["value"])
+        touches = int(cluster["touches"])
+        last_index = int(cluster["last_index"])
+        recency = (last_index + 1) / max(n, 1)
+        distance_fraction = abs(float(valid_close) - value) / max(abs(float(valid_close)), 1e-12)
+        proximity = math.exp(-distance_fraction / 0.02)
+        return 2.0 * math.log1p(touches) + 1.20 * recency + 0.80 * proximity
+
+    supports = [cluster for cluster in clusters if cluster["kind"] == "support" and float(cluster["value"]) < valid_close]
+    resistances = [cluster for cluster in clusters if cluster["kind"] == "resistance" and float(cluster["value"]) > valid_close]
+    supports.sort(key=lambda cluster: (-score(cluster), valid_close - float(cluster["value"])))
+    resistances.sort(key=lambda cluster: (-score(cluster), float(cluster["value"]) - valid_close))
+
+    requested = max(1, int(levels))
+    chosen_supports = supports[:requested]
+    chosen_resistances = resistances[:requested]
+    observed_fallback_used = False
+    completed_highs = [float(v) for v in h[:-radius] if v is not None and float(v) > valid_close]
+    completed_lows = [float(v) for v in l[:-radius] if v is not None and float(v) < valid_close]
+    if not chosen_supports and completed_lows:
+        value = max(completed_lows)
+        chosen_supports = [{"value": value, "touches": 1, "last_index": max(i for i, v in enumerate(l[:-radius]) if v is not None and float(v) == value)}]
+        observed_fallback_used = True
+    if not chosen_resistances and completed_highs:
+        value = min(completed_highs)
+        chosen_resistances = [{"value": value, "touches": 1, "last_index": max(i for i, v in enumerate(h[:-radius]) if v is not None and float(v) == value)}]
+        observed_fallback_used = True
+
     return {
-        "support": support_values,
-        "resistance": resistance_values,
-        "method": "swing_clusters_with_range_fallback" if fallback_used else "swing_clusters",
-        "fallback_used": fallback_used,
+        "support": [float(cluster["value"]) for cluster in chosen_supports],
+        "resistance": [float(cluster["value"]) for cluster in chosen_resistances],
+        "method": "observed_swing_cluster_single" if requested == 1 else "observed_swing_clusters",
+        "fallback_used": observed_fallback_used,
+        "fallback_type": "observed_completed_wick" if observed_fallback_used else None,
+        "cluster_tolerance": tolerance,
+        "candidates": {
+            "support": [{"value": float(cluster["value"]), "touches": int(cluster["touches"]), "last_index": int(cluster["last_index"]), "score": score(cluster)} for cluster in chosen_supports],
+            "resistance": [{"value": float(cluster["value"]), "touches": int(cluster["touches"]), "last_index": int(cluster["last_index"]), "score": score(cluster)} for cluster in chosen_resistances],
+        },
     }
-
 
 def score_to_probability(score: Any, scale: float = 1.0) -> float | None:
     value = finite(score)

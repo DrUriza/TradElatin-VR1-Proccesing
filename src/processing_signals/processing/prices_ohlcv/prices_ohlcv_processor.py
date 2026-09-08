@@ -7,35 +7,50 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
-from processing_signals.processing.math.indicators.market_structure.fibonacci_levels import fibonacci_levels
-from processing_signals.processing.math.indicators.momentum.cci                      import cci
-from processing_signals.processing.math.indicators.momentum.rsi                      import rsi
-from processing_signals.processing.math.indicators.momentum.stochastic               import stochastic
-from processing_signals.processing.math.indicators.momentum.tsi                      import tsi
-from processing_signals.processing.math.indicators.momentum.williams_r               import williams_r
-from processing_signals.processing.math.indicators.trend.adx                         import adx
-from processing_signals.processing.math.indicators.trend.macd                        import macd
-from processing_signals.processing.math.indicators.trend.moving_averages             import ema, sma, wma
-from processing_signals.processing.math.indicators.volatility.atr                    import atr
-from processing_signals.processing.math.indicators.volatility.bollinger_bands        import bollinger_bands
-from processing_signals.processing.math.indicators.volume.mfi                        import mfi
-from processing_signals.processing.math.technical_cross_signals                      import detect_cross_pairs
-from processing_signals.processing.math.native_analysis import (
-    interpolated_cross, rolling_wasserstein, support_resistance_levels, finite as native_finite,
+from .prices_ohlcv_math import fibonacci_levels
+from .prices_ohlcv_math import cci
+from .prices_ohlcv_math import rsi
+from .prices_ohlcv_math import stochastic
+from .prices_ohlcv_math import tsi
+from .prices_ohlcv_math import williams_r
+from .prices_ohlcv_math import adx
+from .prices_ohlcv_math import macd
+from .prices_ohlcv_math import ema, sma, wma
+from .prices_ohlcv_math import atr
+from .prices_ohlcv_math import bollinger_bands
+from .prices_ohlcv_math import mfi
+from .prices_ohlcv_math import detect_cross_pairs
+from .prices_ohlcv_math import (
+    interpolated_cross,
+    rolling_wasserstein,
+    support_resistance_levels,
+    finite as native_finite,
 )
-from processing_signals.processing.math.patterns                                     import detect_candlestick_patterns
-from processing_signals.processing.math.statistics.descriptive_statistics            import (
-    calculate_kurtosis, calculate_mean, calculate_skewness,
-    calculate_standard_deviation, calculate_z_score,
+from .prices_ohlcv_math import detect_candlestick_patterns
+from .prices_ohlcv_math import (
+    calculate_kurtosis,
+    calculate_mean,
+    calculate_skewness,
+    calculate_standard_deviation,
+    calculate_z_score,
 )
-from processing_signals.processing.math.statistics.risk_metrics import (
-    calculate_historical_cvar, calculate_historical_var,
+from .prices_ohlcv_math import (
+    calculate_historical_cvar,
+    calculate_historical_var,
 )
-from processing_signals.processing.math.statistics.return_performance import (
-    calculate_calmar_ratio, calculate_equity_curve, calculate_max_consecutive_losses,
-    calculate_max_consecutive_wins, calculate_max_drawdown, calculate_omega_ratio,
-    calculate_profit_factor, calculate_recovery_factor, calculate_sharpe_ratio,
-    calculate_simple_returns, calculate_sortino_ratio, calculate_win_rate,
+from .prices_ohlcv_math import (
+    calculate_calmar_ratio,
+    calculate_equity_curve,
+    calculate_max_consecutive_losses,
+    calculate_max_consecutive_wins,
+    calculate_max_drawdown,
+    calculate_omega_ratio,
+    calculate_profit_factor,
+    calculate_recovery_factor,
+    calculate_sharpe_ratio,
+    calculate_simple_returns,
+    calculate_sortino_ratio,
+    calculate_win_rate,
 )
 
 from .prices_ohlcv_feature_builder import PricesOhlcvFeatureBuilder
@@ -45,9 +60,7 @@ TIMEFRAME_SECONDS = {
     "1m": 60,
     "5m": 300,
     "15m": 900,
-    "1h": 3600,
     "4h": 14400,
-    "1d": 86400,
 }
 
 TIMEFRAME_ORDER = tuple(TIMEFRAME_SECONDS)
@@ -55,9 +68,7 @@ CALCULATION_MARKETS = ("spot", "futures")
 
 RESAMPLING_RULES = {
     "5m": {"source_timeframe": "1m", "expected_source_records": 5},
-    "1h": {"source_timeframe": "15m", "expected_source_records": 4},
     "4h": {"source_timeframe": "15m", "expected_source_records": 16},
-    "1d": {"source_timeframe": "15m", "expected_source_records": 96},
 }
 
 OHLC_FIELDS = ("open", "high", "low", "close")
@@ -79,6 +90,7 @@ PRICE_INDICATOR_CONFIG = {
     "support_resistance_lookback": 120,
     "wasserstein": {"recent_window": 20, "reference_window": 100},
     "tsi": {"slow_period": 25, "fast_period": 13},
+    "dynamic_oscillator_thresholds": {"lookback": 120, "lower_fraction": 0.20, "upper_fraction": 0.80},
 }
 
 INDICATOR_MODULES = {
@@ -104,7 +116,7 @@ PRICE_STATISTICS_CONFIG = {
 
 PRICE_PERIODS_PER_YEAR = {
     "1m": 525600, "5m": 105120, "15m": 35040,
-    "1h": 8760, "4h": 2190, "1d": 365,
+    "4h": 2190,
 }
 
 
@@ -175,6 +187,68 @@ def last_valid_value(values: Sequence[Any]) -> float | None:
         if valid is not None:
             return valid
     return None
+
+
+def _observed_range_thresholds(
+    values: Sequence[Any],
+    *,
+    lookback: int = 120,
+    lower_fraction: float = 0.20,
+    upper_fraction: float = 0.80,
+) -> dict[str, Any]:
+    """Precompute adaptive oscillator bands from the observed value range.
+
+    HMI consumes these numbers verbatim; it never derives market metrics.
+    Lower/upper are range fractions, not fixed oscillator values or quantiles.
+    """
+    finite_values = [value for value in (_finite_or_none(item) for item in list(values)[-int(lookback):]) if value is not None]
+    if len(finite_values) < 5:
+        return {
+            "status": "unavailable", "reason": "insufficient_observed_range",
+            "lookback": int(lookback), "valid_points": len(finite_values),
+            "lower_fraction": float(lower_fraction), "upper_fraction": float(upper_fraction),
+            "observed_min": None, "observed_max": None, "lower": None, "midpoint": None, "upper": None,
+        }
+    observed_min = min(finite_values)
+    observed_max = max(finite_values)
+    span = observed_max - observed_min
+    if span <= 1e-12:
+        return {
+            "status": "unavailable", "reason": "degenerate_observed_range",
+            "lookback": int(lookback), "valid_points": len(finite_values),
+            "lower_fraction": float(lower_fraction), "upper_fraction": float(upper_fraction),
+            "observed_min": observed_min, "observed_max": observed_max,
+            "lower": None, "midpoint": None, "upper": None,
+        }
+    return {
+        "status": "available", "reason": None,
+        "lookback": int(lookback), "valid_points": len(finite_values),
+        "lower_fraction": float(lower_fraction), "upper_fraction": float(upper_fraction),
+        "observed_min": observed_min, "observed_max": observed_max,
+        "lower": observed_min + float(lower_fraction) * span,
+        "midpoint": observed_min + 0.50 * span,
+        "upper": observed_min + float(upper_fraction) * span,
+        "basis": "observed_min_plus_fraction_of_observed_range",
+    }
+
+
+def _attach_dynamic_oscillator_thresholds(package: dict[str, Any], config: Mapping[str, Any]) -> None:
+    series = package.get("series", {})
+    values = next((items for items in series.values() if isinstance(items, list)), [])
+    thresholds = _observed_range_thresholds(
+        values,
+        lookback=int(config.get("lookback", 120)),
+        lower_fraction=float(config.get("lower_fraction", 0.20)),
+        upper_fraction=float(config.get("upper_fraction", 0.80)),
+    )
+    package["dynamic_thresholds"] = thresholds
+    if thresholds.get("status") == "available":
+        package["reference_lines"] = [
+            {"role": "oversold", "value": thresholds["lower"], "label": "20% RANGE", "basis": thresholds["basis"]},
+            {"role": "overbought", "value": thresholds["upper"], "label": "80% RANGE", "basis": thresholds["basis"]},
+        ]
+    else:
+        package["reference_lines"] = []
 
 
 def evaluate_indicator_quality(
@@ -334,12 +408,35 @@ def calculate_prices_indicator_package(
     }
     fib_result = build_multi_series_indicator(
         indicator_id="fibonacci_levels", raw_series={name: fib[column] for name, column in fib_names.items()},
-        timestamps=ts, parameters={"lookback": fib_period}, warmup_records=fib_period,
+        timestamps=ts,
+        parameters={
+            "lookback": fib_period,
+            "ratios": [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0],
+            "anchor_convention": "0%=swing_origin;100%=swing_endpoint",
+            "swing_rule": "rolling_window_extremes_most_recent_occurrence",
+        },
+        warmup_records=fib_period,
         market_type=market_type, timeframe=timeframe, module=INDICATOR_MODULES["fibonacci_levels"], function="fibonacci_levels",
     )
+    fib_levels_current = {
+        level: fib_result["current"][level]
+        for level in ("0.0", "0.236", "0.382", "0.5", "0.618", "0.786", "1.0")
+    }
+    fib_origin = fib_levels_current["0.0"]
+    fib_endpoint = fib_levels_current["1.0"]
+    fib_direction = None
+    if fib_origin is not None and fib_endpoint is not None:
+        if fib_endpoint > fib_origin:
+            fib_direction = "bullish"
+        elif fib_endpoint < fib_origin:
+            fib_direction = "bearish"
     fib_result["current"] = {
-        "swing_high": fib_result["current"]["swing_high"], "swing_low": fib_result["current"]["swing_low"],
-        "levels": {level: fib_result["current"][level] for level in ("0.0", "0.236", "0.382", "0.5", "0.618", "0.786", "1.0")},
+        "swing_high": fib_result["current"]["swing_high"],
+        "swing_low": fib_result["current"]["swing_low"],
+        "direction": fib_direction,
+        "origin": fib_origin,
+        "endpoint": fib_endpoint,
+        "levels": fib_levels_current,
     }
     package["fibonacci_levels"] = fib_result
 
@@ -356,6 +453,10 @@ def calculate_prices_indicator_package(
             parameters=parameters, warmup_records=warmup, market_type=market_type, timeframe=timeframe,
             module=INDICATOR_MODULES[indicator_id], function=function,
         )
+
+    adaptive_cfg = cfg["dynamic_oscillator_thresholds"]
+    _attach_dynamic_oscillator_thresholds(package["rsi"], adaptive_cfg)
+    _attach_dynamic_oscillator_thresholds(package["tsi"], adaptive_cfg)
 
     macd_cfg   = cfg["macd"]
     macd_frame = macd(close, fast=macd_cfg["fast_period"], slow=macd_cfg["slow_period"], signal=macd_cfg["signal_period"])
@@ -418,12 +519,13 @@ def calculate_prices_indicator_package(
         "calculation": {"module": "processing.math.native_analysis", "function": "rolling_wasserstein", "records": len(ts)},
     }
 
-    sr = support_resistance_levels(high.tolist(), low.tolist(), close.tolist(), lookback=cfg["support_resistance_lookback"], levels=3)
+    sr = support_resistance_levels(high.tolist(), low.tolist(), close.tolist(), lookback=cfg["support_resistance_lookback"], levels=1)
     package["support_resistance"] = {
         "indicator_id": "support_resistance",
-        "parameters": {"lookback": cfg["support_resistance_lookback"], "levels": 3,
-                       "mode": sr.get("method", "swing_clusters"), "fallback_used": bool(sr.get("fallback_used", False))},
-        "current": {"support": sr["support"], "resistance": sr["resistance"]},
+        "parameters": {"lookback": cfg["support_resistance_lookback"], "levels": 1,
+                       "mode": sr.get("method", "observed_swing_cluster_single"),
+                       "fallback_used": bool(sr.get("fallback_used", False)), "fallback_type": sr.get("fallback_type")},
+        "current": {"support": sr["support"], "resistance": sr["resistance"], "candidates": sr.get("candidates", {})},
         "source": _source_metadata(market_type, timeframe),
         "quality": {"status": "ok" if sr["support"] or sr["resistance"] else "insufficient_data"},
         "calculation": {"module": "processing.math.native_analysis", "function": "support_resistance_levels"},
@@ -667,7 +769,7 @@ def build_indicator_bias_components(*, indicator_package: dict[str, Any], close:
 
 
 def calculate_all_prices_bias_components(*, markets: Mapping[str, Any], indicators: Mapping[str, Any]) -> dict[str, Any]:
-    grouping = {"short": ["5m", "15m"], "mid": ["1h", "4h"], "long": ["1d"], "micro_confirmation": ["1m"]}
+    grouping = {"short": ["5m", "15m"], "mid": ["4h"], "micro_confirmation": ["1m"]}
     return {
         market: {
             "timeframes": {
@@ -892,15 +994,21 @@ def calculate_spot_futures_comparison(markets: Mapping[str, Any]) -> dict[str, A
 
 
 def evaluate_prices_processing_quality(markets: Mapping[str, Any]) -> dict[str, Any]:
+    """Evaluate only the canonical Spot OHLCV surface.
+
+    Futures OHLC was retired from the frozen 33-endpoint VR1 contract.  Empty
+    compatibility placeholders must therefore never degrade Prices quality or
+    trigger recovery; they are not an external dependency.
+    """
     warnings: list[str] = []
     errors: list[str] = []
-    for market_name in ("spot", "futures"):
-        for timeframe in TIMEFRAME_ORDER:
-            payload = markets.get(market_name, {}).get("timeframes", {}).get(timeframe)
-            if payload is None:
-                errors.append(f"missing {market_name}/{timeframe}")
-            elif not payload.get("records"):
-                warnings.append(f"empty {market_name}/{timeframe}")
+    market_name = "spot"
+    for timeframe in TIMEFRAME_ORDER:
+        payload = markets.get(market_name, {}).get("timeframes", {}).get(timeframe)
+        if payload is None:
+            errors.append(f"missing {market_name}/{timeframe}")
+        elif not payload.get("records"):
+            warnings.append(f"empty {market_name}/{timeframe}")
     status = "invalid" if errors else ("partial" if warnings else "ok")
     return {"status": status, "warnings": warnings, "errors": errors}
 
@@ -956,6 +1064,9 @@ class PricesOhlcvProcessor:
         apply_cvd_volume_sides(markets, cvd_processing_context)
         comparison              = calculate_spot_futures_comparison(markets)
         dirty = set(dirty_timeframes or ())
+        for target_timeframe, rule in RESAMPLING_RULES.items():
+            if str(rule["source_timeframe"]) in dirty:
+                dirty.add(target_timeframe)
         previous_features = (existing_processing or {}).get("features", {})
         windowed = mode == "incremental" and bool(dirty) and bool(previous_features)
         if windowed:
@@ -1001,8 +1112,8 @@ class PricesOhlcvProcessor:
             "family": "prices_ohlcv",
             "stage": "processing",
             "mode": mode,
+            "context": deepcopy(input_contract.get("context", {})),
             "markets": markets,
-            "confirmations": deepcopy(input_contract.get("confirmations", {})),
             "provider_features": deepcopy(input_contract.get("provider_features", {})),
             "features": self.feature_builder.build(
                 markets=markets, comparison=comparison, indicators=indicators,

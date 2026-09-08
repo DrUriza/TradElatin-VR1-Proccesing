@@ -28,13 +28,13 @@ ATR_LOW_PERCENT             = 0.50
 ATR_MODERATE_PERCENT        = 1.50
 ATR_HIGH_PERCENT            = 3.00
 
-TIMEFRAME_ORDER = ("1m", "5m", "15m", "1h", "4h", "1d")
+TIMEFRAME_ORDER = ("1m", "5m", "15m", "4h")
 MARKET_ORDER    = ("spot", "futures")
 
 PRICE_RETURN_VOLATILITY_THRESHOLDS = {
     "1m": {"low": 0.0010, "high": 0.0030}, "5m": {"low": 0.0020, "high": 0.0060},
-    "15m": {"low": 0.0030, "high": 0.0100}, "1h": {"low": 0.0060, "high": 0.0200},
-    "4h": {"low": 0.0120, "high": 0.0400}, "1d": {"low": 0.0250, "high": 0.0800}}
+    "15m": {"low": 0.0030, "high": 0.0100},
+    "4h": {"low": 0.0120, "high": 0.0400}}
 
 BIAS_COMPONENT_WEIGHTS = {
     "ema_9_minus_ema_21": 1.00, "ema_21_minus_ema_50": 1.20, "sma_20_minus_sma_50": 1.00,
@@ -43,9 +43,9 @@ BIAS_COMPONENT_WEIGHTS = {
     "mfi_centered": 0.60, "williams_r_centered": 0.50, "tsi": 0.80,
     "close_minus_bollinger_middle": 0.70,
 }
-SHORT_TIMEFRAME_WEIGHTS = {"5m": 0.40, "15m": 0.60}
-MID_TIMEFRAME_WEIGHTS   = {"1h": 0.40, "4h": 0.60}
-LONG_TIMEFRAME_WEIGHTS  = {"1d": 1.00}
+SHORT_TIMEFRAME_WEIGHTS = {"1m": 0.25, "5m": 0.75}
+MID_TIMEFRAME_WEIGHTS   = {"15m": 1.00}
+LONG_TIMEFRAME_WEIGHTS  = {"4h": 1.00}
 OVERALL_GROUP_WEIGHTS   = {"short": 0.30, "mid": 0.40, "long": 0.30}
 
 REQUIRED_INDICATOR_SIGNALS = (
@@ -106,19 +106,37 @@ def _sanitize_json_value(value: Any) -> Any:
     return value
 
 
-def classify_rsi(value: Any) -> dict[str, Any]:
-    value = _finite(value)
-    if value is None:
+def _adaptive_oscillator_state(value: Any, thresholds: Mapping[str, Any] | None, *, name: str) -> dict[str, Any]:
+    numeric = _finite(value)
+    if numeric is None:
         return _missing()
-    if value < RSI_OVERSOLD:
-        return _classification(value, "neutral", "oversold", "RSI is below the configured oversold threshold", (RSI_OVERSOLD - value) / RSI_OVERSOLD, "warning")
-    if value > RSI_OVERBOUGHT:
-        return _classification(value, "neutral", "overbought", "RSI is above the configured overbought threshold", (value - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT), "warning")
-    if RSI_NEUTRAL_LOW <= value <= RSI_NEUTRAL_HIGH:
-        return _classification(value, "neutral", "neutral", "RSI is inside the configured neutral range", 1 - abs(value - 50) / 5, "neutral")
-    signal = "bearish" if value < RSI_NEUTRAL_LOW else "bullish"
-    return _classification(value, signal, signal, "RSI is outside the neutral range", abs(value - 50) / 50)
+    source = thresholds if isinstance(thresholds, Mapping) else {}
+    lower = _finite(source.get("lower"))
+    midpoint = _finite(source.get("midpoint"))
+    upper = _finite(source.get("upper"))
+    observed_min = _finite(source.get("observed_min"))
+    observed_max = _finite(source.get("observed_max"))
+    if None in (lower, midpoint, upper, observed_min, observed_max) or not (observed_min <= lower < midpoint < upper <= observed_max):
+        return _classification(numeric, "neutral", "unavailable", f"{name} adaptive range is unavailable", 0.0, "neutral", dynamic_thresholds=dict(source))
+    span = max(observed_max - observed_min, 1e-12)
+    if numeric <= lower:
+        state, signal, color = "oversold", "neutral", "warning"
+    elif numeric >= upper:
+        state, signal, color = "overbought", "neutral", "warning"
+    elif numeric >= midpoint:
+        state, signal, color = "normal_bullish", "bullish", "bullish"
+    else:
+        state, signal, color = "normal_bearish", "bearish", "bearish"
+    confidence = min(1.0, max(0.0, abs(numeric - midpoint) / (0.5 * span)))
+    return _classification(
+        numeric, signal, state,
+        f"{name} uses 20%/80% of its observed range with the observed midpoint separating normal bearish/bullish states",
+        confidence, color, dynamic_thresholds=dict(source),
+    )
 
+
+def classify_rsi(value: Any, thresholds: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return _adaptive_oscillator_state(value, thresholds, name="RSI")
 
 def classify_macd_histogram(value: Any, tolerance: float) -> dict[str, Any]:
     value = _finite(value)
@@ -252,21 +270,14 @@ def classify_atr(absolute_value: Any, atr_percent_of_close: Any) -> dict[str, An
                            atr_absolute=absolute, atr_percent_of_close=percent)
 
 
-def classify_tsi(value: Any, parameters: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    value = _finite(value)
-    if value is None:
-        output = _missing()
-    else:
-        if value > TSI_NEUTRAL_TOLERANCE:
-            signal = "bullish"
-        elif value < -TSI_NEUTRAL_TOLERANCE:
-            signal = "bearish"
-        else:
-            signal = "neutral"
-        output = _classification(value, signal, signal, "TSI is compared with the configured neutral tolerance", min(1, abs(value) / 100))
+def classify_tsi(
+    value: Any,
+    parameters: Mapping[str, Any] | None = None,
+    thresholds: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    output = _adaptive_oscillator_state(value, thresholds, name="TSI")
     output["parameters"] = dict(parameters or {})
     return output
-
 
 def classify_indicator_package(indicator_package: Mapping[str, Any], bias_components: Mapping[str, Any] | None = None) -> dict[str, Any]:
     current = lambda name, field: indicator_package.get(name, {}).get("current", {}).get(field)
@@ -275,7 +286,7 @@ def classify_indicator_package(indicator_package: Mapping[str, Any], bias_compon
     adx     = indicator_package.get("adx", {}).get("current", {})
     bias    = (bias_components or {}).get("values", bias_components or {})
     output  = {
-        "rsi": classify_rsi(current("rsi", "rsi")),
+        "rsi": classify_rsi(current("rsi", "rsi"), indicator_package.get("rsi", {}).get("dynamic_thresholds", {})),
         "macd": classify_macd(macd.get("macd"), macd.get("signal"), macd.get("histogram")),
         "macd_signal": classify_macd_signal(macd.get("signal")),
         "macd_histogram": classify_macd_histogram(macd.get("histogram"), max(abs(_finite(macd.get("macd")) or 0), abs(_finite(macd.get("signal")) or 0), 1) * 0.001),
@@ -284,7 +295,11 @@ def classify_indicator_package(indicator_package: Mapping[str, Any], bias_compon
         "cci": classify_cci(current("cci", "cci")), "mfi": classify_mfi(current("mfi", "mfi")),
         "williams_r": classify_williams_r(current("williams_r", "williams_r")),
         "atr": classify_atr(current("atr", "atr"), bias.get("atr_percent_of_close")),
-        "tsi": classify_tsi(current("tsi", "tsi"), indicator_package.get("tsi", {}).get("parameters", {})),
+        "tsi": classify_tsi(
+            current("tsi", "tsi"),
+            indicator_package.get("tsi", {}).get("parameters", {}),
+            indicator_package.get("tsi", {}).get("dynamic_thresholds", {}),
+        ),
     }
     parameter_sources = {"rsi": "rsi", "macd": "macd", "macd_signal": "macd", "macd_histogram": "macd", "stochastic": "stochastic",
                          "adx": "adx", "cci": "cci", "mfi": "mfi", "williams_r": "williams_r", "atr": "atr", "tsi": "tsi"}
@@ -626,7 +641,7 @@ def classify_market_leadership(biases: Mapping[str, Any]) -> dict[str, Any]:
     return {"state": state, "spot_score": spot, "futures_score": futures, "score_difference": difference,
             "metadata": {"method": "bias_score_difference", "threshold": LEADERSHIP_SCORE_DIFFERENCE}}
 
-def classify_prices_market_relationship(comparison: Mapping[str, Any], biases: Mapping[str, Any], timeframe: str = "1h") -> dict[str, Any]:
+def classify_prices_market_relationship(comparison: Mapping[str, Any], biases: Mapping[str, Any], timeframe: str = "15m") -> dict[str, Any]:
     current = comparison.get("by_timeframe", comparison).get(timeframe, {}).get("current", {})
     return {"basis": classify_basis(current), "agreement": classify_market_agreement(biases),
             "leadership": classify_market_leadership(biases), "timeframe": timeframe}

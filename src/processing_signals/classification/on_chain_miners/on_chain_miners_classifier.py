@@ -12,16 +12,12 @@ MPI_HIGH_PRESSURE_MIN                  = 2.0
 SOPR_BREAKEVEN_EPSILON                = 0.001
 RESERVE_TREND_EPSILON_PERCENT_PER_DAY = 0.001
 DEFAULT_RESERVE_TREND_WINDOW          = "30d"
-NUPL_CAPITULATION_MAX                 = 0.0
-NUPL_HOPE_FEAR_MAX                    = 0.25
-NUPL_OPTIMISM_ANXIETY_MAX             = 0.50
-NUPL_BELIEF_DENIAL_MAX                = 0.75
 
 ON_CHAIN_MINERS_FAMILY = "on_chain_miners"
 VALID_MODES            = {"bootstrap", "incremental", "recovery"}
 VALID_BASIS_STATUSES   = {"available", "partial", "unavailable", "invalid"}
 VALID_QUALITY_STATUSES = {"ok", "partial", "invalid"}
-CLASSIFICATION_IDS     = ("miner_pressure", "reserve_trend", "net_position", "sopr_regime", "nupl_phase")
+CLASSIFICATION_IDS     = ("miner_pressure", "reserve_trend", "net_position", "sopr_regime")
 
 
 def _stable_unique(values: Sequence[str]) -> list[str]:
@@ -70,14 +66,12 @@ SOURCE_TIMESTAMP_PATHS = {
     "reserve_trend":  (("theoretical_start_timestamp",), ("theoretical_end_timestamp",), ("first_timestamp",), ("last_timestamp",)),
     "net_position":   (("timestamp",),),
     "sopr_regime":    (("timestamp",), ("raw_sopr_current", "timestamp")),
-    "nupl_phase":     (("timestamp",), ("previous", "timestamp")),
 }
 REQUIRED_SOURCE_TIMESTAMP_PATHS = {
     "miner_pressure": {("timestamp",)},
     "reserve_trend":  {("last_timestamp",)},
     "net_position":   {("timestamp",)},
     "sopr_regime":    {("timestamp",)},
-    "nupl_phase":     {("timestamp",)},
 }
 
 
@@ -280,58 +274,6 @@ def classify_sopr_regime(basis: Mapping[str, Any]) -> dict[str, Any]:
     return _finalize_source(result, source)
 
 
-def classify_nupl_phase(basis: Mapping[str, Any]) -> dict[str, Any]:
-    current = basis.get("current") if isinstance(basis, Mapping) else None
-    status = _basis_status(basis, current)
-    source = {"feature_id": basis.get("feature_id") if isinstance(basis, Mapping) else None,
-              "timestamp": current.get("timestamp") if isinstance(current, Mapping) else None,
-              "value": current.get("value") if isinstance(current, Mapping) else None,
-              "price_usd": current.get("price_usd") if isinstance(current, Mapping) else None,
-              "unit": current.get("unit") if isinstance(current, Mapping) else None,
-              "previous": basis.get("previous") if isinstance(basis, Mapping) else None,
-              "change_1d": basis.get("change_1d") if isinstance(basis, Mapping) else None}
-    thresholds = {"capitulation_max": NUPL_CAPITULATION_MAX, "hope_fear_max": NUPL_HOPE_FEAR_MAX,
-                  "optimism_anxiety_max": NUPL_OPTIMISM_ANXIETY_MAX, "belief_denial_max": NUPL_BELIEF_DENIAL_MAX}
-    if source["feature_id"] != "nupl_phase_basis":
-        return _empty("nupl_phase", "invalid", "incompatible_nupl_feature_id", source, thresholds)
-    current_status = current.get("status") if isinstance(current, Mapping) else None
-    if status == "invalid":
-        return _empty("nupl_phase", "invalid", "nupl_phase_basis_invalid", source, thresholds)
-    if status == "unavailable":
-        return _empty("nupl_phase", "unavailable", "nupl_phase_basis_unavailable", source, thresholds)
-    if current_status != "available":
-        result = _empty("nupl_phase", "partial" if status == "partial" else "unavailable", "nupl_current_unavailable", source, thresholds)
-        if status == "partial":
-            result["warnings"].append("classification_basis_partial:nupl_phase")
-        return result
-    if source["unit"] != "ratio":
-        return _empty("nupl_phase", "invalid", "incompatible_nupl_unit", source, thresholds)
-    if not _timestamp(source["timestamp"]):
-        return _empty("nupl_phase", "invalid", "invalid_nupl_timestamp", source, thresholds)
-    if not _finite(source["value"]):
-        return _empty("nupl_phase", "invalid", "nupl_value_not_finite", source, thresholds)
-    if source["price_usd"] is not None and not _finite(source["price_usd"]):
-        return _empty("nupl_phase", "invalid", "nupl_price_not_finite", source, thresholds)
-    if source["change_1d"] is not None and not _finite(source["change_1d"]):
-        return _empty("nupl_phase", "invalid", "nupl_change_not_finite", source, thresholds)
-    value = source["value"]
-    if value < NUPL_CAPITULATION_MAX:
-        state, signal, label, token, reason = "capitulation", "bearish", "CAPITULATION", "negative", "nupl_below_zero"
-    elif value < NUPL_HOPE_FEAR_MAX:
-        state, signal, label, token, reason = "hope_fear", "neutral", "HOPE / FEAR", "warning", "nupl_between_zero_and_point_twenty_five"
-    elif value < NUPL_OPTIMISM_ANXIETY_MAX:
-        state, signal, label, token, reason = "optimism_anxiety", "bullish", "OPTIMISM / ANXIETY", "positive", "nupl_between_point_twenty_five_and_point_fifty"
-    elif value < NUPL_BELIEF_DENIAL_MAX:
-        state, signal, label, token, reason = "belief_denial", "neutral", "BELIEF / DENIAL", "warning", "nupl_between_point_fifty_and_point_seventy_five"
-    else:
-        state, signal, label, token, reason = "euphoria_greed", "bearish", "EUPHORIA / GREED", "negative", "nupl_at_or_above_point_seventy_five"
-    result = {"classification_id": "nupl_phase", "status": status, "state": state, "signal": signal, "display_label": label,
-              "display_color_token": token, "source": source, "thresholds": thresholds, "reason": reason, "warnings": [], "errors": []}
-    if status == "partial":
-        result["warnings"].append("classification_basis_partial:nupl_phase")
-    return _finalize_source(result, source)
-
-
 def _validate_processing(contract: Any) -> list[str]:
     if not isinstance(contract, Mapping):
         return ["processing_contract_must_be_mapping"]
@@ -347,7 +289,7 @@ def _validate_processing(contract: Any) -> list[str]:
             errors.append(f"{field}_must_be_mapping")
     features = contract.get("features", {})
     if isinstance(features, Mapping):
-        for feature_id in ("reserve_trend", "miner_pressure_basis", "sopr_regime_basis", "net_position_basis", "nupl_phase_basis"):
+        for feature_id in ("reserve_trend", "miner_pressure_basis", "sopr_regime_basis", "net_position_basis"):
             if not isinstance(features.get(feature_id), Mapping):
                 errors.append(f"missing_required_feature:{feature_id}")
     quality = contract.get("quality", {})
@@ -460,11 +402,9 @@ class OnChainMinersClassifier:
             classifications = {"miner_pressure": classify_miner_pressure(features["miner_pressure_basis"]),
                                "reserve_trend": classify_reserve_trend(features["reserve_trend"]),
                                "net_position": classify_net_position(features["net_position_basis"]),
-                               "sopr_regime": classify_sopr_regime(features["sopr_regime_basis"]),
-                               "nupl_phase": classify_nupl_phase(features["nupl_phase_basis"])}
+                               "sopr_regime": classify_sopr_regime(features["sopr_regime_basis"])}
             basis_by_classification = {"miner_pressure": features["miner_pressure_basis"], "reserve_trend": features["reserve_trend"],
-                                       "net_position": features["net_position_basis"], "sopr_regime": features["sopr_regime_basis"],
-                                       "nupl_phase": features["nupl_phase_basis"]}
+                                       "net_position": features["net_position_basis"], "sopr_regime": features["sopr_regime_basis"]}
             for name, basis in basis_by_classification.items():
                 feature_warnings, feature_errors, message_errors = _feature_messages(name, basis)
                 classifications[name]["warnings"] = _stable_unique([*classifications[name]["warnings"], *feature_warnings])
@@ -490,8 +430,7 @@ class OnChainMinersClassifier:
             timestamps = [classifications["miner_pressure"]["source"].get("timestamp"),
                           classifications["reserve_trend"]["source"].get("last_timestamp"),
                           classifications["net_position"]["source"].get("timestamp"),
-                          classifications["sopr_regime"]["source"].get("timestamp"),
-                          classifications["nupl_phase"]["source"].get("timestamp")]
+                          classifications["sopr_regime"]["source"].get("timestamp")]
             if all(_timestamp(value) for value in timestamps):
                 data_as_of = min(timestamps)
                 processing_data_as_of = processing_quality.get("data_as_of")
@@ -515,7 +454,7 @@ class OnChainMinersClassifier:
 
 
 def classify_on_chain_miners(processing_contract: Mapping[str, Any]) -> dict[str, Any]:
-    """Classify the five approved on-chain miner bases without recomputing Processing mathematics."""
+    """Classify the four approved On-Chain Screen bases without recomputing Processing mathematics."""
     original, _ = copy_json_safe_value(processing_contract, path="processing")
     output   = OnChainMinersClassifier(processing_contract).run()
     current, _ = copy_json_safe_value(processing_contract, path="processing")

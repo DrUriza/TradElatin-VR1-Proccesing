@@ -1,8 +1,8 @@
 """Raw acquisition for Volatility / Market Regimes.
 
-Volatility owns implied-volatility primitives only.  Realized volatility is
-calculated from Prices and Glassnode RV is retained only as a bootstrap
-confirmation.  Long/short positioning is owned entirely by Liquidations.
+Volatility owns one external primitive only: Glassnode DVOL OHLC.
+Realized volatility is derived from Prices inside Processing. Long/short
+positioning is owned entirely by Liquidations.
 """
 from __future__ import annotations
 
@@ -14,22 +14,17 @@ from typing import Any
 
 VOLATILITY_MARKET_REGIMES_FAMILY = "volatility_market_regimes"
 GLASSNODE_PROVIDER = "glassnode"
-GLASSNODE_REALIZED_VOL_ENDPOINT_ID = "realized_volatility"
 GLASSNODE_DVOL_ENDPOINT_ID = "dvol_ohlc"
 BASE_INTERVAL = "1h"
 INTERVAL_SECONDS = 3600
-BOOTSTRAP_HISTORY_DAYS = 730
+BOOTSTRAP_HISTORY_DAYS = 43
 INCREMENTAL_HOURS = 2
 VALID_MODES = {"bootstrap", "incremental", "recovery"}
 
 ENDPOINT_MANIFEST = {
-    (GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID): "/v1/metrics/market/realized_volatility_1_week",
     (GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): "/v1/metrics/derivatives/dvol_ohlc",
 }
 ENDPOINT_NORMALIZATION = {
-    (GLASSNODE_PROVIDER, GLASSNODE_REALIZED_VOL_ENDPOINT_ID): {
-        "timestamp_unit": "seconds", "value_scale": "fraction_to_percent"
-    },
     (GLASSNODE_PROVIDER, GLASSNODE_DVOL_ENDPOINT_ID): {
         "timestamp_unit": "seconds", "value_scale": "volatility_index_points", "shape": "ohlc"
     },
@@ -63,10 +58,6 @@ def build_glassnode_params(*, start_timestamp: int, end_timestamp: int) -> dict[
     if start >= end:
         raise ValueError("invalid_glassnode_window")
     return {"a": "BTC", "s": start, "u": end, "i": BASE_INTERVAL, "f": "json", "timestamp_format": "unix"}
-
-
-def build_glassnode_realized_volatility_params(*, start_timestamp: int, end_timestamp: int) -> dict[str, Any]:
-    return build_glassnode_params(start_timestamp=start_timestamp, end_timestamp=end_timestamp)
 
 
 def build_glassnode_dvol_params(*, start_timestamp: int, end_timestamp: int) -> dict[str, Any]:
@@ -115,22 +106,32 @@ def build_volatility_market_regimes_fetch_plan(
             output.append(_instruction(str(endpoint), max(0, start - INTERVAL_SECONDS), end + INTERVAL_SECONDS))
         return output
 
-    duration = _positive_int(bootstrap_history_days if mode == "bootstrap" else incremental_hours, "history") * (
-        86400 if mode == "bootstrap" else INTERVAL_SECONDS
-    )
-    start = max(0, reference - duration)
-    # DVOL is the only external primitive owned by this family.  Realized
-    # volatility is derived from Prices daily OHLC and no longer requires a
-    # duplicate Glassnode bootstrap request.
-    requests = [_instruction(GLASSNODE_DVOL_ENDPOINT_ID, start, reference)]
+    if mode == "bootstrap":
+        # Every Emulator response stays fixed at 500 records. Request enough
+        # non-overlapping 500-hour pages to cover the public 30D range plus
+        # warm-up, without introducing another logical endpoint.
+        history_seconds = _positive_int(bootstrap_history_days, "history") * 86400
+        page_seconds = 500 * INTERVAL_SECONDS
+        page_count = max(2, math.ceil(history_seconds / page_seconds))
+        requests = []
+        page_end = reference
+        for _ in range(page_count):
+            page_start = max(0, page_end - page_seconds)
+            requests.append(_instruction(GLASSNODE_DVOL_ENDPOINT_ID, page_start, page_end))
+            page_end = page_start
+            if page_end == 0:
+                break
+        requests.reverse()
+    else:
+        duration = _positive_int(incremental_hours, "history") * INTERVAL_SECONDS
+        requests = [_instruction(GLASSNODE_DVOL_ENDPOINT_ID, max(0, reference - duration), reference)]
     if mode != "incremental" or not isinstance(existing_contract, Mapping):
         return requests
     glassnode = existing_contract.get("providers", {}).get("glassnode", {})
     reference_bucket = reference - reference % INTERVAL_SECONDS
     filtered = []
     for request in requests:
-        name = "dvol" if request["endpoint_id"] == GLASSNODE_DVOL_ENDPOINT_ID else "realized_volatility"
-        last = glassnode.get(name, {}).get("last_available_timestamp") if isinstance(glassnode, Mapping) else None
+        last = glassnode.get("dvol", {}).get("last_available_timestamp") if isinstance(glassnode, Mapping) else None
         if type(last) is int and last - last % INTERVAL_SECONDS >= reference_bucket:
             continue
         filtered.append(request)

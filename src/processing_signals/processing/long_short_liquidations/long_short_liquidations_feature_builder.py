@@ -8,10 +8,10 @@ from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from statistics import mean, median
 from typing import Any
 
-REALIZED_WINDOWS_SECONDS = {"1h": 3600, "4h": 14400, "12h": 43200, "24h": 86400}
-EVENT_WINDOWS_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "24h": 86400}
+REALIZED_WINDOWS_SECONDS = {"4h": 14400, "12h": 43200, "24h": 86400}
+EVENT_WINDOWS_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "4h": 14400, "24h": 86400}
 MIN_COMPUTABLE_COVERAGE = .75
-MAP_BUCKET_WIDTH_BPS = 10
+MAP_BUCKET_WIDTH_BPS = 25
 MAP_CENTRAL_TOLERANCE_BPS = 5
 MAP_INTERPOLATION_ENABLED = False
 CLUSTER_MAX_EMPTY_BUCKETS = 0
@@ -35,7 +35,7 @@ def _number(value: Any, *, nonnegative: bool = False, positive: bool = False) ->
     return result
 
 
-def window_end_for_hourly(reference_timestamp: int, records: Sequence[Mapping[str, Any]]) -> int:
+def window_end_for_hourly(reference_timestamp: int, records: Sequence[Mapping[str, Any]], source_interval_seconds: int = 3600) -> int:
     """Return a closed-data semi-open end on the provider's hourly grid.
 
     A record timestamp equal to the runtime reference cannot be assumed to
@@ -55,7 +55,7 @@ def window_end_for_hourly(reference_timestamp: int, records: Sequence[Mapping[st
     if not candidates:
         return reference
     latest = candidates[-1]
-    next_boundary = latest + 3600
+    next_boundary = latest + int(source_interval_seconds)
     return next_boundary if next_boundary <= reference else latest
 
 

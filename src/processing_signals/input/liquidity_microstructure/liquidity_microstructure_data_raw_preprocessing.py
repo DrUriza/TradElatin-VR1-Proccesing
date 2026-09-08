@@ -7,6 +7,7 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+from statistics import median
 import time
 from typing import Any
 
@@ -169,7 +170,7 @@ def _normalize_footprint(record: Any, request: Mapping[str, Any]) -> list[tuple[
         for side, quantity, notional in (("buy", buy_qty, buy_usd), ("sell", sell_qty, sell_usd)):
             if quantity <= 0 and notional <= 0:
                 continue
-            identity = f"footprint|{dimensions['market_type']}|{timestamp}|{index}|{side}|{price_start}|{price_end}"
+            identity = f"footprint|{dimensions['market_type']}|{timestamp}|{index}|{side}"
             output.append(({
                 "event_id": hashlib.sha256(identity.encode()).hexdigest(),
                 "timestamp": timestamp, "market_type": dimensions["market_type"],
@@ -212,14 +213,6 @@ def _normalize_large_order(record: Mapping[str, Any], request: Mapping[str, Any]
     }, unit
 
 
-def _normalize_whale(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
-    timestamp, unit = _record_time(record)
-    dimensions = request["dimensions"]
-    return {"timestamp": timestamp, "market_type": "perpetual", "exchange": dimensions["exchange"],
-            "symbol": dimensions["symbol"], "timeframe": dimensions["timeframe"],
-            "whale_index_value": _finite(record.get("whale_index_value", record.get("whaleIndexValue")), "whale_index_value")}, unit
-
-
 def _normalize_market(record: Mapping[str, Any], request: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     timestamp, unit = _record_time(record)
     return {"timestamp": timestamp, "asset": request["dimensions"]["asset"], "price": _finite(record.get("price"), "price", positive=True),
@@ -237,7 +230,7 @@ def _dataset_key(request: Mapping[str, Any]) -> str:
         return f"coinglass.large_trades.{market}"
     if "large_limit_orders" in endpoint:
         return f"coinglass.whale_orders.{market}"
-    return "coinglass.whale_activity" if endpoint == "whale_index" else "coinglass.market_history"
+    raise ValueError(f"unsupported_liquidity_endpoint:{endpoint}")
 
 
 def validate_liquidity_microstructure_raw_bundle(bundle: Mapping[str, Any]) -> None:
@@ -322,37 +315,101 @@ def _derive_depth_dataset(orderbook: Mapping[str, Any], *, market_type: str, ran
     }
 
 
-def _derive_whale_activity_dataset(spot_orders: Mapping[str, Any], perpetual_orders: Mapping[str, Any]) -> dict[str, Any]:
-    buckets: dict[int, dict[str, float]] = {}
+def _large_level_notional(levels: Sequence[Mapping[str, Any]]) -> float:
+    notionals = [
+        float(level.get("price", 0.0)) * float(level.get("quantity", 0.0))
+        for level in levels
+        if isinstance(level, Mapping) and float(level.get("price", 0.0) or 0.0) > 0 and float(level.get("quantity", 0.0) or 0.0) > 0
+    ]
+    if not notionals:
+        return 0.0
+    threshold = median(notionals) * 1.75
+    selected = [value for value in notionals if value >= threshold]
+    if not selected:
+        selected = sorted(notionals, reverse=True)[:2]
+    return sum(selected)
+
+
+def _derive_whale_activity_dataset(
+    spot_orders: Mapping[str, Any],
+    perpetual_orders: Mapping[str, Any],
+    spot_orderbook: Mapping[str, Any],
+    perpetual_orderbook: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a 4h whale-liquidity activity history from frozen primitives.
+
+    The CoinGlass Large Limit Order endpoint is a current snapshot, so it can
+    provide the latest true whale-order state but not a deep bootstrap history.
+    Historical bootstrap therefore derives a large-level imbalance proxy from
+    the existing 4h order-book primitive. Once repeated structural cycles have
+    accumulated actual whale snapshots, the current bucket is replaced by the
+    large-limit-order calculation. No extra endpoint is introduced.
+    """
+    buckets: dict[int, dict[str, Any]] = {}
+
+    # Deep historical proxy from the 4h order-book primitive.
+    for dataset in (spot_orderbook, perpetual_orderbook):
+        for row in dataset.get("records", []):
+            if not isinstance(row, Mapping) or row.get("timeframe") != "4h" or type(row.get("timestamp")) is not int:
+                continue
+            timestamp = int(row["timestamp"])
+            bids = row.get("bid_levels") or []
+            asks = row.get("ask_levels") or []
+            buy = _large_level_notional(bids)
+            sell = _large_level_notional(asks)
+            state = buckets.setdefault(timestamp, {"buy": 0.0, "sell": 0.0, "sources": set()})
+            state["buy"] += buy
+            state["sell"] += sell
+            state["sources"].add("orderbook_large_level_proxy")
+
+    # Latest real large-limit-order state overrides/adds to the current 4h bucket.
+    actual: dict[int, dict[str, float]] = {}
     for dataset in (spot_orders, perpetual_orders):
         for row in dataset.get("events", []):
             if not isinstance(row, Mapping) or type(row.get("timestamp")) is not int:
                 continue
-            bucket = int(row["timestamp"]) // 3600 * 3600
-            state = buckets.setdefault(bucket, {"buy": 0.0, "sell": 0.0})
+            bucket = int(row["timestamp"]) // 14400 * 14400
+            state = actual.setdefault(bucket, {"buy": 0.0, "sell": 0.0})
             side = str(row.get("side", "")).lower()
             notional = float(row.get("notional_quote", row.get("volume_usd", 0.0)) or 0.0)
-            if side in {"buy", "bid", "long"}: state["buy"] += notional
-            elif side in {"sell", "ask", "short"}: state["sell"] += notional
+            if side in {"buy", "bid", "long"}:
+                state["buy"] += notional
+            elif side in {"sell", "ask", "short"}:
+                state["sell"] += notional
+    for timestamp, values in actual.items():
+        buckets[timestamp] = {"buy": values["buy"], "sell": values["sell"], "sources": {"large_limit_orders"}}
+
     records = []
     for timestamp in sorted(buckets):
-        buy, sell = buckets[timestamp]["buy"], buckets[timestamp]["sell"]
+        state = buckets[timestamp]
+        buy, sell = float(state["buy"]), float(state["sell"] )
         total = buy + sell
         if total <= 0:
             continue
-        records.append({"timestamp": timestamp, "market_type": "aggregate", "exchange": "Binance",
-                        "symbol": "BTCUSDT", "timeframe": "1h",
-                        "whale_index_value": (buy - sell) / total,
-                        "buy_notional_quote": buy, "sell_notional_quote": sell,
-                        "calculation": "large_limit_order_notional_imbalance"})
+        sources = sorted(state.get("sources") or [])
+        records.append({
+            "timestamp": timestamp, "market_type": "aggregate", "exchange": "Binance",
+            "symbol": "BTCUSDT", "timeframe": "4h",
+            "whale_index_value": (buy - sell) / total,
+            "buy_notional_quote": buy, "sell_notional_quote": sell,
+            "calculation": "large_limit_order_notional_imbalance" if sources == ["large_limit_orders"] else "orderbook_large_level_imbalance_proxy",
+            "source_kind": sources[0] if len(sources) == 1 else "+".join(sources),
+        })
+    records = records[-500:]
     status = "available" if records else "unavailable"
-    return {"status": status, "reason": None if records else "large_limit_order_history_unavailable",
-            "records": records, "incoming_records": len(records),
-            "source_data_as_of": max((row["timestamp"] for row in records), default=None),
-            "provenance": {"provider": "calculated", "source": "coinglass.whale_orders",
-                           "calculation": "(buy_notional-sell_notional)/(buy_notional+sell_notional)",
-                           "timestamp_units": ["seconds"] if records else []},
-            "warnings": [], "errors": []}
+    return {
+        "status": status, "reason": None if records else "whale_activity_history_unavailable",
+        "records": records, "incoming_records": len(records),
+        "source_data_as_of": max((row["timestamp"] for row in records), default=None),
+        "provenance": {
+            "provider": "calculated",
+            "source": "coinglass.whale_orders+coinglass.orderbook",
+            "calculation": "actual large-limit-order imbalance for current bucket; 4h large-level orderbook proxy for bootstrap history",
+            "timestamp_units": ["seconds"] if records else [],
+            "uses_new_endpoint": False,
+        },
+        "warnings": [], "errors": [],
+    }
 
 
 class LiquidityMicrostructureInputPreprocessor:
@@ -381,6 +438,26 @@ class LiquidityMicrostructureInputPreprocessor:
                     continue
                 try:
                     records = _envelope(request["response"], websocket=False)
+                    # Emulator integration always returns 500 records. During
+                    # fast incremental Liquidity refresh only the newest
+                    # historical snapshot is new/current; ingesting all 500 on
+                    # every 10 s cycle would be wasteful and can blur the live
+                    # tape. Large-limit-order endpoints are current snapshots,
+                    # so their full 500 rows are intentionally retained.
+                    if ".orderbook." in key:
+                        # Incremental structural refresh consumes only the newest
+                        # snapshot. Bootstrap keeps the full 500-record 4h history
+                        # required by Screen B while bounding the dense 1m book.
+                        if mode == "incremental":
+                            records = records[-1:]
+                        else:
+                            timeframe = str(request.get("dimensions", {}).get("timeframe") or "")
+                            records = records[-500:] if timeframe == "4h" else records[-120:]
+                    elif ".large_trades." in key:
+                        # Footprint expands each provider candle into multiple
+                        # price-bin events. Deep execution history is owned by CVD,
+                        # so Liquidity keeps a compact recent tape only.
+                        records = records[-1:] if mode == "incremental" else records[-24:]
                     for record in records:
                         if ".large_trades." in key:
                             for normalized, unit in _normalize_footprint(record, request):
@@ -396,8 +473,6 @@ class LiquidityMicrostructureInputPreprocessor:
                             normalized, unit = _normalize_depth(record, request)
                         elif ".whale_orders." in key:
                             normalized, unit = _normalize_large_order(record, request)
-                        elif key.endswith("whale_activity"):
-                            normalized, unit = _normalize_whale(record, request)
                         else:
                             normalized, unit = _normalize_market(record, request)
                         units.add(unit); incoming.append(normalized)
@@ -405,6 +480,21 @@ class LiquidityMicrostructureInputPreprocessor:
                     errors.append(f'{request["request_id"]}:{type(exc).__name__}:{exc}')
             events = ".large_trades." in key or ".whale_orders." in key
             merged = _merge(existing, incoming, events=events)
+            if ".orderbook." in key:
+                # Bound long-running state per native timeframe. Keep the deep
+                # 4h bootstrap history required by native Screen-B analytics,
+                # while dense intraday snapshots stay compact.
+                compact: list[dict[str, Any]] = []
+                retention = {"1m": 120, "5m": 120, "15m": 120, "4h": 500}
+                for timeframe, limit in retention.items():
+                    compact.extend([row for row in merged if row.get("timeframe") == timeframe][-limit:])
+                merged = sorted(compact, key=lambda row: (row["timestamp"], str(row.get("timeframe"))))
+            elif ".large_trades." in key and len(merged) > 3_000:
+                merged = merged[-3_000:]
+            elif ".whale_orders." in key and len(merged) > 2_000:
+                # A bounded rolling order-state history is enough to measure
+                # persistence/cancellation while preventing unbounded growth.
+                merged = merged[-2_000:]
             if incoming:
                 status = "partial" if warnings or errors else "available"
                 reason = warnings[0] if warnings else ("endpoint_update_partial" if errors else None)
@@ -421,12 +511,13 @@ class LiquidityMicrostructureInputPreprocessor:
                        "warnings": sorted(set(warnings)), "errors": errors}
             dataset["events" if events else "records"] = merged
             datasets[key] = dataset
-        # Derive the two retired provider datasets from primitives that are
-        # already required by Screen A.
+        # Derive depth and whale-activity datasets from primitives that
+        # are already part of the frozen 33-endpoint inventory.
         datasets["coinglass.order_depth.spot"] = _derive_depth_dataset(datasets["coinglass.orderbook.spot"], market_type="spot")
         datasets["coinglass.order_depth.perpetual"] = _derive_depth_dataset(datasets["coinglass.orderbook.perpetual"], market_type="perpetual")
         datasets["coinglass.whale_activity"] = _derive_whale_activity_dataset(
-            datasets["coinglass.whale_orders.spot"], datasets["coinglass.whale_orders.perpetual"])
+            datasets["coinglass.whale_orders.spot"], datasets["coinglass.whale_orders.perpetual"],
+            datasets["coinglass.orderbook.spot"], datasets["coinglass.orderbook.perpetual"])
 
         coinglass = {"orderbook": {"spot": datasets["coinglass.orderbook.spot"], "perpetual": datasets["coinglass.orderbook.perpetual"]},
                      "order_depth": {"spot": datasets["coinglass.order_depth.spot"], "perpetual": datasets["coinglass.order_depth.perpetual"]},

@@ -9,14 +9,10 @@ SECONDS_PER_DAY             = 86_400
 HASHES_PER_EXAHASH          = 1_000_000_000_000_000_000
 DIFFICULTY_PER_TRILLION     = 1_000_000_000_000
 SOPR_SMA_PERIOD_DAYS        = 7
-RESERVE_TREND_WINDOWS_DAYS  = (7, 30, 90)
+RESERVE_TREND_WINDOWS_DAYS  = (7, 30)
 DEFAULT_RESERVE_TREND_DAYS  = 30
 DAILY_WINDOW_TOLERANCE_DAYS = 2
 STATUS_PRIORITY             = {"available": 0, "partial": 1, "unavailable": 2, "invalid": 3}
-UTXO_AGE_BANDS              = ("0d_1d", "1d_1w", "1w_1m", "1m_3m", "3m_6m", "6m_12m", "12m_18m", "18m_2y", "2y_3y", "3y_5y", "5y_7y", "7y_10y", "10y_inf")
-REVENUE_ABSOLUTE_TOLERANCE_USD  = 1e-6
-REVENUE_RELATIVE_TOLERANCE      = 1e-12
-FEE_SHARE_CONSISTENCY_TOLERANCE = 0.02
 
 
 def _finite(value: Any) -> float:
@@ -159,7 +155,7 @@ def _daily_close_source(source: Mapping[str, Any], *, metric_id: str) -> dict[st
         record = dict(by_day[day])
         record["timestamp"] = day
         record["source_timestamp"] = int(by_day[day]["timestamp"])
-        record["source_resolution"] = "1h" if len(records) > len(by_day) else record.get("source_window", "24h")
+        record["source_resolution"] = "24h"
         daily.append(record)
     output = dict(source)
     output["records"] = daily
@@ -188,7 +184,7 @@ def build_daily_ohlc_from_intraday(records: Sequence[Mapping[str, Any]], *, unit
         values = [value for _, value in observations]
         candles.append({"timestamp": day, "open": values[0], "high": max(values), "low": min(values), "close": values[-1],
                         "is_closed": True, "observation_count": len(observations), "unit": unit,
-                        "ohlc_origin": "processing_derived", "source_resolution": "1h"})
+                        "ohlc_origin": "processing_derived", "source_resolution": "24h"})
     return candles
 
 
@@ -420,547 +416,88 @@ def _mpi_basis(mpi_series: Mapping[str, Any]) -> dict[str, Any]:
     return {"source_metric_id": "mpi", "current": current, "previous": previous, "change_1d": change, "unit": "z_score"}
 
 
-def _status_from_source(source_status: str, *, has_records: bool, partial: bool = False, invalid: bool = False) -> str:
-    if invalid or source_status == "invalid":
-        return "invalid"
-    if source_status == "unavailable" or not has_records:
-        return "unavailable"
-    return "partial" if partial or source_status == "partial" else "available"
+def build_on_chain_miners_features(input_series: Mapping[str, Any], *, input_data_as_of: int | None = None) -> dict[str, Any]:
+    """Build only the final VR1 On-Chain Processing surface.
 
-
-def _simple_extension_series(source: Mapping[str, Any], *, metric_id: str, unit: str, provider: str, endpoint_id: str,
-                             extra: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
-    records: list[dict[str, Any]] = []
-    errors: list[str] = _source_timestamp_errors(source, str(source.get("metric_id", metric_id)))
-    if not errors and source.get("status") not in {"invalid", "unavailable"}:
-        for index, record in enumerate(source.get("records", [])):
-            try:
-                timestamp = record["timestamp"]
-                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-                    raise ValueError("timestamp_must_be_non_negative_integer")
-                if record.get("unit") != source.get("unit") or record.get("provider") != provider or record.get("endpoint_id") != endpoint_id:
-                    raise ValueError("incompatible_extension_record_contract")
-                value = _finite(record["value"])
-                records.append({"timestamp": timestamp, "value": value, "unit": unit, "provider": provider, "endpoint_id": endpoint_id,
-                                **(extra(record) if extra else {})})
-            except (KeyError, TypeError, ValueError) as exc:
-                errors.append(f"record[{index}]:{exc}")
-    status = _status_from_source(str(source.get("status", "invalid")), has_records=bool(records), invalid=bool(errors))
-    warnings = [f"input_series_warning:{source.get('metric_id')}:{message}" for message in source.get("warnings", [])]
-    propagated_errors = [f"input_series_error:{source.get('metric_id')}:{message}" for message in source.get("errors", [])]
-    if source.get("status") == "partial":
-        warnings.append(f"source_series_partial:{source.get('metric_id')}")
-    payload = _series_payload(metric_id=metric_id, unit=unit, source_count=len(source.get("records", [])), records=records, unavailable=[],
-                              warnings=_stable_unique(warnings), errors=_stable_unique([*errors, *propagated_errors]), force_invalid=status == "invalid",
-                              partial_reasons=status == "partial")
-    payload["status"] = status
-    return payload
-
-
-def build_miners_unspent_supply_series(source: Mapping[str, Any]) -> dict[str, Any]:
-    payload = _simple_extension_series(source, metric_id="miners_unspent_supply_btc", unit="BTC", provider="glassnode",
-                                       endpoint_id="miners_unspent_supply", extra=lambda _: {"scope": "miner_specific"})
-    payload["metadata"].update({"scope": "miner_specific", "meaning": "coinbase_outputs_never_moved"})
-    source_current = source.get("current")
-    if isinstance(source_current, Mapping) and source_current.get("status") == "available":
-        try:
-            timestamp, value, unit = source_current["timestamp"], _finite(source_current["value"]), source_current.get("unit")
-            exact = next((record for record in payload["records"] if record["timestamp"] == timestamp and record["value"] == value
-                          and record["unit"] == unit), None)
-            if not exact:
-                raise ValueError("input_current_not_in_valid_records")
-            payload["current"] = {"status": "available", "timestamp": timestamp, "value": value, "unit": "BTC"}
-        except (KeyError, TypeError, ValueError):
-            payload["status"] = "invalid"
-            payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_not_in_valid_records"}
-            payload["errors"] = _stable_unique([*payload["errors"], "input_current_not_in_valid_records"])
-    elif source_current is None:
-        # The normalized Input may omit the duplicated current envelope. Keep the
-        # deterministic latest snapshot already derived from validated records.
-        if not payload["records"]:
-            payload["current"] = {"status": "unavailable", "value": None, "reason": "no_valid_records"}
-    else:
-        payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_unavailable"}
-        if payload["status"] == "available":
-            payload["status"] = "partial" if payload["records"] else "unavailable"
-        payload["warnings"] = _stable_unique([*payload["warnings"], "input_current_unavailable:miners_unspent_supply"])
-    return payload
-
-
-def build_nupl_series(source: Mapping[str, Any]) -> dict[str, Any]:
-    payload = _simple_extension_series(source, metric_id="nupl", unit="ratio", provider="coinglass", endpoint_id="bitcoin_nupl",
-                                       extra=lambda record: {"price_usd": None if record.get("price_usd") is None else _finite(record["price_usd"])})
-    source_current = source.get("current")
-    if isinstance(source_current, Mapping) and source_current.get("status") == "available":
-        try:
-            timestamp = source_current["timestamp"]
-            value = _finite(source_current["value"])
-            price = None if source_current.get("price_usd") is None else _finite(source_current["price_usd"])
-            exact = next((record for record in payload["records"] if record["timestamp"] == timestamp and record["value"] == value
-                          and record.get("price_usd") == price and record.get("unit") == source_current.get("unit")), None)
-            payload["current"] = ({"status": "available", "timestamp": timestamp, "value": value, "price_usd": price, "unit": "ratio"}
-                                  if exact else {"status": "unavailable", "value": None, "reason": "input_current_not_in_valid_records"})
-            if not exact:
-                payload["status"] = "invalid"
-                same_value = any(record["timestamp"] == timestamp and record["value"] == value for record in payload["records"])
-                payload["errors"] = _stable_unique([*payload["errors"], "nupl_current_price_mismatch" if same_value else "input_current_not_in_valid_records"])
-        except (KeyError, TypeError, ValueError):
-            payload["status"] = "invalid"
-            payload["current"] = {"status": "unavailable", "value": None, "reason": "invalid_input_current"}
-            payload["errors"] = _stable_unique([*payload["errors"], "invalid_nupl_input_current"])
-    elif source_current is None:
-        if not payload["records"]:
-            payload["current"] = {"status": "unavailable", "value": None, "reason": "no_valid_records"}
-    else:
-        payload["current"] = {"status": "unavailable", "value": None, "reason": "input_current_unavailable"}
-        if payload["status"] == "available":
-            payload["status"] = "unavailable"
-    return payload
-
-
-def build_nupl_phase_basis(nupl_series: Mapping[str, Any]) -> dict[str, Any]:
-    current = dict(nupl_series.get("current", {"status": "unavailable", "value": None}))
-    previous: dict[str, Any] = {"status": "unavailable", "timestamp": None, "value": None, "price_usd": None, "unit": "ratio",
-                                "reason": "previous_calendar_day_unavailable"}
-    change = None
-    warnings = list(nupl_series.get("warnings", []))
-    errors = list(nupl_series.get("errors", []))
-    if current.get("status") == "available":
-        target = int(current["timestamp"]) - SECONDS_PER_DAY
-        match = next((record for record in nupl_series.get("records", []) if record.get("timestamp") == target), None)
-        if match:
-            previous = {"status": "available", "timestamp": target, "value": _finite(match["value"]), "price_usd": match.get("price_usd"), "unit": "ratio", "reason": None}
-            change = _finite(_finite(current["value"]) - _finite(match["value"]))
-        else:
-            warnings.append("previous_calendar_day_unavailable")
-    status = str(nupl_series.get("status", "invalid"))
-    if status == "available" and current.get("status") != "available":
-        status = "unavailable"
-    return {"feature_id": "nupl_phase_basis", "status": status, "current": current, "previous": previous, "change_1d": change,
-            "warnings": _stable_unique(warnings), "errors": _stable_unique(errors),
-            "metadata": {"previous_policy": "exact_previous_calendar_day", "classification_pending": True,
-                         "data_as_of": current.get("timestamp") if current.get("status") == "available" else None}}
-
-
-def build_miner_outflow_distribution(collection: Mapping[str, Any]) -> dict[str, Any]:
-    source_status = str(collection.get("status", "invalid"))
-    warnings = [f"input_collection_warning:miner_outflow_by_pool:{message}" for message in collection.get("warnings", [])]
-    errors = [f"input_collection_error:miner_outflow_by_pool:{message}" for message in collection.get("errors", [])]
-    pools = collection.get("pools", {})
-    if source_status == "invalid" or not isinstance(pools, Mapping):
-        return {"feature_id": "miner_outflow_distribution", "status": "invalid", "unit": "BTC/day", "records": [],
-                "current": {"status": "unavailable", "value": None, "reason": "source_collection_invalid"}, "active_symbols": [],
-                "inactive_symbols": [], "warnings": _stable_unique(warnings), "errors": _stable_unique([*errors, "source_collection_invalid"]),
-                "metadata": {"data_as_of": None, "timestamps_processed": 0, "calculation": "cross_pool_exact_timestamp_distribution"}}
-    if any(not isinstance(symbol, str) for symbol in pools):
-        return {"feature_id": "miner_outflow_distribution", "status": "invalid", "unit": "BTC/day", "records": [],
-                "current": {"status": "unavailable", "value": None, "reason": "source_collection_invalid"}, "active_symbols": [],
-                "inactive_symbols": [], "warnings": _stable_unique(warnings), "errors": _stable_unique([*errors, "non_string_pool_symbol"]),
-                "metadata": {"data_as_of": None, "timestamps_processed": 0, "calculation": "cross_pool_exact_timestamp_distribution"}}
-    active_symbols = sorted(symbol for symbol, payload in pools.items() if isinstance(payload, Mapping) and payload.get("active") is True)
-    inactive_symbols = sorted(symbol for symbol in pools if symbol not in active_symbols)
-    by_timestamp: dict[int, list[dict[str, Any]]] = {}
-    invalid = False
-    for symbol in sorted(pools):
-        payload = pools[symbol]
-        required_pool_keys = {"miner_symbol", "active", "status", "records", "warnings", "errors", "metadata"}
-        if not isinstance(payload, Mapping) or not required_pool_keys <= set(payload) or payload.get("miner_symbol") != symbol \
-                or not isinstance(payload.get("active"), bool) or payload.get("status") not in STATUS_PRIORITY:
-            invalid = True
-            errors.append(f"invalid_pool_structure:{symbol}")
-            continue
-        pool_status = str(payload["status"])
-        if pool_status == "invalid":
-            invalid = True
-            errors.append(f"source_pool_invalid:{symbol}")
-            continue
-        if pool_status == "unavailable":
-            warnings.append(f"source_pool_unavailable:{symbol}")
-            continue
-        if pool_status == "partial":
-            warnings.append(f"source_pool_partial:{symbol}")
-        previous_timestamp = None
-        for index, record in enumerate(payload.get("records", [])):
-            try:
-                timestamp = record["timestamp"]
-                if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-                    raise ValueError("timestamp_must_be_non_negative_integer")
-                if previous_timestamp is not None and timestamp <= previous_timestamp:
-                    raise ValueError("pool_timestamps_must_be_unique_ascending")
-                previous_timestamp = timestamp
-                if record.get("unit") != "BTC" or record.get("provider") != "cryptoquant" or record.get("endpoint_id") != "miner_outflow" \
-                        or record.get("source_window") != "day":
-                    raise ValueError("incompatible_outflow_record_contract")
-                values = {field: _finite(record[field]) for field in ("outflow_total", "outflow_top10", "outflow_mean")}
-                if any(value < 0 for value in values.values()):
-                    raise ValueError("outflow_value_must_be_non_negative")
-                by_timestamp.setdefault(timestamp, []).append({"miner_symbol": symbol, "active": payload.get("active") is True,
-                                                               "outflow_total_btc": values["outflow_total"], "outflow_top10_btc": values["outflow_top10"],
-                                                               "outflow_mean_btc": values["outflow_mean"]})
-            except (KeyError, TypeError, ValueError) as exc:
-                invalid = True
-                errors.append(f"pool_record_invalid:{symbol}:{index}:{exc}")
-    records: list[dict[str, Any]] = []
-    for timestamp in sorted(by_timestamp):
-        observed = by_timestamp[timestamp]
-        aggregate = _finite(sum(pool["outflow_total_btc"] for pool in observed))
-        ordered = sorted(observed, key=lambda pool: (-pool["outflow_total_btc"], pool["miner_symbol"]))
-        record_warnings: list[str] = []
-        for rank, pool in enumerate(ordered, 1):
-            pool["pool_share_ratio"] = None if aggregate == 0 else _finite(pool["outflow_total_btc"] / aggregate)
-            pool["rank"] = rank
-        if aggregate == 0:
-            record_warnings.append("outflow_share_unavailable_zero_aggregate")
-        missing = sorted(set(active_symbols) - {pool["miner_symbol"] for pool in observed})
-        record_warnings.extend(f"outflow_missing_active_pool:{symbol}:{timestamp}" for symbol in missing)
-        status = "partial" if missing else "available"
-        records.append({"timestamp": timestamp, "aggregate_outflow_total_btc": aggregate, "expected_active_pools": len(active_symbols),
-                        "observed_active_pools": sum(pool["active"] for pool in observed), "missing_active_pools": missing,
-                        "pool_count_with_data": len(observed), "pools": ordered, "top_pool_symbol": ordered[0]["miner_symbol"] if ordered else None,
-                        "top1_share_ratio": None if aggregate == 0 else ordered[0]["pool_share_ratio"],
-                        "top3_share_ratio": None if aggregate == 0 else _finite(sum(pool["pool_share_ratio"] for pool in ordered[:3])),
-                        "status": status, "warnings": record_warnings, "errors": []})
-        warnings.extend(record_warnings)
-    if invalid:
-        records = []
-    source_as_of = collection.get("metadata", {}).get("data_as_of")
-    exact = next((record for record in records if record["timestamp"] == source_as_of), None) if isinstance(source_as_of, int) else None
-    if not active_symbols:
-        current = {"status": "unavailable", "value": None, "reason": "no_active_outflow_pools"}
-        warnings.append("no_active_outflow_pools")
-    elif invalid:
-        current = {"status": "unavailable", "value": None, "reason": "source_pool_invalid"}
-    elif exact:
-        current = {"status": exact["status"], "timestamp": exact["timestamp"], "value": exact["aggregate_outflow_total_btc"], "unit": "BTC/day"}
-    else:
-        current = {"status": "unavailable", "value": None, "reason": "outflow_current_timestamp_not_available" if source_as_of is not None else "source_data_as_of_unavailable"}
-        if source_as_of is not None:
-            warnings.append("outflow_current_timestamp_not_available")
-    partial_pool = any(isinstance(payload, Mapping) and payload.get("status") == "partial" for payload in pools.values())
-    unavailable_active = any(symbol in active_symbols and isinstance(payload, Mapping) and payload.get("status") == "unavailable"
-                             for symbol, payload in pools.items())
-    status = ("invalid" if invalid else "unavailable" if not active_symbols or (unavailable_active and not records) else
-              _status_from_source(source_status, has_records=bool(records), partial=partial_pool or unavailable_active
-                                  or any(record["status"] == "partial" for record in records)))
-    return {"feature_id": "miner_outflow_distribution", "status": status, "unit": "BTC/day", "records": records, "current": current,
-            "active_symbols": active_symbols, "inactive_symbols": inactive_symbols, "warnings": _stable_unique(warnings), "errors": _stable_unique(errors),
-            "metadata": {"data_as_of": current.get("timestamp") if current.get("status") in {"available", "partial"} else None,
-                         "timestamps_processed": len(records), "calculation": "cross_pool_exact_timestamp_distribution"}}
-
-
-def build_miner_outflow_total_series(distribution: Mapping[str, Any]) -> dict[str, Any]:
-    blocked = distribution.get("status") in {"invalid", "unavailable"}
-    records = [] if blocked else [{"timestamp": record["timestamp"], "value": record["aggregate_outflow_total_btc"], "unit": "BTC/day", "provider": "derived",
-                "calculation_source": "miner_outflow_by_pool"} for record in distribution.get("records", [])]
-    payload = _series_payload(metric_id="miner_outflow_total_btc", unit="BTC/day", source_count=len(records), records=records, unavailable=[],
-                              warnings=list(distribution.get("warnings", [])), errors=list(distribution.get("errors", [])),
-                              force_invalid=distribution.get("status") == "invalid", partial_reasons=distribution.get("status") == "partial")
-    payload["status"] = distribution.get("status", "invalid")
-    payload["current"] = ({"status": distribution["current"]["status"], "timestamp": distribution["current"]["timestamp"],
-                           "value": distribution["current"]["value"], "unit": "BTC/day"}
-                          if distribution.get("current", {}).get("status") in {"available", "partial"} else dict(distribution.get("current", {})))
-    return payload
-
-
-
-
-def build_miner_pressure_basis(outflow_series: Mapping[str, Any], sopr_7d: Mapping[str, Any], window: int = 90) -> dict[str, Any]:
-    records = [r for r in outflow_series.get("records", []) if isinstance(r, Mapping)]
-    current_sopr = sopr_7d.get("current", {}) if isinstance(sopr_7d, Mapping) else {}
-    if not records:
-        return {"source_metric_id": "miner_outflow_total_btc", "status": "unavailable",
-                "current": {"status": "unavailable", "value": None, "reason": "miner_outflow_unavailable"},
-                "components": {"reserve_outflow_z_90d": None, "sopr_7d": current_sopr.get("value")}}
-    values = [_finite(r["value"]) for r in records[-window:]]
-    mean = sum(values) / len(values)
-    variance = sum((v - mean) ** 2 for v in values) / len(values) if values else 0.0
-    std = math.sqrt(variance)
-    z = 0.0 if std == 0 else (values[-1] - mean) / std
-    timestamp = int(records[-1]["timestamp"])
-    return {"source_metric_id": "miner_outflow_total_btc", "status": outflow_series.get("status", "available"),
-            "current": {"status": "available", "timestamp": timestamp, "value": z, "unit": "z_score",
-                        "components": {"reserve_outflow_z_90d": z, "sopr_7d": current_sopr.get("value")}},
-            "components": {"reserve_outflow_z_90d": z, "sopr_7d": current_sopr.get("value")},
-            "window_days": min(window, len(values)), "calculation": "miner_outflow_zscore_with_sopr_context"}
-
-
-def build_reserve_age_context(miners_series: Mapping[str, Any], utxo_source: Mapping[str, Any]) -> dict[str, Any]:
-    warnings = [f"input_series_warning:utxo_age_distribution:{message}" for message in utxo_source.get("warnings", [])]
-    errors = [f"input_series_error:utxo_age_distribution:{message}" for message in utxo_source.get("errors", [])]
-    records: list[dict[str, Any]] = []
-    ordering_errors = _source_timestamp_errors(utxo_source, "utxo_age_distribution")
-    errors.extend(ordering_errors)
-    invalid = utxo_source.get("status") == "invalid" or bool(ordering_errors)
-    if not invalid and utxo_source.get("status") not in {"invalid", "unavailable"}:
-        for index, record in enumerate(utxo_source.get("records", [])):
-            try:
-                timestamp = record["timestamp"]
-                source_bands = record["bands"]
-                if not isinstance(timestamp, int) or isinstance(timestamp, bool) or timestamp < 0 or not isinstance(source_bands, Mapping):
-                    raise ValueError("invalid_utxo_age_record_structure")
-                native_values = [None if source_bands[band].get("native_btc") is None else _finite(source_bands[band]["native_btc"]) for band in UTXO_AGE_BANDS]
-                if any(value is not None and value < 0 for value in native_values):
-                    raise ValueError("utxo_native_btc_must_be_non_negative")
-                total = _finite(sum(value for value in native_values if value is not None))
-                bands: dict[str, Any] = {}
-                for band, native in zip(UTXO_AGE_BANDS, native_values):
-                    source_band = source_bands[band]
-                    usd = None if source_band.get("usd") is None else _finite(source_band["usd"])
-                    percent = None if source_band.get("percent") is None else _finite(source_band["percent"])
-                    bands[band] = {"native_btc": native, "usd": usd, "provider_percent": percent,
-                                   "derived_share_ratio": None if native is None or total == 0 else _finite(native / total)}
-                record_warnings = ["utxo_age_share_unavailable_zero_total"] if total == 0 else []
-                records.append({"timestamp": timestamp, "network_total_native_btc": total, "bands": bands, "status": "available",
-                                "warnings": record_warnings, "errors": []})
-                warnings.extend(record_warnings)
-            except (KeyError, TypeError, ValueError) as exc:
-                invalid = True
-                errors.append(f"utxo_record_invalid:{index}:{exc}")
-    network_status = _status_from_source(str(utxo_source.get("status", "invalid")), has_records=bool(records), invalid=invalid)
-    input_current = utxo_source.get("current")
-    if network_status == "invalid":
-        records = []
-        network_current = {"status": "unavailable", "reason": "invalid_utxo_source"}
-    elif isinstance(input_current, Mapping) and input_current.get("status") == "available":
-        timestamp = input_current.get("timestamp")
-        exact = next((record for record in records if record["timestamp"] == timestamp), None)
-        if exact:
-            network_current = {"status": "available", **exact}
-        else:
-            records = []
-            network_status = "invalid"
-            network_current = {"status": "unavailable", "reason": "utxo_input_current_not_in_valid_records"}
-            errors.append("utxo_input_current_not_in_valid_records")
-    elif input_current is None:
-        if records:
-            network_current = {"status": "available", **records[-1]}
-        else:
-            network_current = {"status": "unavailable", "reason": "no_valid_records"}
-            if network_status == "available":
-                network_status = "unavailable"
-    else:
-        network_current = {"status": "unavailable", "reason": "input_current_unavailable"}
-        if network_status == "available":
-            network_status = "partial" if records else "unavailable"
-        warnings.append("input_current_unavailable:utxo_age_distribution")
-    miner_current = dict(miners_series.get("current", {"status": "unavailable", "reason": "no_valid_miner_unspent_supply"}))
-    timestamps = [current.get("timestamp") for current in (miner_current, network_current) if current.get("status") == "available"]
-    data_as_of = min(timestamps) if len(timestamps) == 2 else None
-    status = max((str(miners_series.get("status", "invalid")), network_status), key=lambda value: STATUS_PRIORITY[value])
-    if status == "invalid":
-        records = []
-        network_current = {"status": "unavailable", "reason": "source_feature_invalid"}
-        data_as_of = None
-    return {"feature_id": "reserve_age_context", "status": status,
-            "miner_specific": {"scope": "miner_specific", "series_id": "miners_unspent_supply_btc", "current": miner_current,
-                               "meaning": "coinbase_outputs_never_moved"},
-            "network_context": {"scope": "bitcoin_network", "is_miner_specific": False, "records": records, "current": network_current},
-            "warnings": _stable_unique([*miners_series.get("warnings", []), *warnings]), "errors": _stable_unique([*miners_series.get("errors", []), *errors]),
-            "metadata": {"semantic_policy": "miner_unspent_supply_plus_bitcoin_network_age_context", "data_as_of": data_as_of}}
-
-
-def build_miner_revenue_series(source: Mapping[str, Any], *, metric_id: str) -> dict[str, Any]:
-    if metric_id != "miner_revenue_total_usd":
-        raise ValueError("only miner_revenue_total_usd is a provider revenue series; block/fee revenue are derived")
-    return _simple_extension_series(source, metric_id=metric_id, unit="USD/day", provider="glassnode", endpoint_id="revenue_sum")
-
-
-def _derived_revenue_series(metric_id: str, unit: str, feature: Mapping[str, Any], field: str) -> dict[str, Any]:
-    if feature.get("status") == "invalid":
-        payload = _series_payload(metric_id=metric_id, unit=unit, source_count=0, records=[], unavailable=[], warnings=[],
-                                  errors=list(feature.get("errors", [])), force_invalid=True)
-        payload["current"] = {"status": "unavailable", "value": None, "reason": "source_feature_invalid"}
-        return payload
-    records = [{"timestamp": record["timestamp"], "value": record[field], "unit": unit, "provider": "derived",
-                "calculation_source": "miner_revenue_breakdown"} for record in feature.get("records", []) if record.get(field) is not None]
-    payload = _series_payload(metric_id=metric_id, unit=unit, source_count=len(feature.get("records", [])), records=records, unavailable=[],
-                              warnings=list(feature.get("warnings", [])), errors=list(feature.get("errors", [])),
-                              force_invalid=feature.get("status") == "invalid", partial_reasons=feature.get("status") == "partial")
-    payload["status"] = feature.get("status", "invalid")
-    feature_current = feature.get("current", {})
-    if feature_current.get("status") in {"available", "partial"}:
-        timestamp = feature_current.get("timestamp")
-        exact = next((record for record in records if record["timestamp"] == timestamp), None)
-        if exact:
-            payload["current"] = {"status": feature_current["status"], "timestamp": timestamp, "value": exact["value"], "unit": unit}
-        else:
-            payload["status"] = "invalid"
-            payload["current"] = {"status": "unavailable", "value": None, "reason": "derived_revenue_current_not_in_records"}
-            payload["errors"] = _stable_unique([*payload["errors"], f"derived_revenue_current_not_in_records:{metric_id}"])
-    else:
-        payload["current"] = {"status": "unavailable", "value": None, "reason": feature_current.get("reason", "source_feature_current_unavailable")}
-    return payload
-
-
-def _revenue_source_errors(source: Mapping[str, Any], metric_id: str, *, unit: str, provider: str, endpoint_id: str) -> list[str]:
-    errors = _source_timestamp_errors(source, metric_id)
-    if source.get("unit") != unit:
-        errors.append("incompatible_revenue_from_fees_contract:unit" if metric_id == "miner_revenue_from_fees" else f"incompatible_revenue_source_contract:{metric_id}:unit")
-    for index, record in enumerate(source.get("records", [])):
-        if not isinstance(record, Mapping):
-            errors.append(f"revenue_source_record_invalid:{metric_id}:{index}:record_must_be_mapping")
-            continue
-        for field, expected in (("unit", unit), ("provider", provider), ("endpoint_id", endpoint_id)):
-            if record.get(field) != expected:
-                errors.append(f"incompatible_revenue_from_fees_contract:{field}" if metric_id == "miner_revenue_from_fees"
-                              else f"incompatible_revenue_source_contract:{metric_id}:{field}")
-        try:
-            value = _finite(record.get("value"))
-            if value < 0:
-                raise ValueError("value_must_be_non_negative")
-        except (TypeError, ValueError) as exc:
-            errors.append(f"revenue_source_record_invalid:{metric_id}:{index}:{exc}")
-    return _stable_unique(errors)
-
-
-def build_miner_revenue_breakdown(total_source: Mapping[str, Any], fee_source: Mapping[str, Any],
-                                  *, input_data_as_of: int | None = None) -> dict[str, Any]:
-    """Derive fee and block-reward revenue from Glassnode total revenue + fee share.
-
-    Glassnode ``revenue_from_fees`` is the share of miner revenue attributable
-    to fees.  ``volume_mined_sum`` is therefore not required to reconstruct the
-    revenue breakdown and is not polled by the normal Screen contract.
+    External acquisition is limited to the seven frozen primitives.  Net-position
+    change and Puell are derived later; no retired endpoint-dependent drilldowns
+    are constructed here.
     """
-    sources = {"miner_revenue_total_usd": total_source, "miner_revenue_from_fees": fee_source}
-    warnings = [f"input_series_warning:{metric_id}:{message}" for metric_id, source in sources.items() for message in source.get("warnings", [])]
-    errors = [f"input_series_error:{metric_id}:{message}" for metric_id, source in sources.items() for message in source.get("errors", [])]
-    errors.extend(_revenue_source_errors(total_source, "miner_revenue_total_usd", unit="USD/day", provider="glassnode", endpoint_id="revenue_sum"))
-    errors.extend(_revenue_source_errors(fee_source, "miner_revenue_from_fees", unit="provider_native_percentage", provider="glassnode",
-                                         endpoint_id="revenue_from_fees"))
-    statuses = [str(source.get("status", "invalid")) for source in sources.values()]
-    if errors or "invalid" in statuses:
-        status = "invalid"
-        records: list[dict[str, Any]] = []
-    elif "unavailable" in statuses:
-        status = "unavailable"
-        records = []
-    else:
-        total_map = {record["timestamp"]: record for record in total_source.get("records", [])}
-        fee_map = {record["timestamp"]: record for record in fee_source.get("records", [])}
-        common = sorted(set(total_map) & set(fee_map))
-        if set(common) != (set(total_map) | set(fee_map)):
-            warnings.append("revenue_timestamp_alignment_incomplete")
-        records = []
-        invalid = False
-        for timestamp in common:
-            try:
-                total = _finite(total_map[timestamp]["value"])
-                provider_value = _finite(fee_map[timestamp]["value"])
-                if total < 0 or provider_value < 0:
-                    raise ValueError("revenue_values_must_be_non_negative")
-                # Glassnode fixtures and live endpoint commonly expose this as a
-                # percentage. Accept a ratio too so the contract remains robust.
-                provider_ratio = provider_value if 0 <= provider_value <= 1 else provider_value / 100.0
-                if not 0 <= provider_ratio <= 1:
-                    raise ValueError("provider_fee_share_out_of_range")
-                fee = _finite(total * provider_ratio)
-                block = _finite(total - fee)
-                records.append({"timestamp": timestamp, "total_revenue_usd": total,
-                                "block_reward_revenue_usd": block, "fee_revenue_usd": fee,
-                                "derived_fee_share_ratio": provider_ratio,
-                                "derived_fee_share_percent": _finite(provider_ratio * 100.0),
-                                "provider_fee_value": provider_value,
-                                "provider_fee_scale": "ratio" if provider_value <= 1 else "percent",
-                                "provider_fee_ratio": provider_ratio, "provider_fee_difference_ratio": 0.0,
-                                "unit": "USD/day", "status": "available", "warnings": [], "errors": []})
-            except (KeyError, TypeError, ValueError) as exc:
-                invalid = True
-                errors.append(str(exc))
-        if invalid:
-            records = []
-        status = "invalid" if invalid else "unavailable" if not records else "partial" if "partial" in statuses or warnings else "available"
-    eligible = [record for record in records if input_data_as_of is None or record["timestamp"] <= input_data_as_of]
-    current_record = next((record for record in records if record["timestamp"] == input_data_as_of), None) if input_data_as_of is not None else (records[-1] if records else None)
-    if current_record is None and eligible:
-        current_record = eligible[-1]
-        warnings.append("revenue_current_before_input_data_as_of")
-        if status == "available":
-            status = "partial"
-    current = ({"status": current_record["status"], "timestamp": current_record["timestamp"], "value": current_record["fee_revenue_usd"], "unit": "USD/day"}
-               if current_record and status != "invalid" else {"status": "unavailable", "value": None,
-                                                                "reason": "source_feature_invalid" if status == "invalid" else "no_common_revenue_timestamp"})
-    return {"feature_id": "miner_revenue_breakdown", "status": status, "records": records, "current": current,
-            "warnings": _stable_unique(warnings), "errors": _stable_unique(errors),
-            "metadata": {"alignment": "exact_timestamp_intersection", "fee_revenue_formula": "total_revenue_usd_times_provider_fee_share",
-                         "block_reward_formula": "total_revenue_usd_minus_fee_revenue_usd",
-                         "provider_fee_scale_policy": "ratio_or_percent", "data_as_of": current.get("timestamp") if current.get("status") in {"available", "partial"} else None}}
-
-
-def build_on_chain_miners_features(input_series: Mapping[str, Any], input_collections: Mapping[str, Any] | None = None,
-                                   *, input_data_as_of: int | None = None, include_screen_extensions: bool = True) -> dict[str, Any]:
-    # Core provider series are collected at 1h from Glassnode for legitimate daily OHLC.
-    # Classification features continue to use one canonical UTC close per day.
     reserve_source = _daily_close_source(input_series["miner_reserve"], metric_id="miner_reserve")
     sopr_source = _daily_close_source(input_series["sopr"], metric_id="sopr")
     hashrate_source = _daily_close_source(input_series["hashrate"], metric_id="hashrate")
     difficulty_source = _daily_close_source(input_series["difficulty"], metric_id="difficulty")
+
     reserve = _copy_base_series(reserve_source, metric_id="miner_reserve_btc", unit="BTC", transform=_reserve_record)
-    sopr    = _copy_base_series(sopr_source, metric_id="sopr", unit="ratio", transform=_sopr_record)
-    mpi     = _copy_base_series(input_series["mpi"], metric_id="mpi", unit="z_score", transform=_mpi_record)
-    def derived_from(source: Mapping[str, Any], source_id: str, metric_id: str, unit: str, builder: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any]]) -> dict[str, Any]:
+    sopr = _copy_base_series(sopr_source, metric_id="sopr", unit="ratio", transform=_sopr_record)
+    mpi = _copy_base_series(input_series["mpi"], metric_id="mpi", unit="z_score", transform=_mpi_record)
+
+    def derived_from(source: Mapping[str, Any], source_id: str, metric_id: str, unit: str,
+                     builder: Callable[[Sequence[Mapping[str, Any]]], dict[str, Any]]) -> dict[str, Any]:
         if source["status"] in {"invalid", "unavailable"}:
             payload = _blocked_source_series(metric_id=metric_id, unit=unit, source_metric_id=source_id, source_status=str(source["status"]))
         else:
             payload = builder(source["records"])
         return apply_source_series_context(payload, source, source_id)
 
-    sopr_7d    = derived_from(sopr_source, "sopr", "sopr_7d", "ratio", build_sopr_7d_series)
-    hashrate   = derived_from(hashrate_source, "hashrate", "hashrate_eh_s", "EH/s", build_hashrate_eh_s_series)
+    sopr_7d = derived_from(sopr_source, "sopr", "sopr_7d", "ratio", build_sopr_7d_series)
+    hashrate = derived_from(hashrate_source, "hashrate", "hashrate_eh_s", "EH/s", build_hashrate_eh_s_series)
     difficulty = derived_from(difficulty_source, "difficulty", "difficulty_t", "T", build_difficulty_trillion_series)
     net_position = _copy_direct_value_series(input_series["miner_net_position_change"], metric_id="miner_net_position_change",
                                              unit="BTC/day", source_metric_id="miner_net_position_change")
+    outflow = _copy_direct_value_series(input_series["miner_outflow_total"], metric_id="miner_outflow_total_btc",
+                                        unit="BTC/day", source_metric_id="miner_outflow_total")
+    revenue = _copy_direct_value_series(input_series["miner_revenue_total_usd"], metric_id="miner_revenue_total_usd",
+                                        unit="USD/day", source_metric_id="miner_revenue_total_usd")
+
     if reserve_source["status"] == "invalid":
-        reserve_trend = {"feature_id": "reserve_trend", "status": "invalid", "default_window_days": DEFAULT_RESERVE_TREND_DAYS, "windows": {},
-                         "warnings": [], "errors": ["source_series_invalid:miner_reserve"]}
+        reserve_trend = {"feature_id": "reserve_trend", "status": "invalid", "default_window_days": DEFAULT_RESERVE_TREND_DAYS,
+                         "windows": {}, "warnings": [], "errors": ["source_series_invalid:miner_reserve"]}
     elif reserve_source["status"] == "unavailable":
-        reserve_trend = {"feature_id": "reserve_trend", "status": "unavailable", "default_window_days": DEFAULT_RESERVE_TREND_DAYS, "windows": {},
-                         "warnings": ["source_series_unavailable:miner_reserve"], "errors": []}
+        reserve_trend = {"feature_id": "reserve_trend", "status": "unavailable", "default_window_days": DEFAULT_RESERVE_TREND_DAYS,
+                         "windows": {}, "warnings": ["source_series_unavailable:miner_reserve"], "errors": []}
     else:
         reserve_trend = build_reserve_trend_features(reserve["records"])
         if reserve_source["status"] == "partial" and reserve_trend["status"] == "available":
             reserve_trend["status"] = "partial"
         reserve_trend["warnings"] = _stable_unique([*reserve_trend["warnings"],
-                                                     *(["source_series_partial:miner_reserve"] if reserve_source["status"] == "partial" else []),
-                                                     *(f"input_series_warning:miner_reserve:{message}" for message in reserve_source.get("warnings", []))])
+            *(["source_series_partial:miner_reserve"] if reserve_source["status"] == "partial" else []),
+            *(f"input_series_warning:miner_reserve:{message}" for message in reserve_source.get("warnings", []))])
         reserve_trend["errors"] = _stable_unique([*reserve_trend["errors"],
-                                                   *(f"input_series_error:miner_reserve:{message}" for message in reserve_source.get("errors", []))])
+            *(f"input_series_error:miner_reserve:{message}" for message in reserve_source.get("errors", []))])
+
     daily_candles = {
         "miner_reserve": build_daily_ohlc_from_intraday(input_series["miner_reserve"].get("records", []), unit="BTC"),
-        "sopr_7d": build_sopr_7d_intraday_candles(input_series["sopr"].get("records", [])),
+        "sopr_7d": build_daily_ohlc_from_intraday(sopr_7d.get("records", []), unit="ratio"),
         "hashrate": build_daily_ohlc_from_intraday(input_series["hashrate"].get("records", []), unit="EH/s", value_transform=lambda v: v / HASHES_PER_EXAHASH),
         "difficulty": build_daily_ohlc_from_intraday(input_series["difficulty"].get("records", []), unit="T", value_transform=lambda v: v / DIFFICULTY_PER_TRILLION),
     }
-    series = {"miner_reserve_btc": reserve, "sopr": sopr, "sopr_7d": sopr_7d, "hashrate_eh_s": hashrate,
-              "difficulty_t": difficulty, "miner_net_position_change": net_position, "mpi": mpi}
-    for chart_id, series_id in (("miner_reserve", "miner_reserve_btc"), ("sopr_7d", "sopr_7d"), ("hashrate", "hashrate_eh_s"), ("difficulty", "difficulty_t")):
+    series = {
+        "miner_reserve_btc": reserve, "sopr": sopr, "sopr_7d": sopr_7d, "hashrate_eh_s": hashrate,
+        "difficulty_t": difficulty, "miner_net_position_change": net_position, "mpi": mpi,
+        "miner_outflow_total_btc": outflow, "miner_revenue_total_usd": revenue,
+    }
+    for chart_id, series_id in (("miner_reserve", "miner_reserve_btc"), ("sopr_7d", "sopr_7d"),
+                                ("hashrate", "hashrate_eh_s"), ("difficulty", "difficulty_t")):
         series[series_id]["daily_candles"] = daily_candles[chart_id]
-        series[series_id]["metadata"] = {**dict(series[series_id].get("metadata", {})), "daily_ohlc_source": "glassnode_intraday_1h",
-                                           "daily_ohlc_candles": len(daily_candles[chart_id]), "ohlc_origin": "processing_derived"}
-    features = {"reserve_trend": reserve_trend,
-                         "miner_pressure_basis": ({"source_metric_id": "mpi", "status": mpi["status"], "current": mpi["current"], "previous": None,
-                                                   "change_1d": None, "unit": "z_score"} if mpi["status"] in {"invalid", "unavailable"} else _mpi_basis(mpi)),
-                         "sopr_regime_basis": {"source_metric_id": "sopr_7d", "status": sopr_7d["status"], "current": sopr_7d["current"],
-                                               "raw_sopr_current": sopr["current"]},
-                         "net_position_basis": {"source_metric_id": "miner_net_position_change", "status": net_position["status"],
-                                                "current": net_position["current"]}}
-    if include_screen_extensions:
-        collections = input_collections or {}
-        outflow = build_miner_outflow_distribution(collections["miner_outflow_by_pool"])
-        miners_unspent = build_miners_unspent_supply_series(input_series["miners_unspent_supply"])
-        reserve_age = build_reserve_age_context(miners_unspent, input_series["utxo_age_distribution"])
-        total_revenue = build_miner_revenue_series(input_series["miner_revenue_total_usd"], metric_id="miner_revenue_total_usd")
-        revenue = build_miner_revenue_breakdown(input_series["miner_revenue_total_usd"], input_series["miner_revenue_from_fees"],
-                                                input_data_as_of=input_data_as_of)
-        block_revenue = _derived_revenue_series("miner_block_reward_revenue_usd", "USD/day", revenue, "block_reward_revenue_usd")
-        nupl = build_nupl_series(input_series["nupl"])
-        direct_outflow = _copy_direct_value_series(input_series["miner_outflow_total"], metric_id="miner_outflow_total_btc",
-                                                  unit="BTC/day", source_metric_id="miner_outflow_total")
-        features["miner_pressure_basis"] = build_miner_pressure_basis(direct_outflow, sopr_7d)
-        features["mpi_context"] = _mpi_basis(mpi) if mpi.get("status") not in {"invalid", "unavailable"} else {"status": mpi.get("status"), "current": mpi.get("current")}
-        series.update({"miners_unspent_supply_btc": miners_unspent, "nupl": nupl, "miner_outflow_total_btc": direct_outflow,
-                       "miner_revenue_total_usd": total_revenue, "miner_block_reward_revenue_usd": block_revenue,
-                       "miner_fee_revenue_usd": _derived_revenue_series("miner_fee_revenue_usd", "USD/day", revenue, "fee_revenue_usd"),
-                       "miner_fee_share_ratio": _derived_revenue_series("miner_fee_share_ratio", "ratio", revenue, "derived_fee_share_ratio")})
-        features.update({"miner_outflow_distribution": outflow, "reserve_age_context": reserve_age,
-                         "miner_revenue_breakdown": revenue, "nupl_phase_basis": build_nupl_phase_basis(nupl)})
+        series[series_id]["metadata"] = {**dict(series[series_id].get("metadata", {})),
+            "daily_ohlc_source": "glassnode_24h", "daily_ohlc_candles": len(daily_candles[chart_id]),
+            "ohlc_origin": "processing_derived"}
+
+    # Classification pressure state remains anchored to MPI (z-score); the
+    # richer native selling-pressure analysis below also consumes total outflow.
+    pressure_basis = (
+        {"source_metric_id": "mpi", "status": mpi["status"], "current": mpi["current"],
+         "previous": None, "change_1d": None, "unit": "z_score"}
+        if mpi["status"] in {"invalid", "unavailable"}
+        else _mpi_basis(mpi)
+    )
+    features = {
+        "reserve_trend": reserve_trend,
+        "miner_pressure_basis": pressure_basis,
+        "mpi_context": _mpi_basis(mpi) if mpi.get("status") not in {"invalid", "unavailable"} else {"status": mpi.get("status"), "current": mpi.get("current")},
+        "sopr_regime_basis": {"source_metric_id": "sopr_7d", "status": sopr_7d["status"], "current": sopr_7d["current"], "raw_sopr_current": sopr["current"]},
+        "net_position_basis": {"source_metric_id": "miner_net_position_change", "status": net_position["status"], "current": net_position["current"]},
+    }
     return {"series": series, "features": features}
+

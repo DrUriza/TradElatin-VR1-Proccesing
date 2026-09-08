@@ -12,10 +12,8 @@ from .cvd_volume_orderflow_data_raw_extract import (
     TIMEFRAME_SECONDS, CvdVolumeOrderflowFetcher, CvdVolumeOrderflowRawExtractor, required_base_records,
 )
 
-READINESS_SOURCE = {"1m": "1m", "5m": "1m", "15m": "15m", "30m": "15m", "1h": "15m", "4h": "15m", "1d": "15m"}
-READINESS_FACTORS = {"1m": 1, "5m": 5, "15m": 1, "30m": 2, "1h": 4, "4h": 16, "1d": 96}
-GLASSNODE_METRICS = ("spot_cvd_sum", "spot_vd_sum", "spot_buying_volume_sum", "spot_selling_volume_sum")
-
+READINESS_SOURCE = {"5m": "5m", "15m": "15m", "4h": "15m"}
+READINESS_FACTORS = {"5m": 1, "15m": 1, "4h": 16}
 
 def _sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
@@ -55,17 +53,6 @@ def normalize_timestamp(value: Any) -> int:
     return result
 
 
-def normalize_iso_timestamp(value: Any) -> int:
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("invalid_timestamp") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return int(parsed.timestamp())
-    return normalize_timestamp(value)
-
 
 def unwrap_coinglass_response(response: Any) -> list[Any]:
     if not isinstance(response, Mapping) or str(response.get("code")) != "0" or not isinstance(response.get("data"), list):
@@ -73,19 +60,6 @@ def unwrap_coinglass_response(response: Any) -> list[Any]:
     return copy.deepcopy(response["data"])
 
 
-def unwrap_cryptoquant_response(response: Any) -> tuple[str, list[Any]]:
-    if not isinstance(response, Mapping) or not isinstance(response.get("status"), Mapping) or response["status"].get("code") != 200:
-        raise ValueError("invalid_cryptoquant_envelope")
-    result = response.get("result")
-    if not isinstance(result, Mapping) or not isinstance(result.get("data"), list) or result.get("window") not in {"min", "hour"}:
-        raise ValueError("invalid_cryptoquant_structure")
-    return result["window"], copy.deepcopy(result["data"])
-
-
-def unwrap_glassnode_response(response: Any) -> list[Any]:
-    if not _sequence(response):
-        raise ValueError("invalid_glassnode_envelope")
-    return copy.deepcopy(list(response))
 
 
 def normalize_coinglass_cvd_record(row: Any) -> dict[str, Any]:
@@ -116,24 +90,6 @@ def normalize_footprint_snapshot(row: Any) -> dict[str, Any]:
     return {"timestamp": normalize_timestamp(row[0]), "levels": levels, "invalid_levels": invalid}
 
 
-def normalize_cryptoquant_record(row: Any, provider_window: str) -> dict[str, Any]:
-    required = {"taker_buy_volume", "taker_sell_volume", "taker_buy_ratio", "taker_sell_ratio", "taker_buy_sell_ratio"}
-    if not isinstance(row, Mapping) or not required.issubset(row):
-        raise ValueError("invalid_cryptoquant_record")
-    timestamp_value = row.get("datetime", row.get("date"))
-    if timestamp_value is None:
-        raise ValueError("invalid_cryptoquant_record_timestamp")
-    return {"timestamp": normalize_iso_timestamp(timestamp_value), "taker_buy_volume_usd": normalize_non_negative_float(row["taker_buy_volume"]),
-        "taker_sell_volume_usd": normalize_non_negative_float(row["taker_sell_volume"]),
-        "provider_taker_buy_ratio": normalize_finite_float(row["taker_buy_ratio"]),
-        "provider_taker_sell_ratio": normalize_finite_float(row["taker_sell_ratio"]),
-        "provider_taker_buy_sell_ratio": normalize_finite_float(row["taker_buy_sell_ratio"]), "provider_window": provider_window}
-
-
-def normalize_glassnode_record(row: Any) -> dict[str, Any]:
-    if not isinstance(row, Mapping) or not {"t", "v"}.issubset(row):
-        raise ValueError("invalid_glassnode_record")
-    return {"timestamp": normalize_timestamp(row["t"]), "value": normalize_finite_float(row["v"])}
 
 
 def upsert_records_by_timestamp(existing: Sequence[Mapping[str, Any]], incoming: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -276,64 +232,11 @@ def _primary_payload(pages: Sequence[Mapping[str, Any]], existing: Mapping[str, 
         "provenance": {"provider": "coinglass", "dataset": "aggregated_cvd", "timeframe": timeframe}}
 
 
-def _derive_15m_from_1m(one_minute: Mapping[str, Any], existing: Mapping[str, Any] | None, required: int) -> dict[str, Any]:
-    """Update the persisted 15m CVD base locally from complete 1m buckets.
-
-    Bootstrap still comes from the provider-native 15m endpoint.  This function
-    is only the incremental bridge that prevents a second paid timeframe call.
-    """
-    source = [row for row in one_minute.get("records", []) if isinstance(row, Mapping)]
-    existing_records = copy.deepcopy(existing.get("records", [])) if isinstance(existing, Mapping) else []
-    last_existing = max((row.get("timestamp") for row in existing_records if isinstance(row, Mapping) and type(row.get("timestamp")) is int), default=None)
-    # Provider fixtures and some venues can carry a stable non-zero timestamp
-    # phase. Preserve the native 15m phase instead of assuming epoch modulo 900.
-    phase = (last_existing % TIMEFRAME_SECONDS["15m"]) if last_existing is not None else (source[0]["timestamp"] % TIMEFRAME_SECONDS["15m"] if source else 0)
-    buckets: dict[int, list[Mapping[str, Any]]] = {}
-    for row in source:
-        stamp = row.get("timestamp")
-        if type(stamp) is not int:
-            continue
-        bucket = phase + ((stamp - phase) // TIMEFRAME_SECONDS["15m"]) * TIMEFRAME_SECONDS["15m"]
-        buckets.setdefault(bucket, []).append(row)
-    incoming: list[dict[str, Any]] = []
-    for bucket in sorted(buckets):
-        if last_existing is not None and bucket < last_existing:
-            continue
-        rows = sorted(buckets[bucket], key=lambda row: row["timestamp"])
-        one_minute_phase = rows[0]["timestamp"] % TIMEFRAME_SECONDS["1m"]
-        expected = [bucket + one_minute_phase + offset * TIMEFRAME_SECONDS["1m"] for offset in range(15)]
-        # If the provider 15m phase already includes the minute phase, avoid
-        # double counting it (the common case).
-        if rows and rows[0]["timestamp"] == bucket:
-            expected = [bucket + offset * TIMEFRAME_SECONDS["1m"] for offset in range(15)]
-        if len(rows) != 15 or [row["timestamp"] for row in rows] != expected:
-            continue
-        incoming.append({
-            "timestamp": bucket,
-            "taker_buy_volume_usd": sum(float(row["taker_buy_volume_usd"]) for row in rows),
-            "taker_sell_volume_usd": sum(float(row["taker_sell_volume_usd"]) for row in rows),
-            "provider_cvd_usd": rows[-1].get("provider_cvd_usd"),
-        })
-    records, upsert = upsert_records_by_timestamp(existing_records, incoming)
-    gaps = detect_internal_gaps(records, TIMEFRAME_SECONDS["15m"])
-    status, reason = _status(structural=False, records=records, failed=False, invalid=[], gaps=gaps, insufficient=len(records) < required)
-    earliest_required = records[-1]["timestamp"] - (required - 1) * TIMEFRAME_SECONDS["15m"] if records else None
-    return {
-        "status": status, "reason": reason, "records": records, "incoming_records": incoming, "invalid_records": [],
-        "records_required": required, "records_available": len(records), "missing_records": max(0, required - len(records)),
-        "earliest_required_timestamp": earliest_required, "earliest_available_timestamp": records[0]["timestamp"] if records else None,
-        "expected_interval_seconds": TIMEFRAME_SECONDS["15m"], "gaps": gaps,
-        "pagination": {"pages_requested": 0, "pages_succeeded": 0, "pages_failed": 0, "records_raw": 0,
-                       "records_unique": len(incoming), "duplicates_removed": 0, "pagination_complete": True,
-                       "pagination_stop_reason": "derived_from_1m"},
-        "upsert": upsert,
-        "provenance": {"provider": "coinglass", "dataset": "aggregated_cvd", "timeframe": "15m",
-                       "construction": "local_resample_from_1m", "paid_request": False},
-    }
-
-
 def _optional_payload(pages: Sequence[Mapping[str, Any]], existing: Mapping[str, Any] | None, provider: str,
                       dataset: str, enabled: bool) -> dict[str, Any]:
+    """Normalize the contracted CoinGlass footprint enrichment only."""
+    if provider != "coinglass" or dataset != "footprint":
+        raise ValueError("unsupported_optional_cvd_source")
     if not enabled:
         return {"status": "unavailable", "reason": "endpoint_disabled", "records": [], "invalid_records": []}
     incoming, invalid, failed, structural = [], [], False, False
@@ -342,27 +245,19 @@ def _optional_payload(pages: Sequence[Mapping[str, Any]], existing: Mapping[str,
             failed = True
             continue
         try:
-            if provider == "coinglass":
-                rows, window = unwrap_coinglass_response(page.get("response")), None
-                normalizer = normalize_footprint_snapshot
-            elif provider == "cryptoquant":
-                window, rows = unwrap_cryptoquant_response(page.get("response"))
-                def normalizer(row: Any) -> dict[str, Any]:
-                    return normalize_cryptoquant_record(row, window)
-            else:
-                rows, window, normalizer = unwrap_glassnode_response(page.get("response")), None, normalize_glassnode_record
+            rows = unwrap_coinglass_response(page.get("response"))
         except ValueError as exc:
             structural = True
             invalid.append({"reason": str(exc)})
             continue
-        good, bad = _normalize_rows(rows, normalizer)
+        good, bad = _normalize_rows(rows, normalize_footprint_snapshot)
         incoming.extend(good)
         invalid.extend(bad)
     records, upsert = upsert_records_by_timestamp(existing.get("records", []) if isinstance(existing, Mapping) else [], incoming)
-    nested_invalid = any(row.get("invalid_levels") for row in records) if provider == "coinglass" else False
+    nested_invalid = any(row.get("invalid_levels") for row in records)
     status, reason = _status(structural=structural, records=records, failed=failed, invalid=invalid or ([{}] if nested_invalid else []), gaps=[])
     return {"status": status, "reason": reason, "records": records, "incoming_records": incoming, "invalid_records": invalid,
-        "upsert": upsert, "provenance": {"provider": provider, "dataset": dataset}}
+        "upsert": upsert, "provenance": {"provider": "coinglass", "dataset": "footprint"}}
 
 
 def evaluate_readiness(markets: Mapping[str, Any], target_display_records: int, warmup_records: int) -> dict[str, Any]:
@@ -381,38 +276,19 @@ def evaluate_readiness(markets: Mapping[str, Any], target_display_records: int, 
 
 def evaluate_quality(markets: Mapping[str, Any]) -> dict[str, Any]:
     primary = {f"{market}.{frame}": markets[market]["cvd"]["timeframes"][frame]["status"] for market in ("spot", "futures") for frame in BASE_TIMEFRAMES}
-    optional = {}
-    disabled_keys = set()
-    for market in ("spot", "futures"):
-        footprint_key, footprint = f"{market}.footprint", markets[market]["footprint"]
-        optional[footprint_key] = footprint["status"]
-        if footprint.get("reason") == "endpoint_disabled":
-            disabled_keys.add(footprint_key)
-        for provider, payload in markets[market]["confirmations"].items():
-            if provider == "glassnode":
-                optional.update({f"spot.glassnode.{metric}": item["status"] for metric, item in payload.items()})
-                disabled_keys.update(f"spot.glassnode.{metric}" for metric, item in payload.items() if item.get("reason") == "endpoint_disabled")
-            else:
-                key = f"{market}.{provider}"
-                optional[key] = payload["status"]
-                if payload.get("reason") == "endpoint_disabled":
-                    disabled_keys.add(key)
-    actionable_optional = []
-    for market in ("spot", "futures"):
-        footprint = markets[market]["footprint"]
-        if footprint.get("reason") != "endpoint_disabled":
-            actionable_optional.append(footprint["status"])
-        for payload in markets[market]["confirmations"].values():
-            for item in payload.values() if "status" not in payload else (payload,):
-                if item.get("reason") != "endpoint_disabled":
-                    actionable_optional.append(item["status"])
+    optional = {f"{market}.footprint": markets[market]["footprint"]["status"] for market in ("spot", "futures")}
+    actionable_optional = [
+        markets[market]["footprint"]["status"]
+        for market in ("spot", "futures")
+        if markets[market]["footprint"].get("reason") != "endpoint_disabled"
+    ]
     if "invalid" in primary.values():
         status = "invalid"
     elif any(item != "available" for item in primary.values()) or any(item != "available" for item in actionable_optional):
         status = "partial"
     else:
         status = "ok"
-    warnings = [key for key, value in {**primary, **optional}.items() if value in {"partial", "unavailable"} and key not in disabled_keys]
+    warnings = [key for key, value in {**primary, **optional}.items() if value in {"partial", "unavailable"}]
     errors = [key for key, value in {**primary, **optional}.items() if value == "invalid"]
     recovery = any(payload["gaps"] for market in ("spot", "futures") for payload in markets[market]["cvd"]["timeframes"].values())
     return {"status": status, "primary_sources": primary, "optional_sources": optional, "recovery_required": recovery,
@@ -438,12 +314,6 @@ class CvdVolumeOrderflowInputPreprocessor:
     def preprocess_footprint(self, requests: Sequence[Mapping[str, Any]], *, existing: Mapping[str, Any] | None, enabled: bool) -> dict[str, Any]:
         return _optional_payload(requests, existing, "coinglass", "footprint", enabled)
 
-    def preprocess_cryptoquant(self, requests: Sequence[Mapping[str, Any]], *, existing: Mapping[str, Any] | None, enabled: bool) -> dict[str, Any]:
-        return _optional_payload(requests, existing, "cryptoquant", "taker_buy_sell_stats", enabled)
-
-    def preprocess_glassnode(self, requests: Sequence[Mapping[str, Any]], *, existing: Mapping[str, Any] | None, dataset: str, enabled: bool) -> dict[str, Any]:
-        return _optional_payload(requests, existing, "glassnode", dataset, enabled)
-
     def merge_paginated_records(self, requests: Sequence[Mapping[str, Any]], *, dataset: str = "aggregated_cvd",
                                 records_required: int | None = None) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
         return merge_paginated_records(requests, dataset=dataset, records_required=records_required)
@@ -456,18 +326,15 @@ class CvdVolumeOrderflowInputPreprocessor:
 
     def run(self, *, reference_timestamp: int, requested_mode: str | None = None,
             recovery_requests: Sequence[Mapping[str, Any]] | None = None, include_footprint: bool = True,
-            include_cryptoquant_confirmation: bool = True, include_glassnode_confirmation: bool = True,
             target_display_records: int = FINAL_DISPLAY_RECORDS, warmup_records: int = FINAL_WARMUP_RECORDS, **kwargs: Any) -> dict[str, Any]:
         mode = self.determine_mode(requested_mode=requested_mode, recovery_requests=recovery_requests)
         raw = self.raw_extractor.run(mode=mode, reference_timestamp=reference_timestamp, existing_input=self.existing_input,
             recovery_requests=recovery_requests, include_footprint=include_footprint,
-            include_cryptoquant_confirmation=include_cryptoquant_confirmation, include_glassnode_confirmation=include_glassnode_confirmation,
             target_display_records=target_display_records, warmup_records=warmup_records, **kwargs)
-        return self.preprocess_raw(raw, include_footprint=include_footprint, include_cryptoquant_confirmation=include_cryptoquant_confirmation,
-            include_glassnode_confirmation=include_glassnode_confirmation, target_display_records=target_display_records, warmup_records=warmup_records)
+        return self.preprocess_raw(raw, include_footprint=include_footprint,
+            target_display_records=target_display_records, warmup_records=warmup_records)
 
-    def preprocess_raw(self, raw: Mapping[str, Any], *, include_footprint: bool, include_cryptoquant_confirmation: bool,
-                       include_glassnode_confirmation: bool, target_display_records: int, warmup_records: int) -> dict[str, Any]:
+    def preprocess_raw(self, raw: Mapping[str, Any], *, include_footprint: bool, target_display_records: int, warmup_records: int) -> dict[str, Any]:
         if not isinstance(raw, Mapping) or raw.get("family") != CVD_VOLUME_ORDERFLOW_FAMILY or raw.get("stage") != "raw_extract":
             raise ValueError("raw contract is incompatible")
         old = _existing_input(self.existing_input)
@@ -483,27 +350,13 @@ class CvdVolumeOrderflowInputPreprocessor:
                 previous = old.get("markets", {}).get(market, {}).get("cvd", {}).get("timeframes", {}).get(timeframe) if old else None
                 required = required_base_records(timeframe, target_display_records, warmup_records)
                 pages = by_logical.get(identifier, [])
-                if timeframe == "15m" and raw.get("mode") == "incremental" and not pages:
-                    frames[timeframe] = _derive_15m_from_1m(frames["1m"], previous, required)
-                else:
-                    frames[timeframe] = self.preprocess_coinglass_cvd(pages, existing=previous,
-                        timeframe=timeframe, records_required=required)
+                frames[timeframe] = self.preprocess_coinglass_cvd(pages, existing=previous,
+                    timeframe=timeframe, records_required=required)
             footprint_pages = [item for key, value in by_logical.items() if key.startswith(f"coinglass:{market}:footprint:") for item in value]
             previous_footprint = old.get("markets", {}).get(market, {}).get("footprint") if old else None
             footprint = self.preprocess_footprint(footprint_pages, existing=previous_footprint, enabled=include_footprint)
-            if market == "spot":
-                glassnode = {}
-                for metric in GLASSNODE_METRICS:
-                    previous = old.get("markets", {}).get("spot", {}).get("confirmations", {}).get("glassnode", {}).get(metric) if old else None
-                    glassnode[metric] = self.preprocess_glassnode(by_logical.get(f"glassnode:spot:{metric}:1h", []), existing=previous,
-                        dataset=metric, enabled=include_glassnode_confirmation)
-                confirmations = {"glassnode": glassnode}
-            else:
-                previous = old.get("markets", {}).get("futures", {}).get("confirmations", {}).get("cryptoquant") if old else None
-                confirmations = {"cryptoquant": self.preprocess_cryptoquant(by_logical.get("cryptoquant:futures:taker_buy_sell_stats:1h", []),
-                    existing=previous, enabled=include_cryptoquant_confirmation)}
             markets[market] = {"cvd": {"provider": "coinglass", "endpoint_id": f"{market}_aggregated_cvd", "timeframes": frames},
-                "footprint": footprint, "confirmations": confirmations}
+                "footprint": footprint}
         context = raw["context"]
         output_context = {"base_asset": context["base_asset"], "pair_symbol": context["pair_symbol"],
             "requested_exchanges": copy.deepcopy(context["requested_exchanges"]), "effective_exchanges": copy.deepcopy(context["requested_exchanges"]),
@@ -519,7 +372,6 @@ def run_cvd_volume_orderflow_input(*, fetcher: CvdVolumeOrderflowFetcher, base_a
                                    exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"), existing_input: Mapping[str, Any] | None = None,
                                    requested_mode: str | None = None, recovery_requests: Sequence[Mapping[str, Any]] | None = None,
                                    include_footprint: bool = True, footprint_exchanges: Sequence[str] = ("Binance", "OKX", "Bybit"),
-                                   include_cryptoquant_confirmation: bool = True, include_glassnode_confirmation: bool = True,
                                    target_display_records: int = FINAL_DISPLAY_RECORDS, warmup_records: int = FINAL_WARMUP_RECORDS,
                                    incremental_limits: Mapping[str, int] | None = None, footprint_history_seconds: int = 172800,
                                    max_pages: int | None = None, data_mode: str = "synthetic", is_demo: bool = True,
@@ -529,7 +381,6 @@ def run_cvd_volume_orderflow_input(*, fetcher: CvdVolumeOrderflowFetcher, base_a
     extractor = CvdVolumeOrderflowRawExtractor(fetcher, clock=clock)
     return CvdVolumeOrderflowInputPreprocessor(extractor, existing_input).run(reference_timestamp=reference_timestamp,
         requested_mode=requested_mode, recovery_requests=recovery_requests, include_footprint=include_footprint,
-        include_cryptoquant_confirmation=include_cryptoquant_confirmation, include_glassnode_confirmation=include_glassnode_confirmation,
         target_display_records=target_display_records, warmup_records=warmup_records, base_asset=base_asset, pair_symbol=pair_symbol,
         exchanges=exchanges, footprint_exchanges=footprint_exchanges, incremental_limits=incremental_limits,
         footprint_history_seconds=footprint_history_seconds, max_pages=max_pages, data_mode=data_mode, is_demo=is_demo,

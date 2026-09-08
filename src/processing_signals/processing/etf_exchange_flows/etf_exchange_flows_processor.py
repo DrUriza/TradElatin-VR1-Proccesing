@@ -18,14 +18,12 @@ from .etf_exchange_flows_feature_builder import (
 STAGE   = "processing"
 VERSION = "0.1"
 
-REQUIRED_FEATURES = ("etf_net_flow_usd_latest", "reported_total_aum_usd", "gbtc_premium_latest", "exchange_inflow_24h",
-                     "exchange_outflow_24h", "exchange_netflow_24h_reported", "cryptoquant_reserve_latest")
+REQUIRED_FEATURES = ("etf_net_flow_usd_latest", "reported_total_aum_usd", "exchange_inflow_24h",
+                     "exchange_outflow_24h", "exchange_netflow_24h_calculated", "cryptoquant_reserve_latest")
 OPTIONAL_FEATURES = ("etf_net_flow_btc_latest", "etf_period_flow_usd", "etf_period_flow_btc", "etf_cumulative_flow_usd",
     "etf_cumulative_flow_btc", "fund_period_flow_usd", "fund_period_signed_flow_share", "fund_aum_usd", "fund_aum_share",
     "calculated_fund_aum_usd", "aum_difference_usd", "aum_difference_percent", "exchange_netflow_24h_calculated",
-    "netflow_difference", "coinglass_balance_total", "exchange_flow_pressure_24h")
-SECONDARY_FEATURES = ("glassnode_balance_secondary", "balance_provider_spread")
-
+    "netflow_difference", "exchange_flow_pressure_24h")
 
 def _timestamp(value: Any) -> int | None:
     if isinstance(value, bool):
@@ -79,9 +77,7 @@ def _feature_map(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
         "etf_net_flow_btc_latest": features["etf"]["net_flow_btc_latest"],
         "calculated_fund_aum_usd": features["etf"]["calculated_fund_aum_usd"],
         "exchange_netflow_24h_calculated": features["exchange_flows"]["netflow_24h_calculated"],
-        "coinglass_balance_total": features["exchange_balances"]["coinglass_total"],
-        "exchange_flow_pressure_24h": features["pressure"]["flow_24h"],
-        "glassnode_balance_secondary": features["exchange_balances"]["glassnode_secondary"]}
+        "exchange_flow_pressure_24h": features["pressure"]["flow_24h"]}
 
 
 def is_non_isolatable_required_error(feature: Mapping[str, Any]) -> bool:
@@ -126,11 +122,9 @@ def _apply_input_quality(payload: dict[str, Any], input_contract: Mapping[str, A
         return
     dependencies = {
         "coinglass.bitcoin_etf_flows": payload["features"]["etf"]["net_flow_usd_latest"],
-        "coinglass.bitcoin_etf_net_assets_history": payload["features"]["etf"]["reported_total_aum_usd"],
-        "coinglass.bitcoin_etf_premium_discount_history": payload["features"]["premium_discount"]["gbtc_latest"],
+        "coinglass.bitcoin_etf_list": payload["features"]["etf"]["reported_total_aum_usd"],
         "cryptoquant.exchange_inflow.hour": payload["features"]["exchange_flows"]["inflow_24h"],
         "cryptoquant.exchange_outflow.hour": payload["features"]["exchange_flows"]["outflow_24h"],
-        "cryptoquant.exchange_netflow.hour": payload["features"]["exchange_flows"]["netflow_24h_reported"],
         "cryptoquant.exchange_reserve.hour": payload["features"]["exchange_balances"]["cryptoquant_reserve"],
     }
     for endpoint, feature in dependencies.items():
@@ -202,8 +196,9 @@ def _provenance(payload: Mapping[str, Any], input_contract: Mapping[str, Any], e
 
 
 def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
-    flows = list(payload.get("series", {}).get("etf_flow_daily", []))
-    timestamps = [int(row["timestamp"]) for row in flows]
+    raw_flows = list(payload.get("series", {}).get("etf_flow_daily", []))
+    flows = [row for row in raw_flows if isinstance(row, Mapping) and _timestamp(row.get("timestamp")) is not None]
+    timestamps = [int(_timestamp(row.get("timestamp"))) for row in flows]
     flow_values = [row.get("flow_usd") for row in flows]
     flow_z = rolling_zscore(flow_values, 30, 10)
     flow_momentum_z = rolling_zscore(difference(flow_values), 20, 8)
@@ -211,14 +206,29 @@ def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_d
     persistence = rolling_mean(signs, 10, 5)
 
     prices = price_history_daily or []
-    price_by_ts = {int(row["timestamp"]): row.get("close") for row in prices if isinstance(row, Mapping) and row.get("timestamp") is not None}
+    price_by_ts: dict[int, Any] = {}
+    for row in prices:
+        if not isinstance(row, Mapping):
+            continue
+        timestamp = _timestamp(row.get("timestamp"))
+        if timestamp is not None:
+            price_by_ts[timestamp] = row.get("close")
     aligned_prices = [price_by_ts.get(ts) for ts in timestamps]
     price_return_z = rolling_zscore(native_pct_change(aligned_prices, 1, 100.0), 30, 10)
     divergence = [None if p is None or f is None else float(p) - float(f) for p, f in zip(price_return_z, flow_z, strict=True)]
 
     def align_day(name: str, field: str) -> list[float | None]:
         rows = payload.get("series", {}).get(name, {}).get("day", [])
-        lookup = {int(row["timestamp"]): row.get(field) for row in rows if isinstance(row, Mapping)}
+        # Partial/unavailable provider datasets may preserve placeholder rows
+        # with timestamp=None.  Those rows are valid availability markers, not
+        # time-series observations, so they must never reach int(None).
+        lookup: dict[int, Any] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            timestamp = _timestamp(row.get("timestamp"))
+            if timestamp is not None:
+                lookup[timestamp] = row.get(field)
         return [lookup.get(ts) for ts in timestamps]
 
     inflow = align_day("exchange_inflow", "inflow_total")
@@ -260,7 +270,9 @@ def _native_capital_flow_analysis(payload: Mapping[str, Any], *, price_history_d
                 "unit": "score", "timestamps": timestamps, "series": {k:list(v) for k,v in series_map.items()},
                 "thresholds": [{"value":0.0,"role":"neutral"}],
                 "summary": {"section": section, "label": label, "display_value": None if primary is None else f"{primary:.3f}",
-                            "signal": signal, "signal_color": signal, "strength": 0.0 if primary is None else min(1.0,abs(float(primary))/2.0)},
+                            "signal": signal,
+                            "signal_color": {"positive": "#20d05c", "negative": "#ff3d55", "neutral": "#ffab00"}.get(signal, "#59636b"),
+                            "strength": 0.0 if primary is None else min(1.0,abs(float(primary))/2.0)},
                 "provenance": {"owner":"ETF Processing", "indicator_id":indicator_id}}
 
     indicators = {
@@ -312,4 +324,11 @@ class EtfExchangeFlowsProcessor:
     def process(self, *, input_contract: Mapping[str, Any], generated_at: Any = None, exchange_scope: str | None = None,
                 price_history_daily: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
         return process_etf_exchange_flows(input_contract=input_contract, generated_at=generated_at, exchange_scope=exchange_scope, price_history_daily=price_history_daily)
-from processing_signals.processing.math.native_analysis import rolling_zscore, rolling_wasserstein, difference, pct_change as native_pct_change, rolling_mean, latest
+from .etf_exchange_flows_math import (
+    rolling_zscore,
+    rolling_wasserstein,
+    difference,
+    pct_change as native_pct_change,
+    rolling_mean,
+    latest,
+)
