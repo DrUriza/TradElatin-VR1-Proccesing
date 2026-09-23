@@ -1,7 +1,8 @@
 # C9/Stacks Proposed Source-Surface Catalog
 
 **Status for every entry:** PROPOSED / NOT IMPLEMENTED  
-**Scope:** pre-implementation catalog; no current runtime endpoints or contracts
+**Scope:** 14 proposed logical source surfaces; no active endpoints, current
+runtime endpoints, or C9 contracts
 
 ## Catalog rules
 
@@ -11,15 +12,27 @@ Milestone 1, each source must be verified against the actual API or contract
 interface, mapped to one of the three frozen C9 observables, and assigned explicit
 provenance, units, timestamps, finality, and failure behavior.
 
+This catalog freezes neither URLs, HTTP methods, parameters, payload schemas,
+pagination, exact contract addresses, nor production provider assignments.
+Those implementation details must be validated during Milestone 1.
+
 `C9 ownership` identifies the canonical C9 domain. `Possible consuming C1–C8
-families` permits contextual consumption only; it does not transfer ownership or
-authorize a consumer to change the source semantics.
+families` permits contextual consumption only; it does not transfer ownership,
+authorize a consumer to change the source semantics, or establish causality.
+
+## Semantic guardrails
+
+- Transfers do not become CVD automatically.
+- Lending state is not Open Interest or Funding.
+- AMM liquidity is not order-book depth.
+- Protocol liquidations are not derivatives liquidations.
+- Cross-family context does not establish causality.
 
 ## A. C9 CORE / NATIVE
 
 | Logical source ID | Intended source/API/contract class | What it measures | C9 ownership | Possible consuming C1–C8 families | Status | Notes / semantic restrictions |
 |---|---|---|---|---|---|---|
-| `sbtc_token_supply` | `sbtc-token`; Stacks read-only contract interface; Hiro / Stacks APIs | Observed sBTC token supply plus validated issuance or mint-burn context | C9.1 — sBTC Supply & Peg State | C1, C5 | PROPOSED / NOT IMPLEMENTED | Supply, minted amount, burned amount, and circulating interpretation are distinct. Pin contract/network, decimals, block, and provenance. Peg price is separate context, not supply. |
+| `sbtc_token_supply` | `sbtc-token`; Stacks read-only contract interface; Hiro / Stacks APIs | Observed sBTC token supply plus validated issuance or mint-burn context | C9.1 — sBTC Supply & Peg State | C5 | PROPOSED / NOT IMPLEMENTED | Supply, minted amount, burned amount, and circulating interpretation are distinct. Pin contract/network, decimals, block, and provenance. Peg price is separate context, not supply. |
 | `sbtc_bridge_deposits` | Emily public API; `sbtc-registry`; protocol contracts/events | Deposit operations, amounts, counts, states, and timing into sBTC | C9.2 — sBTC Bridge Flow; C9.3 operational state where applicable | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED | Requested/pending/accepted/confirmed/completed deposits are not equivalent. Do not count an unfinalized request as completed bridge inflow. |
 | `sbtc_bridge_withdrawals` | Emily public API; `sbtc-registry`; protocol contracts/events | Withdrawal operations, amounts, counts, states, and timing out of sBTC | C9.2 — sBTC Bridge Flow; C9.3 operational state where applicable | C4, C5, C6 | PROPOSED / NOT IMPLEMENTED | Preserve requested, pending, confirmed, completed, rejected, and failed states. Net flow requires an explicit sign convention and common time window. |
 | `sbtc_bridge_limits` | Emily public API; `sbtc-registry`; Stacks read-only contract interfaces | Active protocol or service limits affecting bridge operations | C9.3 — sBTC Bridge Operational State | C4, C6 | PROPOSED / NOT IMPLEMENTED | Label protocol limits separately from API, wallet, UI, provider, or policy limits; preserve scope, units, and effective time. |
@@ -33,9 +46,9 @@ authorize a consumer to change the source semantics.
 | `sbtc_ft_transfers` | Hiro / Stacks APIs; SIP-010/token contract events; protocol-specific contracts/events | sBTC fungible-token transfers with sender, recipient, amount, transaction, block, and event context | C9 transversal transfer surface; contextual input to C9.1/C9.2 only when semantics prove relevance | C2, C5 | PROPOSED / NOT IMPLEMENTED | A transfer is not automatically a trade, bridge flow, mint, burn, or whale action. Classify only with validated contract/event semantics. |
 | `sbtc_holder_distribution` | Hiro / Stacks APIs; token balances/read-only interfaces; indexed ledger state | Distribution of observed sBTC balances across addresses at a defined snapshot | C9 transversal ownership-distribution surface; contextual input to C9.1 | C5 | PROPOSED / NOT IMPLEMENTED | Addresses are not persons or entities. Exclude or label contracts, custodial aggregation, dust, inactive balances, and incomplete indexing where identifiable. |
 | `sbtc_dex_trades` | Protocol-specific DEX contracts/events; Hiro / Stacks APIs | Validated swaps/trades involving sBTC, including venue, pair, amounts, and execution context | C9 transversal market-activity surface | C1, C2, C8 | PROPOSED / NOT IMPLEMENTED | Only validated swap/trade events qualify. Preserve venue/pool/pair and token direction; do not claim aggressor side or CVD semantics unless derivable and validated. |
-| `sbtc_amm_pool_state` | AMM read-only contract interfaces; pool contracts/events; Hiro / Stacks APIs | Pool reserves, liquidity, price state, fees, and invariant-related context for sBTC pools | C9 transversal liquidity surface | C1, C6, C8 | PROPOSED / NOT IMPLEMENTED | AMM reserves and curve liquidity are not order-book bid/ask depth. Derived price impact must identify pool model, fee tier, path, size, block, and assumptions. |
-| `sbtc_lending_market_state` | Protocol-specific lending contracts/read-only interfaces/events | sBTC lending supply, borrow, utilization, collateral, and rate state where exposed | C9 transversal DeFi-credit surface | C3, C5, C6 | PROPOSED / NOT IMPLEMENTED | Do not label lending supply/borrow as derivatives Open Interest, and do not label protocol rates as perpetual Funding Rate. Preserve protocol-specific definitions. |
-| `sbtc_protocol_liquidations` | Protocol-specific lending/liquidation contracts and validated events | Confirmed protocol liquidation events involving sBTC | C9 transversal liquidation surface | C7, C5, C6 | PROPOSED / NOT IMPLEMENTED | Count only events whose protocol semantics are verified. Do not mix lending liquidations with centralized/perpetual liquidation maps or pending risk positions. |
+| `sbtc_amm_pool_state` | AMM read-only contract interfaces; pool contracts/events; Hiro / Stacks APIs | Pool reserves, liquidity, price state, fees, and invariant-related context for sBTC pools | C9 transversal liquidity surface | C1, C8 | PROPOSED / NOT IMPLEMENTED | AMM reserves and curve liquidity are not order-book bid/ask depth. Derived price impact must identify pool model, fee tier, path, size, block, and assumptions. |
+| `sbtc_lending_market_state` | Protocol-specific lending contracts/read-only interfaces/events | sBTC lending supply, borrow, utilization, collateral, and rate state where exposed | C9 transversal DeFi-credit surface | C3, C6 | PROPOSED / NOT IMPLEMENTED | Do not label lending supply/borrow as derivatives Open Interest, and do not label protocol rates as perpetual Funding Rate. Preserve protocol-specific definitions. |
+| `sbtc_protocol_liquidations` | Protocol-specific lending/liquidation contracts and validated events | Confirmed protocol liquidation events involving sBTC | C9 transversal liquidation surface | C6, C7 | PROPOSED / NOT IMPLEMENTED | Count only events whose protocol semantics are verified. Protocol liquidations are not derivatives liquidations; do not mix them with centralized/perpetual liquidation maps or pending risk positions. |
 | `stacks_fee_state` | Hiro / Stacks APIs; Stacks node/mempool/transaction data | Observed transaction fee levels and fee context affecting Stacks/sBTC operations | C9 transversal network-operational surface; contextual input to C9.3 | C6 | PROPOSED / NOT IMPLEMENTED | Distinguish paid fees, estimates, percentiles, and protocol-specific fees. Units, sampling window, transaction class, and freshness are mandatory. |
 | `stacks_mempool_activity` | Hiro / Stacks APIs; Stacks node mempool interfaces | Pending transaction volume/activity and congestion context relevant to operational timing | C9 transversal network-operational surface; contextual input to C9.3 | C6 | PROPOSED / NOT IMPLEMENTED | Mempool data is ephemeral and provider-dependent. Pending does not mean confirmed; deduplicate transactions and expose snapshot coverage and staleness. |
 
@@ -65,3 +78,6 @@ real source interface, access conditions, field semantics, unit conversions,
 timestamps, pagination, finality, quality/error states, and the destination C9
 contract version. Until then, every catalog entry remains **PROPOSED / NOT
 IMPLEMENTED** and is excluded from the current Processing runtime inventory.
+
+The 14 identifiers in this catalog are **proposed logical source surfaces**, not
+**active endpoints**.

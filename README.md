@@ -12,6 +12,8 @@ Standalone processing repository for TradELATIN VR1 — OBSERVE.
 - C9/Stacks is not implemented yet.
 - C9 implementation is proposed grant work and remains outside the current runtime.
 
+The C9 pre-implementation catalog freezes 14 proposed logical source surfaces: 6 C9 Core and 8 transversal. None is implemented in the current runtime.
+
 The current C1–C8 inventory, runtime family names, acquisition routing, endpoint
 allowlists, processing pipelines, contract builders, and sample/runtime contracts
 remain unchanged. Stacks is not part of the current runtime inventory.

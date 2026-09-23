@@ -12,8 +12,9 @@ of a prototype or live Stacks support.
 
 No Stacks adapter, Stacks acquisition path, C9 normalizer, C9 processor, C9
 contract builder, runtime registration, endpoint allowlist entry, or sample C9
-contract exists in the current repository. Those items belong to proposed grant
-Milestone 1. The implemented C1–C8 runtime and its inventory remain unchanged.
+contract exists in the current repository. There is no operational Stacks support.
+Those items belong to proposed grant Milestone 1. The implemented C1–C8 runtime
+and its inventory remain unchanged.
 
 ## 2. Future Processing architecture
 
@@ -129,7 +130,7 @@ contract metadata.
 
 Cross-family enrichment must reference the originating C9 contract version and
 observation timestamp. Consumers must tolerate C9 being absent because C9 is not
-part of the current runtime.
+part of the current runtime. Cross-family context does not establish causality.
 
 ## 7. Validation and provenance requirements
 
@@ -157,6 +158,11 @@ This documentation change does not:
 - claim a Stacks prototype;
 - claim live Stacks support; or
 - perform Milestone 1 in advance.
+
+This pre-implementation specification freezes logical source-surface identifiers
+and semantic ownership only. It does not freeze URLs, HTTP methods, parameters,
+payload schemas, pagination, exact contract addresses, or production provider
+assignments; those details must be validated during Milestone 1.
 
 The detailed proposed source-surface inventory is frozen separately in
 [C9_STACKS_ENDPOINT_CATALOG.md](C9_STACKS_ENDPOINT_CATALOG.md).
