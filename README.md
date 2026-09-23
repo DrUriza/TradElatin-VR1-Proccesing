@@ -1,6 +1,25 @@
 # TradELATIN VR1 Processing V4.2
 
-Standalone processing repository.
+Standalone processing repository for TradELATIN VR1 — OBSERVE.
+
+## Implementation status and scope
+
+- Existing C1–C8 Processing is implemented.
+- Public validation is primarily emulator/synthetic/replay based.
+- A live-provider acquisition path exists for the frozen C1–C8 providers.
+- Live operation requires external provider credentials and applicable data access.
+- This does **not** mean C1–C8 are a continuously-live public production service.
+- C9/Stacks is not implemented yet.
+- C9 implementation is proposed grant work and remains outside the current runtime.
+
+The current C1–C8 inventory, runtime family names, acquisition routing, endpoint
+allowlists, processing pipelines, contract builders, and sample/runtime contracts
+remain unchanged. Stacks is not part of the current runtime inventory.
+
+Pre-implementation C9/Stacks documentation:
+
+- [C9/Stacks Technical Specification](docs/c9/stacks/C9_STACKS_TECHNICAL_SPEC.md)
+- [C9/Stacks Endpoint Catalog](docs/c9/stacks/C9_STACKS_ENDPOINT_CATALOG.md)
 
 ## Automatic runtime
 
