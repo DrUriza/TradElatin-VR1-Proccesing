@@ -23,6 +23,24 @@ Pre-implementation C9/Stacks documentation:
 - [C9/Stacks Technical Specification](docs/c9/stacks/C9_STACKS_TECHNICAL_SPEC.md)
 - [C9/Stacks Endpoint Catalog](docs/c9/stacks/C9_STACKS_ENDPOINT_CATALOG.md)
 
+## Proposed Equities extension
+
+SSL Market / IBKR has been evaluated as a functional source for a future
+multi-market Equities extension. The extension is documentation-only and remains
+**PRE-IMPLEMENTATION — PROPOSED / NOT IMPLEMENTED**. There is no IBKR adapter,
+Equities acquisition path, normalizer, processor, contract builder, or operational
+Equities runtime in this repository.
+
+The implemented inventory remains frozen at **33 logical endpoints across C1–C8**
+for BTC/CRYPTO. Proposed Equities observable IDs are maintained separately and
+are not counted among those 33 endpoints. They do not modify C9, which remains an
+independent pre-implementation family.
+
+Pre-implementation Equities documentation:
+
+- [Equities Processing Technical Specification](docs/equities/EQUITIES_PROCESSING_TECHNICAL_SPEC.md)
+- [Proposed Equities Observable Catalog](docs/equities/EQUITIES_OBSERVABLE_CATALOG.md)
+
 ## Automatic runtime
 
 Only these families run automatically:
