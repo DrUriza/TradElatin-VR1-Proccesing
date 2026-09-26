@@ -41,6 +41,12 @@ Pre-implementation Equities documentation:
 - [Equities Processing Technical Specification](docs/equities/EQUITIES_PROCESSING_TECHNICAL_SPEC.md)
 - [Proposed Equities Observable Catalog](docs/equities/EQUITIES_OBSERVABLE_CATALOG.md)
 
+Non-runtime structural primitives now exist under `processing_signals.markets`:
+canonical market context/events, adapter boundaries, the isolated proposed
+Equities registry, and a compatibility projection to `vr1-observation-v1` for
+future VR2 consumption. They are not imported by the current BTC pipeline and
+do not constitute operational IBKR or Equities support.
+
 ## Automatic runtime
 
 Only these families run automatically:

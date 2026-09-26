@@ -189,6 +189,8 @@ parallel, versioned market-aware envelope, not new mandatory BTC fields.
 | event/received/calculated timestamps | Source, acquisition, and derivation time. |
 | `value`, `units` | Typed value and units. |
 | `source_status` | Live/frozen/delayed/unavailable state. |
+| `source_mode` | `LIVE`, `SYNTHETIC`, or `REPLAY`, matching the frozen VR2 input vocabulary. |
+| `quality` | `VALID`, `PARTIAL`, `STALE`, `INVALID`, or `UNKNOWN`. |
 | `data_quality` | Staleness, coverage, completeness, validation facts. |
 | `capabilities` | COMPLETE/PARTIAL/UNSUPPORTED/NOT_APPLICABLE. |
 | `derivation_type`, `method_version` | RAW/DERIVED/INFERRED and method identity. |
@@ -197,6 +199,14 @@ parallel, versioned market-aware envelope, not new mandatory BTC fields.
 This is conceptual only, not an operational JSON contract. A later proposal must
 define compatibility, required/optional fields, serialization, null semantics,
 identifiers, and migration behavior before code or samples are created.
+
+The structural compatibility layer may project this richer envelope into the
+existing downstream `vr1-observation-v1` shape expected by VR2. Provider-specific
+status, venue, derivation, capability, and provenance remain namespaced under
+`metadata`; this does not change current BTC Screen contracts or activate a new
+runtime path. VR3 can consume the same observation vocabulary through its own
+input contract, while VR4 remains downstream of VR3 and is not a direct consumer
+of this provider envelope.
 
 ## 11. Compatibility risks and controls
 
