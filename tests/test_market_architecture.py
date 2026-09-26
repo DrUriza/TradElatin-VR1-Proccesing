@@ -143,3 +143,19 @@ def test_equities_envelope_projects_to_vr2_frozen_observation_contract() -> None
     assert observation["source_mode"] == "REPLAY"
     assert observation["quality"] == "VALID"
     assert observation["metadata"]["derivation_type"] == "DERIVED"
+    assert {
+        "schema_version",
+        "market",
+        "asset",
+        "timestamp",
+        "family",
+        "observable_id",
+        "value",
+        "units",
+        "source",
+        "source_mode",
+        "quality",
+        "metadata",
+    } <= observation.keys()
+    assert "processing_version" not in observation
+    assert "request_id" not in observation
