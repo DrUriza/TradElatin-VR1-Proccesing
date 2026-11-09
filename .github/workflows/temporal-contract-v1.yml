@@ -1,0 +1,27 @@
+name: Temporal Contract v1 tests
+
+on:
+  push:
+    branches: [feature/temporal-contract-v1]
+    paths:
+      - "contracts/temporal_contract_v1.py"
+      - "tests/test_temporal_contract_v1.py"
+      - "docs/TEMPORAL_CONTRACT_V1.md"
+      - ".github/workflows/temporal-contract-v1.yml"
+  pull_request:
+    paths:
+      - "contracts/temporal_contract_v1.py"
+      - "tests/test_temporal_contract_v1.py"
+      - "docs/TEMPORAL_CONTRACT_V1.md"
+
+jobs:
+  validate-temporal-contract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s tests -p test_temporal_contract_v1.py -v
